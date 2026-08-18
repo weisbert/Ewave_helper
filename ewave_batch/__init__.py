@@ -11,3 +11,4 @@
 __version__ = "0.1.0.dev0"
 """工具版本，进 `Provenance.tool_version`。
 仓库根的 `VERSION` 文件是 `git archive` 时打的 commit 戳，两者不是一回事。"""
+

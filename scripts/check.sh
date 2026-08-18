@@ -43,6 +43,19 @@ sh scripts/redzone_scan.sh || FAIL=1
 step "4/5  dry-run 冒烟"
 if [ -f cli.py ] || [ -d ewave_batch ]; then
     python -m ewave_batch dry-run --self-test || FAIL=1
+    # ★ 同一条命令，在 ASCII-only 的 locale 下再跑一遍。
+    # 红区批处理上下文里 LANG 常是 C，stdout 就是纯 ASCII；本工具的输出带中文
+    # ⇒ 不做防护的话一个 print 就 UnicodeEncodeError 退 1。也就是说「开发机全绿」
+    # 的闸门到红区必红，而那是最没法调试的地方（和 CRLF 那颗雷同一类）。
+    # 2026-08-18 实测过：加防护前 exit 1，加防护后 exit 0。见 tests/test_gate_portability.py。
+    # 只输出结论，不重复整张表。
+    if PYTHONIOENCODING=ascii python -m ewave_batch dry-run --self-test >/dev/null 2>&1; then
+        echo "ok  ASCII locale（LANG=C）下同样退 0"
+    else
+        echo "FAIL  ASCII locale 下自检崩了 —— 红区 LANG=C 时闸门会红。"
+        echo "      修法：入口点开头调 ewave_batch.ascii_safe_stdio()，别让 print 抛 UnicodeEncodeError。"
+        FAIL=1
+    fi
 else
     echo "skip  CLI 还没有（P1 之前正常）"
 fi

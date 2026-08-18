@@ -18,7 +18,13 @@ cd "$ROOT" || exit 1
 if [ "${1:-}" = "--staged" ]; then
     FILES=$(git diff --cached --name-only --diff-filter=ACM)
 else
-    FILES=$(git ls-files)
+    # ⚠️ 不要写成裸 `git ls-files`：那只列**已跟踪**的文件，于是刚写出来还没 git add 的
+    # 新代码一个都扫不到 —— 闸门会对着一堆未跟踪的新文件报 clean。
+    # 2026-08-18 Phase 0 审查实测抓到：10 个新文件全是 `??`，check.sh 第 3 步照报 clean。
+    # `--cached --others --exclude-standard` = 已跟踪 + 未跟踪但不被 .gitignore 排除的，
+    # 正好是「将来会进 git 的全集」。被 ignore 的（PROJECT_BRIEF.md、*.local.* 等）仍然不扫，
+    # 那是对的：它们本来就永远不会被发布出去。
+    FILES=$(git ls-files --cached --others --exclude-standard)
 fi
 [ -z "$FILES" ] && exit 0
 

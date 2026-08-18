@@ -304,6 +304,11 @@ def selftest(stream: object = None) -> int:
 
 def main(argv: object = None) -> int:
     """入口。目前只认 `dry-run --self-test`，其余转给 `ewave_batch.cli`（P5 才有）。"""
+    # 第一件事：把 stdout/stderr 变成 ASCII-locale 下不会崩的。红区 LANG 常是 C，
+    # 而本文件的输出带中文 —— 不做这一步，闸门会在红区因为 locale 而红。见 ewave_batch.ascii_safe_stdio。
+    from ewave_batch._stdio import ascii_safe_stdio
+
+    ascii_safe_stdio()
     args = list(sys.argv[1:] if argv is None else argv)
     if "--self-test" in args:
         return selftest()

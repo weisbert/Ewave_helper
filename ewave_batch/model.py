@@ -1774,6 +1774,7 @@ def build_frame(parent: object, bridge: GuiBridgeProtocol) -> object:
 
 FROZEN: dict[str, tuple[str, ...]] = {
     "ewave_batch": ("__version__",),
+    "ewave_batch._stdio": ("ascii_safe_stdio",),
     "ewave_batch.model": (
         # 版本 / 别名
         "INTERFACE_VERSION",
@@ -1977,6 +1978,7 @@ FROZEN: dict[str, tuple[str, ...]] = {
 
 FROZEN_PHASE: dict[str, str] = {
     "ewave_batch": "P0",
+    "ewave_batch._stdio": "P0",
     "ewave_batch.model": "P0",
     "ewave_batch.core.matrix": "P1",
     "ewave_batch.core.spec": "P1",
