@@ -1,0 +1,27 @@
+# 行尾 --------------------------------------------------------------------
+# 下面的 `eol=lf` 是承重的，且**不能**省略成只写 `text=auto`：一个文件设了 `text`
+# 但没设 `eol` 时，`git archive` 会回退到 core.eol，Windows 上 native = CRLF。
+# 于是在 Windows 上打的包就是 CRLF，红区 bash 跑 deploy.sh 立刻死在
+# `$'\r': command not found` —— 而那是你最没法调试的地方。目标机是 Linux，全钉 LF。
+* text=auto eol=lf
+*.sh  text eol=lf
+*.ps1 text eol=crlf
+
+# 红区包的内容 ------------------------------------------------------------
+# **黑名单，不是白名单**：仓库里的东西默认全部过关，除非在这里 export-ignore。
+# 这样以后新加的脚本自动进包，打包流程零维护。只切掉「过了气隙就没意义」的开发侧文件。
+CLAUDE.md        export-ignore
+.gitignore       export-ignore
+.gitattributes   export-ignore
+deploy/pack.ps1  export-ignore
+docs/OVERNIGHT.md export-ignore
+
+# mockups/ 是 Windows 上的界面草图，产品界面在 gui/；mvp/ 是一次性脚手架，
+# 红区侧那份由用户自己管理（见 CLAUDE.md）。两者过了气隙都没用。
+mockups/         export-ignore
+mvp/             export-ignore
+
+# 版本戳 ------------------------------------------------------------------
+# `git archive` 会把下面这行替换掉；工作树里它保持字面量。
+# 红区那边靠它回答「我现在装的是哪一版」—— 对一个当信道用的库，这个问题很常问。
+VERSION export-subst
