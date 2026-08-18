@@ -2,6 +2,9 @@
 ENVIRONMENT.local.md
 .redzone_patterns.local
 PROJECT_BRIEF.md
+
+# golden fixture 从真实生产命令抽出 -> 含站点坐标，只留本机
+tests/fixtures/*.local.json
 ewave_donau_kit/
 ewave_donau_kit.tar.gz
 references/ewave_donau_kit/
