@@ -27,7 +27,12 @@ fi
 
 step "2/5  单元测试"
 if [ -d tests ] && ls tests/test_*.py >/dev/null 2>&1; then
-    python -m unittest discover -s tests -t . -v 2>&1 | tail -25 || FAIL=1
+    # ⚠️ 不要写成 `python ... | tail -25 || FAIL=1`：POSIX sh 里管道的退出码取自
+    # 最后一段（tail 永远返回 0），`|| FAIL=1` 永远不触发 —— 单测全挂也报 ALL GREEN。
+    # 这个洞在 2026-08-18 实测抓到过一次，别改回去。
+    UT_OUT=$(python -m unittest discover -s tests -t . -v 2>&1); UT_RC=$?
+    printf '%s\n' "$UT_OUT" | tail -25
+    if [ "$UT_RC" -eq 0 ]; then echo "ok  单测全绿"; else echo "FAIL  单测有红"; FAIL=1; fi
 else
     echo "FAIL  一个测试都没有"; FAIL=1
 fi
