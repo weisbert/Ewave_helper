@@ -1,0 +1,40 @@
+# 红区资料 —— 绝不进 git（详见 PROJECT_BRIEF / ENVIRONMENT.local.md）
+ENVIRONMENT.local.md
+.redzone_patterns.local
+PROJECT_BRIEF.md
+ewave_donau_kit/
+ewave_donau_kit.tar.gz
+references/ewave_donau_kit/
+references/probes/
+*_probe_*.txt
+gdsout_setup*
+# 下面这份是纯占位符模板，不是真的 setup 文件（git 不支持行尾注释，注释必须单独一行）
+!mvp/redzone/gdsout_setup.tmpl
+
+# 站点坐标（真实内网路径）—— 模板 site.example.sh 进 git，实际值不进
+site.local.sh
+
+# 构建产物
+mvp/mvp_pack.sh
+mvp/dist/
+
+# 本机专属（写死了 memory 目录的绝对路径 → 换机器需重建，见记忆 memory-maintenance-discipline）
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 运行产物
+*.s[0-9]p
+*.s[0-9][0-9]p
+*.s[0-9][0-9][0-9]p
+*.msh
+ewave.log
+batches/
