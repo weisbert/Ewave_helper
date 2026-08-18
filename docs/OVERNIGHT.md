@@ -66,3 +66,43 @@ sh scripts/check.sh
 
 报告里"我没把握的地方"这一节**必须写实**。夜里没人拦着，写得漂亮没有意义，
 写得准才有意义。
+
+---
+
+## workflow 结构
+
+阶段之间是硬依赖，只能串行；并行只发生在阶段内部。
+**Phase 0 不许跳** —— 跳过接口冻结，并行的 agent 必然发明互不兼容的数据模型，
+早上收到的会是一堆拼不起来的零件。
+
+| Phase | 并行 agent | 产出 | 判据 |
+|---|---|---|---|
+| **0 接口冻结** | 1（串行） | `ewave_batch/model.py`：Design / Axis / Run / RunStatus / BatchState 的数据结构 + 跨模块函数签名 + docstring，**只写签名不写实现**；外加 `docs/INTERFACES.md` 一页 | 能被 import；签名覆盖 P1–P5 全部跨模块调用 |
+| **1 核心** | 3 | `core/matrix.py` 展开+slug+varying 轴 · `core/cmd.py` 四层合并→argv · `core/layout.py` 目录/归档/state 读写 | `cmd.py` 对着 golden fixture 逐 flag 验，**且带反向验证**（故意改一个值必须被抓到） |
+| **2 阶段一** | 2 | `tools/strmout.py` 渲染 gdsout_setup 模板（D1c 那 8 个字段） · `core/discover.py` 从官方 run 目录解析坐标 | discover 用 `mvp/redzone/cfg.sh` 同款解析路径；纯字符串 → 单测 |
+| **3 调度** | 2 | `sched/fake.py`（**先做**）· `sched/donau.py` 从 kit 移植 · `sched/driver.py` 两阶段 DAG + 有界并发 + poll + verify + archive + resume | FakeRunner 要模拟实测过的坑：`exit=0` 但崩了、0 字节产物报 done、写失败被吞。12-run 假批次全链路，含失败与 resume |
+| **4 日志** | 1–2 | `core/logparse.py` → 收敛/墙钟/峰值内存/端口数/成败 | 用 MVP 取回的真实日志当 fixture |
+| **5 界面** | 3 | `cli.py`（run / dry-run / resume / archive / status）· `gui/`（共用层 + `frames/{stacked,tabbed,split}.py`，默认 split） | headless smoke 三版都建得起来；**无 `$DISPLAY` 时 CLI 必须可用**（惰性 import） |
+| **6 收尾** | 2 | `deploy/pack.ps1` + `doctor.sh` 三 tier · 红区验证包 · 交接报告 | 完整 `check.sh` 全绿；报告含「没把握的地方」 |
+
+**每个 Phase 后挂一个独立审查 agent**（共 6 名，不写代码）。它只回答四个问题：
+测试真的在测东西吗？有没有自证？`check.sh` 真绿了吗？范围有没有自己长出来？
+查出问题就打回重做，不许放行。
+
+合计约 **21 个 agent**。超过 medium 档（15），起跑前把 `/config` 的
+"Dynamic workflow size" 调大，或明确按更大规模跑。
+
+## 怎么起跑（新会话里粘这段）
+
+```
+夜跑：按 docs/OVERNIGHT.md 的「workflow 结构」跑完 P1–P6，做出 v1 完整版本。
+
+开跑前先读：CLAUDE.md（硬约束）、PROJECT_BRIEF.md §4 决定表 / §11 参数四层 /
+§12 实现计划、docs/OVERNIGHT.md（这份规矩）。
+
+规矩一律以 docs/OVERNIGHT.md 为准：一票否决 sh scripts/check.sh、不许碰清单、
+防自证三条、允许 commit 禁止 push。Phase 0 接口冻结不许跳。
+
+用 workflow 编排。
+```
+
