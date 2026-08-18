@@ -1,0 +1,98 @@
+# ============================================================================
+# ewave_batch 批次 spec —— 可直接复制改的样例
+#
+# 跑法：  python -m ewave_batch dry-run <这个文件>
+# 换成 JSON 也行（PyYAML 缺失时的退路）：把注释删掉、写成 .json 即可，字段完全一样。
+#
+# 心智模型：
+#     run = (design, corner, temperature, equalCurrent, fullWave, 网格密度, …)
+#   design 本身就是矩阵的一根轴；每根轴的取值列表**自动展开成笛卡尔积**。
+#
+# 目录长这样（<axes-slug> 只编码「在变的轴」）：
+#     <batch_root>/<batch_name>/runs/<design>/<axes-slug>/<corner>_<temp>/
+#   最里面那层 <corner>_<temp> 是 eWave 自己建的，我们控制不了名字。
+# ============================================================================
+
+batch_name: demo_batch          # 留空 = 用 UTC 时间戳现起一个
+batch_root: ./batches           # 批次落在哪。**绝不要指到设计师的 workarea 里**
+
+# ---------------------------------------------------------------------------
+# designs —— 要提取的 (Library, Cell, view)
+#
+#   * library / cell / view 三个字段**都可以写成列表**，会自动展开成笛卡尔积。
+#     下面这一项就是 1 个 library × 2 个 cell × 1 个 view = 2 个 design。
+#   * view 不是常量：为 EM 提取派生的 cellview 和普通 layout 都可能，必须自己写清楚。
+#   * official_run_dir = 官方 GUI 跑过一次的那个 design 目录。库名/端口/ptxt/队列
+#     全部从那里**现场解析**，本文件里一个站点坐标都不用写。
+# ---------------------------------------------------------------------------
+designs:
+  - library: <lib>
+    cell: [<cellA>, <cellB>]
+    view: <view>
+    official_run_dir: <官方 GUI 跑过的那个 design 目录>
+    resources: "cpu=20;mem=100000"   # per-design 的 dsub -R。端口多的电感要的比走线多
+
+  - library: <lib>
+    cell: <cellC>
+    view: <view>
+    official_run_dir: <另一个官方 run 目录>
+    # 这个 design 单独少扫一点（没写的轴用全局取值）
+    axes:
+      temperature: ["25.0"]
+
+# ---------------------------------------------------------------------------
+# axes —— 设定轴。**取值列表 = 笛卡尔积的一维**
+#
+#   内置轴：corner / temperature / equalCurrent / fullWave / mesh /
+#           relativeTolerance / relativeCurrentTolerance /
+#           multiSweep / discreteFreq / parallel
+#
+#   ⚠️ 只有一个取值的轴**不进目录名** —— 这样只扫 corner+temp 时目录名与官方逐字一致。
+#   ⚠️ 温度务必带引号且带小数位："-40.0" 和 "-40" 会让 eWave 建出**不同的**目录
+#      （-40_0 vs -40）。YAML 里不加引号的 -40.0 会被读成数字，仍然是 -40.0，但
+#      写 -40 就真的变成了 -40。
+#   ⚠️ corner 轴会**同时**改 --corner= 和 --emssTechFile 的 ptxt 文件名，两处一起动。
+# ---------------------------------------------------------------------------
+axes:
+  corner: [typical]                 # 只有一个取值 → 不进 slug，但照样进 eWave 的目录名
+  temperature: ["-40.0", "125.0"]
+  equalCurrent: [on, off]           # 开关轴：off 会把默认表里的 --equalCurrent 抵消掉
+
+  # 自定义轴：内置目录里没有的 flag 这样加（工具不会替你猜取值该怎么翻译）
+  # myKnob:
+  #   flag: --someFlag              # 每个取值渲染成 --someFlag=<取值>
+  #   values: ["1", "2"]
+  #   short: mk                     # slug 片段写成 mk-1 / mk-2
+
+# ---------------------------------------------------------------------------
+# defaults —— 默认表的**覆盖**。留空 = 全部从 official_run_dir 里的真实命令学
+#             （§11 规则 1：默认表的值不写死在源码，换 PDK 自动跟上）
+# ---------------------------------------------------------------------------
+defaults: {}
+
+# ---------------------------------------------------------------------------
+# extra_flags —— 逃生口：别人临时要求加的、工具没做成轴的 flag
+#
+#   两种写法都行：
+#     extra_flags: "--labelDepth=0 --printDouble"
+#     extra_flags: {--labelDepth: "0", --printDouble: true}
+#   写 false 表示「显式缺席」：把低层默认表里的那个 flag 抵消掉。
+#
+#   ⚠️ 已经是轴的 flag（如 --temperature）和工具自己管的 flag（--workDir / --gds /
+#      --all / --sparam / --top / -m / --nogui / --cadencePins / --includePortOrder /
+#      --emssTechFile）在这里会被**拒绝** —— 否则目录名会和实际跑的值对不上。
+# ---------------------------------------------------------------------------
+extra_flags: {}
+
+# ---------------------------------------------------------------------------
+# options —— 批次级开关（全部可省，下面写的就是默认值）
+# ---------------------------------------------------------------------------
+options:
+  dry_run: false
+  max_parallel: 4                 # 同时在飞的 job 数上限
+  poll_interval: 15.0
+  scheduler: donau                # donau | fake（fake = 本机跑假批次，不提交任何东西）
+  keep_logs_on_failure: true
+  include_port_order: true        # 让 .sNp 自描述端口顺序（归档后命令行就找不到了）
+  verify_port_count: true         # 端口数不对就算失败。--all 的编号平移是静默的，别关
+  parallel_multiplier: 1.0        # --parallel = dsub 的 cpu= × 这个倍率
