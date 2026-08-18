@@ -39,6 +39,13 @@ fi
 
 step "3/5  红区标识符闸门"
 sh scripts/redzone_scan.sh || FAIL=1
+# ★ 第二道：拿**红区证据本身**当词表反查（不是我们事先想到的形状）。
+# 加这一道的理由是 2026-08-18 夜跑 P3 抓到的真泄漏：两个 8 位 Donau JOBID 被从
+# references/ewave_donau_kit/ 逐字抄进了源码和测试，而 redzone_scan 报 clean ——
+# 因为没人事先想到「job id 也是站点身份」，词表里没有它。
+# 词表永远追不上现实；「证据里出现过的高熵 token 一律不许进 git」追得上。
+# 见 scripts/redzone_crosscheck.sh 的抬头。
+sh scripts/redzone_crosscheck.sh || FAIL=1
 
 step "4/5  dry-run 冒烟"
 if [ -f cli.py ] || [ -d ewave_batch ]; then

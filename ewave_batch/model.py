@@ -1997,12 +1997,23 @@ FROZEN: dict[str, tuple[str, ...]] = {
         "FakeRunner",
         "FakeScheduler",
         "FakeFailureMode",
+        # 模块级常量：测试和 driver 都在读，登记了 self-test 才替它们盯存在性。
+        "FAKE_LOG_HEADER",
+        "DEFAULT_PORT_COUNT",
+        "DEFAULT_EPOCH",
     ),
     "ewave_batch.sched.donau": (
         "DonauScheduler",
         "build_dsub_argv",
         "parse_dsub_submit_output",
         "parse_djob_output",
+        # ⚠️ 这两个只吃 `model.JobState`、与后端无关，却住在一个**具体后端**模块里，
+        # 而 `sched.driver` 判状态的整条路径挂在它们身上（`from .donau import ...`）。
+        # 这个归属是有味道的：将来加第二个后端时它们该搬到 model 或一个共享模块去。
+        # 今晚不搬（搬动会牵动 driver 的全部状态判断，风险不划算），但**必须登记** ——
+        # 不登记的话 self-test 不替它们盯签名，而它们一变，整个批次的状态机就跟着变。
+        "is_terminal",
+        "run_status_for_job_state",
     ),
     "ewave_batch.sched.driver": (
         "Driver",
