@@ -462,6 +462,10 @@ def expand_runs(
             temperature = (
                 "" if AXIS_TEMPERATURE in collapsed else axis_values.get(AXIS_TEMPERATURE, "")
             )
+            # corner/temperature 没都当轴扫（或被 D12 的原生多值折叠掉）时，
+            # `<corner>_<temp>/` 这层的名字就**预测不出来**。留空串是诚实的表示，
+            # 不是遗漏 —— eWave 跑完之后那层目录是存在的，届时由
+            # `layout.verify_run_outputs` 现场发现（见那里的「预测不出来怎么办」）。
             ewave_dir = ewave_dir_name(corner, temperature) if (corner and temperature) else ""
             # run_id 的第三段：能预测 eWave 那层目录名就用它；预测不了（corner/temp 没都当轴扫）
             # 就退回用已知的那几个取值拼一个 —— run_id 必须唯一，撞了就是静默覆盖。

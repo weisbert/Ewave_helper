@@ -258,6 +258,27 @@ SPARAM_DIRNAME = "sparam"
 RUNS_DIRNAME = "runs"
 LOGS_DIRNAME = "logs"
 CMD_SH_NAME = "cmd.sh"
+RUN_LOG_NAME = "run.log"
+"""退路名字：只在 `<corner>_<temp>` 预测不出来时用（corner/temperature 没都当轴扫）。"""
+
+CMD_SH_TEMPLATE = "cmd_{stem}.sh"
+RUN_LOG_TEMPLATE = "run_{stem}.log"
+"""★ 每个 run 一份命令留档 / 一份日志，`{stem}` = `<corner>_<temp>`。
+
+**为什么不是固定的 `cmd.sh`**（BRIEF §5 的树画的是固定名，这里是刻意偏离）：
+`<axes-slug>` 按定义**不含** corner/temp，而 `<corner>_<temp>/` 是 eWave 在 `--workDir`
+里面自己建的 —— 于是同一个 axes-slug 下的 N 个 corner/temp 组合共用一个 `run_dir`。
+固定名 `cmd.sh` 会让这 N 个 run 的命令行**互相覆盖**，最后只剩最后一个跑的那条。
+而每条命令的 `--corner` / `--temperature` / `--emssTechFile` 都不同 ⇒ 留档直接失真，
+「这个结果是拿什么命令跑出来的」再也答不上来。
+
+**静默覆盖正是本工具要消灭的东西**（BRIEF §5「原生 GUI 的真实痛点」痛点 1），
+在归档层自己再造一个同样的坑说不过去。
+
+取这个名字也不是新发明：官方 run 目录里 `run_ewave_<corner>_<temp>.sh` 和
+`run_ewave_<corner>_<temp>.log` 就是 `<corner>_<temp>/` 的**同级兄弟**，形状一模一样。
+"""
+
 GDSOUT_SETUP_SUFFIX = ".gdsout_setup"
 """归档布局的固定名字（BRIEF §5「归档布局」）。别在别处重复写字符串字面量。"""
 
@@ -686,7 +707,8 @@ class RunPaths:
       gdsout/<design>.gdsout_setup      design_gdsout
       sparam/<design>__<slug>__<c>_<t>.sNp   sparam_prefix + 后缀
       runs/<design>/<axes-slug>/        run_dir   ← ★ --workDir 指到这里
-        cmd.sh                          cmd_sh
+        cmd_<corner>_<temp>.sh          cmd_sh    ← ★ 每个 run 一份，不是固定 cmd.sh
+        run_<corner>_<temp>.log         run_log      （理由见 CMD_SH_TEMPLATE）
         <corner>_<temp>/                ewave_dir ← ★ eWave 自己建的，我们控制不了名字
     ```
     """
@@ -1816,6 +1838,9 @@ FROZEN: dict[str, tuple[str, ...]] = {
         "RUNS_DIRNAME",
         "LOGS_DIRNAME",
         "CMD_SH_NAME",
+        "RUN_LOG_NAME",
+        "CMD_SH_TEMPLATE",
+        "RUN_LOG_TEMPLATE",
         "GDSOUT_SETUP_SUFFIX",
         "RUNS_CSV_COLUMNS",
         # 数据结构
@@ -1867,6 +1892,10 @@ FROZEN: dict[str, tuple[str, ...]] = {
         "axes_for_design",
         "builtin_axis_catalog",
         "expand_runs",
+        # P1 实做时长出来的跨模块 helper（`core.spec` 在用）。冻结面补登记，
+        # 否则 self-test 不认识它们 = 不替它们盯签名漂移。
+        "axis_with_values",
+        "effective_axis_values",
     ),
     "ewave_batch.core.spec": (
         "load_spec",
@@ -1887,6 +1916,9 @@ FROZEN: dict[str, tuple[str, ...]] = {
         "diff_flags",
         "diff_ports",
         "parse_resource_string",
+        # D1b 的编码器：`--all` 的端口编号预测。红区那趟 dry-run 的自带比对要用它，
+        # 是"不依赖 GUI"成立的全部依据 —— 这种东西必须在冻结面里盯着。
+        "predict_all_ports",
     ),
     "ewave_batch.core.layout": (
         "compute_run_paths",

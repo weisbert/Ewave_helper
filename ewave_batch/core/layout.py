@@ -46,6 +46,7 @@ from ..model import (
     AXIS_SLUG_SEP,
     BATCH_JSON_NAME,
     CMD_SH_NAME,
+    CMD_SH_TEMPLATE,
     GDS_DIRNAME,
     GDSOUT_DIRNAME,
     GDSOUT_SETUP_SUFFIX,
@@ -53,6 +54,8 @@ from ..model import (
     RUNS_CSV_COLUMNS,
     RUNS_CSV_NAME,
     RUNS_DIRNAME,
+    RUN_LOG_NAME,
+    RUN_LOG_TEMPLATE,
     SCHEMA_VERSION,
     SPARAM_DIRNAME,
     TIMESTAMP_FORMAT,
@@ -104,9 +107,10 @@ SPINE_DIRNAME = "ewave_simulation"
 与 `mvp/redzone/cfg.sh` 的守卫**同一条规则**，只是这里是 Python 版。"""
 
 GDS_SUFFIX = ".gds"
-RUN_LOG_NAME = "run.log"
-"""我们自己 tee 的那份日志，落在 run 自己的目录里（**不是** eWave 的 ewave.log）。
-BRIEF §5 的树里没画它 —— 见本阶段报告的「设计偏离」。"""
+
+# `RUN_LOG_NAME` / `CMD_SH_NAME` 是**退路**名字：只在 `<corner>_<temp>` 预测不出来、
+# 且 run_id 也给不出词根时才用。正常路径走 `RUN_LOG_TEMPLATE` / `CMD_SH_TEMPLATE`
+# （每个 run 一份，理由见 model.CMD_SH_TEMPLATE）。两者都从 model 来，别在这儿重定义。
 
 SET_CURRENT_LOG_NAME = "set_current.log"
 """`set_run_as_current` 的审计日志。写进批次的 `logs/`，**不写进 spine**。"""
@@ -263,6 +267,25 @@ def _inside(path: str, base: str) -> bool:
 # --------------------------------------------------------------------------
 
 
+def _per_run_name(template: str, fallback: str, ewave_dir_name: str) -> str:
+    """每个 run 一份的留档文件名。`<corner>_<temp>` 预测不出来时退回固定名。
+
+    为什么必须每个 run 一份：`<axes-slug>` 按定义**不含** corner/temp，而
+    `<corner>_<temp>/` 是 eWave 在 `--workDir` 里自己建的 —— 同一个 axes-slug 下的
+    N 个 corner/temp 组合**共用同一个 `run_dir`**。用固定的 `cmd.sh`，这 N 条命令行会
+    互相覆盖，只剩最后跑的那条；而它们的 `--corner`/`--temperature`/`--emssTechFile`
+    各不相同 ⇒「这个结果是拿什么命令跑出来的」再也答不上来。
+    静默覆盖正是本工具要消灭的东西，不能在归档层自己再造一个。
+
+    退路分支（`ewave_dir_name` 为空）出现在 corner/temperature 没都当轴扫的时候。
+    此时该 axes-slug 下只会有一个 run，固定名不会撞 —— `test_layout_paths` 里有
+    计数断言盯着「N 个 run ⇒ N 个互不相同的 cmd_sh」，撞了会当场红。
+    """
+    if not ewave_dir_name:
+        return fallback
+    return template.format(stem=ewave_dir_name)
+
+
 def compute_run_paths(batch_dir: str, design: Design, run: Run) -> RunPaths:
     """算出 BRIEF §5「归档布局」那棵树上这个 run 相关的全部路径。
 
@@ -276,7 +299,20 @@ def compute_run_paths(batch_dir: str, design: Design, run: Run) -> RunPaths:
 
     design_name = _design_dir_name(design, run)
     axes_slug = _validate_component(run.axes_slug, "axes_slug")
-    ewave_dir_name = _validate_component(run.ewave_dir, "ewave_dir（<corner>_<temp>）")
+    # ★ `ewave_dir` 允许是空的 —— 那是「预测不出来」的诚实表示，不是遗漏。
+    # 两种合法情形：①corner/temperature 没都当轴扫；②D12 原生多值把温度折叠成
+    # `--temperature=a,b,c`（一条命令跑出好几层目录，名字本来就不止一个）。
+    # 硬拒绝会把 D12 直接砍掉，所以这里放行，改由 `verify_run_outputs` 在跑完之后
+    # **现场发现**那层目录 —— 那时候它已经存在了，不需要预测。
+    ewave_dir_name = (
+        _validate_component(run.ewave_dir, "ewave_dir（<corner>_<temp>）") if run.ewave_dir else ""
+    )
+    # 留档文件名的词根：优先用 eWave 那层目录名；预测不出来时退回 run_id 的最后一段
+    # （`expand_runs` 保证它在同一个 run_dir 下唯一）；都没有再退回固定名。
+    # 这一步是承重的：`<axes-slug>` 按定义不含 corner/temp ⇒ 同一个 run_dir 下会有 N 个 run，
+    # 用固定名它们的命令行会互相覆盖，「这结果是拿什么命令跑的」就永远答不上来了。
+    # 见 model.CMD_SH_TEMPLATE 与 tests/test_layout_no_collision.py。
+    stem = ewave_dir_name or run.run_id.rsplit("/", 1)[-1].strip()
 
     gds_dir = _join(root, GDS_DIRNAME)
     gdsout_dir = _join(root, GDSOUT_DIRNAME)
@@ -286,7 +322,9 @@ def compute_run_paths(batch_dir: str, design: Design, run: Run) -> RunPaths:
 
     # 扁平区文件名：<design>__<axes-slug>__<corner>_<temp>（BRIEF §5）。
     # 分隔符复用 AXIS_SLUG_SEP（双下划线）—— 单下划线已经被温度占用（`-40.0` → `-40_0`）。
-    flat_stem = AXIS_SLUG_SEP.join((design_name, axes_slug, ewave_dir_name))
+    flat_stem = AXIS_SLUG_SEP.join(
+        part for part in (design_name, axes_slug, ewave_dir_name or stem) if part
+    )
 
     return RunPaths(
         batch_dir=root,
@@ -299,9 +337,11 @@ def compute_run_paths(batch_dir: str, design: Design, run: Run) -> RunPaths:
         design_gds=_join(gds_dir, design_name + GDS_SUFFIX),
         design_gdsout=_join(gdsout_dir, design_name + GDSOUT_SETUP_SUFFIX),
         run_dir=run_dir,
-        cmd_sh=_join(run_dir, CMD_SH_NAME),
-        ewave_dir=_join(run_dir, ewave_dir_name),
-        run_log=_join(run_dir, RUN_LOG_NAME),
+        cmd_sh=_join(run_dir, _per_run_name(CMD_SH_TEMPLATE, CMD_SH_NAME, stem)),
+        # 预测不出来时留空串（**不是** run_dir）—— 空串是给 verify_run_outputs 的信号：
+        # "去 run_dir 里现场找 eWave 建的那层"。填成 run_dir 会让它误以为产物就在外层。
+        ewave_dir=_join(run_dir, ewave_dir_name) if ewave_dir_name else "",
+        run_log=_join(run_dir, _per_run_name(RUN_LOG_TEMPLATE, RUN_LOG_NAME, stem)),
         sparam_prefix=_join(sparam_dir, flat_stem),
     )
 
@@ -388,6 +428,35 @@ def port_count_from_suffix(path: str) -> int | None:
     return count if count > 0 else None
 
 
+def _discover_ewave_dirs(run_dir: str) -> list[str]:
+    """跑完之后，在 `run_dir` 里现场找 eWave 自己建的那层 `<corner>_<temp>/`。
+
+    只在规划阶段预测不出目录名时用（`RunPaths.ewave_dir` 为空串）。
+    判据故意保守：**必须是直接子目录，且里面至少有一个 Touchstone 产物或 eWave 日志**。
+    光看名字形状（`<something>_<something>`）会把我们自己写的东西也算进去。
+
+    返回排序后的绝对路径列表。找不到返回空列表 —— 不抛异常，验收失败是正常结果之一。
+    """
+    root = _posix(run_dir)
+    if not os.path.isdir(root):
+        return []
+    out: list[str] = []
+    for name in sorted(os.listdir(root)):
+        candidate = _join(root, name)
+        if not os.path.isdir(candidate):
+            continue
+        try:
+            inner = os.listdir(candidate)
+        except OSError:
+            continue
+        looks_like_ewave_output = any(
+            _is_sparam_name(n) or n in ("ewave.log", "emsolver.log", "mesh.log") for n in inner
+        )
+        if looks_like_ewave_output:
+            out.append(candidate)
+    return out
+
+
 def verify_run_outputs(
     paths: RunPaths,
     run: Run,
@@ -403,6 +472,37 @@ def verify_run_outputs(
     reasons: list[str] = []
     ewave_dir = _posix(paths.ewave_dir)
     ports = tuple(run.ports)
+
+    if not ewave_dir:
+        # 「预测不出来怎么办」：`ewave_dir` 是空串 = 规划时算不出 `<corner>_<temp>`
+        # （corner/temp 没都当轴扫，或 D12 原生多值把温度折叠了）。
+        # 但**现在**它已经存在了 —— eWave 跑完就把目录建好了 —— 所以不用预测，直接看。
+        # 这正是"规划要预测、验收只需要看"的分工：把不确定性推迟到它自然消失的时刻。
+        found = _discover_ewave_dirs(paths.run_dir)
+        if not found:
+            return VerifyReport(
+                ok=False,
+                reasons=(
+                    f"{_posix(paths.run_dir)} 里没有 eWave 建的 <corner>_<temp>/ 子目录 —— "
+                    "这个 run 大概根本没跑起来",
+                ),
+                ports=ports,
+            )
+        if len(found) > 1:
+            # 原生多值（D12）会一次跑出好几层。v1 不猜哪层是"这个 run 的"，
+            # 老实报出来让人看见 —— 猜错会把别的组合的产物算到这个 run 头上。
+            return VerifyReport(
+                ok=False,
+                reasons=(
+                    f"{_posix(paths.run_dir)} 下发现 {len(found)} 个 <corner>_<temp>/ 目录："
+                    + "、".join(os.path.basename(d) for d in found)
+                    + "。预测不出该认哪一个 ⇒ 不猜。"
+                    "  下一步：把 corner 和 temperature 都写成轴（哪怕是单值），"
+                    "让每个 run 对应唯一一层目录。",
+                ),
+                ports=ports,
+            )
+        ewave_dir = found[0]
 
     if not os.path.isdir(ewave_dir):
         return VerifyReport(

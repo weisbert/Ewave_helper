@@ -219,7 +219,15 @@ class ComputeRunPaths(unittest.TestCase):
             "/batches/demo/sparam/demo_lib_demo_cell_layout__base__typical_-40_0",
         )
         self.assertEqual(paths.run_dir, "/batches/demo/runs/demo_lib_demo_cell_layout/base")
-        self.assertEqual(paths.cmd_sh, "/batches/demo/runs/demo_lib_demo_cell_layout/base/cmd.sh")
+        # ★ 每个 run 一份，名字带 <corner>_<temp> —— **不是**固定的 `cmd.sh`。
+        # BRIEF §5 的树画的是固定名，这里是刻意偏离：`<axes-slug>` 不含 corner/temp，
+        # 所以同一个 axes-slug 下的 N 个 corner/temp 组合共用一个 run_dir，固定名会让
+        # N 条命令行互相覆盖 —— 而静默覆盖正是本工具要消灭的东西。
+        # 形状照官方：`run_ewave_<corner>_<temp>.sh` 就是 `<corner>_<temp>/` 的同级兄弟。
+        self.assertEqual(
+            paths.cmd_sh,
+            "/batches/demo/runs/demo_lib_demo_cell_layout/base/cmd_typical_-40_0.sh",
+        )
         self.assertEqual(
             paths.ewave_dir,
             "/batches/demo/runs/demo_lib_demo_cell_layout/base/typical_-40_0",
@@ -228,7 +236,7 @@ class ComputeRunPaths(unittest.TestCase):
         self.assertEqual(paths.logs_dir, "/batches/demo/logs")
         self.assertEqual(
             paths.run_log,
-            "/batches/demo/runs/demo_lib_demo_cell_layout/base/run.log",
+            "/batches/demo/runs/demo_lib_demo_cell_layout/base/run_typical_-40_0.log",
         )
 
     def test_paths_match_the_brief_tree_negative(self) -> None:
