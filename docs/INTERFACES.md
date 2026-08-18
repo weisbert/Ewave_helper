@@ -16,6 +16,7 @@
 ewave_batch/                 ← 包根
   __init__.py  __main__.py   ← __main__ 只有 self-test，没有业务
   model.py                   ← ★ 冻结面：数据结构 + 全部跨模块签名 + FROZEN 清单
+  redzone_dryrun.py          ← P2：红区那趟只读 dry-run（独立入口，不经 cli）
   cli.py                     ← P5
   core/{matrix,spec,cmd,layout,discover,logparse,template}.py
   tools/{strmout,ewave}.py
@@ -48,6 +49,7 @@ YAML 惰性 import + JSON 退路 + 校验是一整块活，塞进 `matrix.py` �
 | `core.template` | 一条现成 ewave 命令行 → `ParsedCommand` | P1 |
 | `core.discover` | 官方 run 目录 → `SiteFacts`（**站点坐标只在这条路上出现**） | P2 |
 | `tools.strmout` | 渲染 `gdsout_setup` + 拼 strmout argv | P2 |
+| `redzone_dryrun` | 红区只读 dry-run：解析真目录 → 打印全部命令 + 落地目录 → 自带比对 | P2 |
 | `tools.ewave` | 拼 ewave argv（薄封装到 `core.cmd`） | P3 |
 | `sched.fake` | 假 runner / 假调度器，模拟实测过的坑 | P3 |
 | `sched.donau` | 真 `dsub`/`djob` | P3 |
@@ -178,8 +180,11 @@ EXAMPLE_SPEC   # 见 model.py / 下表
 ```python
 BUILTIN_DEFAULT_FLAGS   # 见 model.py / 下表
 DEFAULT_DIFF_IGNORE   # 见 model.py / 下表
+KEY_FLAG   # 见 model.py / 下表
 def build_flag_layers(run: Run, ctx: PlanContext) -> FlagLayers:
     # 把这个 run 的五层 flag 各自装好（还没合并）。
+    # `defaults` 层额外补两样"值来自站点发现、不来自源码常量"的东西：
+    #   `--parallel`（从 `-R` 的 `cpu=` 推）和 `--key`（从 `SiteFacts.key` 取）。
 def resolve_axis_flags(axis: Axis, value: str, facts: SiteFacts) -> FlagDict:
     # 算某根轴取某个值时贡献的 flag，并把占位符换掉。
 def merge_flag_layers(layers: FlagLayers) -> FlagDict:
@@ -293,10 +298,45 @@ def extract_command_line(text: str, *, program: str = ewave) -> str | None:
 ```python
 DEFAULT_GDSOUT_TEMPLATE   # 见 model.py / 下表
 GDSOUT_PLACEHOLDERS   # 见 model.py / 下表
+GDSOUT_CRITICAL_FIELDS    # D1c 点名的 8 个"会改变 GDS 内容"的字段，必须逐字复现
+CDSWORK_DIRNAME           # strmout 的 cwd 目录名（批次目录下）
 def render_gdsout_setup(template_text: str, fields: GdsoutFields) -> str:
     # 把 `GDSOUT_PLACEHOLDERS` 换成 `fields` 的值，**其余逐字不动**（D1c）。
 def build_strmout_plan(design: Design, ctx: PlanContext, *, setup_path: str) -> CommandPlan:
     # 拼阶段 1 的 `strmout` 命令（`-templateFile <setup_path>` 形式）。
+def gdsout_fields_for_design(design: Design, ctx: PlanContext, *, gds_path: str, layer_map: str = "") -> GdsoutFields:
+    # 按归档布局算出这个 design 的 7 个字段。★ P3 driver 的硬依赖。
+def cdswork_dir(batch_dir: str) -> str:
+    # `strmout` 该在哪个目录跑。★ P3 driver 的硬依赖（要往里写 cds.lib）。
+def substitute_placeholders(text: str, values: Mapping[str, str]) -> tuple[str, tuple[str, ...]]:
+    # 换 `@@TOKEN@@`，返回 (换完的文本, 没被换掉的 token)。
+def parse_gdsout_fields(text: str) -> dict[str, str]:
+    # `gdsout_setup` 文本 → 字段 dict（值去引号）。
+def diff_gdsout_setup(actual_text: str, expected_text: str, *, ignore: tuple[str, ...] = ()) -> FlagDiff:
+    # 两份 `gdsout_setup` 逐字段 diff，复用 `FlagDiff`（`compared_count` 防"空得好看"）。
+```
+
+### `ewave_batch.redzone_dryrun` — P2
+
+红区那趟**只读** dry-run：解析真实官方目录 → 打印全部 argv + 落地目录 → 自带比对
+（BRIEF §12「红区验证节奏」）。独立入口，**不经 `cli`** —— P1 一完成就能拿去红区跑。
+操作手册：`docs/REDZONE_DRYRUN.md`。
+
+```python
+EXIT_OK / EXIT_DIFF / EXIT_NO_BASELINE / EXIT_ERROR   # 0 / 2 / 3 / 1，写进文档、机器可判
+ReadOnlyViolation   # 落点选在 spine 或 OFFDIR 里 → 打印任何命令**之前**拒绝
+ComparisonReport / DryRunReport   # 纯数据；渲染是 format_report 的事
+def build_report(offdir: str, *, spec_path: str = "", batch_root: str = "./ewave_batches", batch_name: str = "dryrun", limit: int = 0, show_gdsout: bool = False, env: Mapping[str, str] | None = None) -> DryRunReport:
+    # 跑完整趟规划，返回纯数据报告。**不写任何文件**，所有落点经 `WriteLedger` 过闸。
+    # `env` 原样透传给 `core.discover.find_tool`（"传了 env 就只看 env"）：给了就完全
+    # 不读真实环境 ⇒ `argv[0]` 只由入参决定。**测试的期望值必须走这条口子** ——
+    # 否则"argv[0] 等于某个值"取决于跑测试那台机器 PATH 上有没有 ewave（本机没有 ⇒ 绿，
+    # 红区 `ma ewave/…` 之后有 ⇒ 红），也就是在唯一真正重要的机器上是红的。
+def format_report(report: DryRunReport) -> str:
+    # 报告 → 人能看懂的文本（含"哪几条是结构上必然相等"的诚实交代）。
+def build_parser() -> argparse.ArgumentParser:
+def main(argv: Sequence[str] | None = None) -> int:
+    # 第一件事是 `ascii_safe_stdio()`（红区 LANG 常是 C）。
 ```
 
 ### `ewave_batch.tools.ewave` — P3
@@ -305,7 +345,8 @@ def build_strmout_plan(design: Design, ctx: PlanContext, *, setup_path: str) -> 
 
 ```python
 def render_ports(port_spec: PortSpec) -> list[str]:
-    # 端口部分的 argv：`--all`，或者 `-p P000=<pin> -p …  -i <pin> …`（**保序**）。
+    # 端口部分的 argv：`-p P000=<pin> -p …  -i P000 …`（**保序**）。
+    # ⚠️ `PortMode.ALL` → **返回空 list**，`--all` 由机制层的 flag dict 出（否则 argv 里两个 `--all`）。
 def ewave_program(facts: SiteFacts) -> str:
     # 要执行的 ewave 可执行文件。`facts.ewave_bin` 为空 → `ToolMissingError`。
 def build_ewave_plan(run: Run, ctx: PlanContext) -> CommandPlan:
@@ -499,9 +540,13 @@ def tick(self) -> TickReport | None: ...
 |---|---|---|
 | `core.cmd.BUILTIN_DEFAULT_FLAGS` | P1 | 内置兜底默认（BRIEF §6「已知的生产默认值」那一串）。**只许 flag 名和通用数值**，零站点坐标 |
 | `core.cmd.DEFAULT_DIFF_IGNORE` | P1 | 与参考命令比对时默认忽略的 flag（路径/站点相关的那几个）。**精确名，不许前缀** |
+| `core.cmd.KEY_FLAG` | P1 | `--key` 的 flag 名。**取值永远来自 `SiteFacts.key`，源码里零写死**（硬约束 1b）。`build_flag_layers` 把它补进默认表层；`facts.key` 为空则**什么都不加** —— 宁可缺，也不许编一个假 key |
 | `core.spec.EXAMPLE_SPEC` | P1 | 一份可直接改的示例 spec 文本。占位符写 `<lib>`/`<cell>`/`<view>`，**不许真实取值** |
 | `tools.strmout.DEFAULT_GDSOUT_TEMPLATE` | P2 | 兜底模板文本（形如 `mvp/redzone/gdsout_setup.tmpl`）。⚠️ **必须是源码里的字符串常量，不许放成 `.tmpl` 文件** —— `.gitignore` 里 `gdsout_setup*` 是被忽略的，放文件会静默不进包 |
 | `tools.strmout.GDSOUT_PLACEHOLDERS` | P2 | 7 个占位符名（`runDir`/`library`/`topCell`/`view`/`strmFile`/`logFile`/`layerMap`）|
+| `tools.strmout.GDSOUT_CRITICAL_FIELDS` | P2 | D1c 点名的 8 个字段（`maxVertices`/`case`/`convertPin`/…）。它们**不是**占位符，必须逐字复现：丢一行 GDS 照样导得出、eWave 照样跑得完、数字还挺像，只有 mesh 悄悄变了 |
+| `tools.strmout.CDSWORK_DIRNAME` | P2 | `strmout` 的 cwd 目录名（批次目录下）。cwd 里要有一份能看见目标 library 的 `cds.lib` —— 放在我们自己的目录里，于是**不必 cd 进设计师的 workarea**（硬约束 4）|
+| `redzone_dryrun.EXIT_*` | P2 | `0` 一致 / `2` 有差异 / `3` 没能比对 / `1` 跑不起来。写进 `docs/REDZONE_DRYRUN.md`，红区靠退出码判 |
 | `sched.fake.FakeFailureMode` | P3 | 至少要能模拟实测过的三个坑：`exit=0` 但崩了、0 字节产物报 done、写失败被吞 |
 | `cli.SUBCOMMANDS` | P5 | `("run", "dry-run", "resume", "archive", "status")` |
 | `gui.app.LAYOUTS` | P5 | `("stacked", "tabbed", "split")`，默认 `split` |

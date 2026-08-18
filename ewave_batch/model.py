@@ -32,8 +32,14 @@ from typing import ClassVar, Protocol, runtime_checkable
 # 版本
 # --------------------------------------------------------------------------
 
-INTERFACE_VERSION = 1
-"""冻结接口的版本。任何 `[interface-change]` commit 都要 +1。"""
+INTERFACE_VERSION = 2
+"""冻结接口的版本。任何 `[interface-change]` commit 都要 +1。
+
+* 1 → 2（P2 复审返工）：**只加符号 + 改注释，没动任何已有签名** ——
+  `core.cmd.KEY_FLAG`、`tools.strmout` 的 7 个跨模块符号、新模块条目
+  `ewave_batch.redzone_dryrun`，外加 `render_ports` 的 docstring 与实现对齐
+  （`ALL` → 返回空 list，`--all` 由机制层出）。老调用方一个都不用改。
+"""
 
 SCHEMA_VERSION = 1
 """`batch.json` 的 schema 版本。读到更大的值要拒绝而不是猜。"""
@@ -1641,10 +1647,15 @@ def build_strmout_plan(design: Design, ctx: PlanContext, *, setup_path: str) -> 
 
 
 def render_ports(port_spec: PortSpec) -> list[str]:
-    """端口部分的 argv：`--all`，或者 `-p P000=<pin> -p …  -i <pin> …`（**保序**）。
+    """端口部分的 argv：`-p P000=<pin> -p …  -i P000 …`（**保序**）。
 
     顺序就是映射本身：Touchstone 只按 P00x 编号排列、名字被丢掉。排序一乱，
     整份 `.sNp` 就静默错位。
+
+    ⚠️ `PortMode.ALL` → **返回空 list**，`--all` 由机制层的 flag dict 出
+    （`core.cmd._locked_flags`）。这里再给一次的话 argv 里会出现**两个** `--all` ——
+    eWave 多半照单全收，而 `.sNp` 里根本看不出端口被重复声明过。
+    计数断言见 `tests/test_tools_ewave.py::test_build_ewave_plan_has_exactly_one_all_flag`。
     """
     raise NotImplementedError
 
@@ -1907,6 +1918,10 @@ FROZEN: dict[str, tuple[str, ...]] = {
     "ewave_batch.core.cmd": (
         "BUILTIN_DEFAULT_FLAGS",
         "DEFAULT_DIFF_IGNORE",
+        # `--key` 的 flag 名。取值永远来自 `SiteFacts.key`（站点身份，源码里零写死），
+        # 由 `build_flag_layers` 补进默认表层 —— 和「`--parallel` 从 `-R` 的 `cpu=` 推导」
+        # 同一处、同一形状。名字在两个模块里各写一份就会漂，所以它是公开常量。
+        "KEY_FLAG",
         "build_flag_layers",
         "resolve_axis_flags",
         "merge_flag_layers",
@@ -1963,6 +1978,15 @@ FROZEN: dict[str, tuple[str, ...]] = {
         "GDSOUT_PLACEHOLDERS",
         "render_gdsout_setup",
         "build_strmout_plan",
+        # P2 实做时长出来的跨模块符号 —— 补登记，否则 self-test 不认识它们
+        # ＝ 不替它们盯漂移。前两个是 P3 driver 的**硬依赖**：
+        "gdsout_fields_for_design",  # driver 阶段 1 靠它算 7 个字段
+        "cdswork_dir",  # driver 要在这个 cwd 里写 cds.lib（BRIEF §10 step1 实测）
+        "CDSWORK_DIRNAME",
+        "GDSOUT_CRITICAL_FIELDS",  # D1c 的 8 个字段，redzone_dryrun 的兜底模板对照在用
+        "parse_gdsout_fields",
+        "diff_gdsout_setup",
+        "substitute_placeholders",
     ),
     "ewave_batch.tools.ewave": (
         "render_ports",
@@ -1986,6 +2010,21 @@ FROZEN: dict[str, tuple[str, ...]] = {
         "make_driver",
         "run_batch",
         "resume_batch",
+    ),
+    "ewave_batch.redzone_dryrun": (
+        # 红区那趟「只读 dry-run + 自带比对」的公开入口（BRIEF §12 的红区验证节奏）。
+        # 它是**用户手里那条命令**，退出码写进了 docs/REDZONE_DRYRUN.md ⇒ 必须有机器判据。
+        "EXIT_OK",
+        "EXIT_ERROR",
+        "EXIT_DIFF",
+        "EXIT_NO_BASELINE",
+        "ReadOnlyViolation",
+        "ComparisonReport",
+        "DryRunReport",
+        "build_report",
+        "format_report",
+        "build_parser",
+        "main",
     ),
     "ewave_batch.cli": (
         "SUBCOMMANDS",
@@ -2019,6 +2058,7 @@ FROZEN_PHASE: dict[str, str] = {
     "ewave_batch.core.template": "P1",
     "ewave_batch.core.discover": "P2",
     "ewave_batch.tools.strmout": "P2",
+    "ewave_batch.redzone_dryrun": "P2",
     "ewave_batch.sched.fake": "P3",
     "ewave_batch.sched.donau": "P3",
     "ewave_batch.sched.driver": "P3",

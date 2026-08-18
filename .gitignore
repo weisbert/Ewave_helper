@@ -13,6 +13,9 @@ references/probes/
 gdsout_setup*
 # 下面这份是纯占位符模板，不是真的 setup 文件（git 不支持行尾注释，注释必须单独一行）
 !mvp/redzone/gdsout_setup.tmpl
+# 合成的解析器 fixture：形状照真实文件，值全是明显的假占位符（见该目录的 README.md）。
+# discover.py 的测试没有它就只能拿红区文件当输入，而红区文件永不进 git。
+!tests/fixtures/offdir_synthetic/gdsout_setup
 
 # 站点坐标（真实内网路径）—— 模板 site.example.sh 进 git，实际值不进
 site.local.sh

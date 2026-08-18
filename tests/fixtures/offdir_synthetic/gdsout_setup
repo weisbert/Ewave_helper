@@ -1,0 +1,24 @@
+	runDir			"/fake/wa/ewave_simulation/MY_LIB_MY_CELL_layout_em"
+	library		"MY_LIB"
+	topCell		"MY_CELL"
+	view		"layout_em"
+	strmFile		"MY_CELL.gds"
+	hierDepth		32
+	maxVertices		200
+	refLibList		""
+	strmVersion		"5"
+	arrayInstToScalar
+	case	"preserve"
+	convertDot	"ignore"
+	logFile		"/fake/wa/ewave_simulation/MY_LIB_MY_CELL_layout_em/gds_out.log"
+	cellMap		""
+	layerMap		"/fake/pdk/tech/FAKEPDK.layermap"
+	fontMap		""
+	convertPin		"geometry"
+	pinAttNum		1
+	propMap     ""
+	userSkillFile   ""
+	viaMap  ""
+	summaryFile     ""
+	techLib     ""
+	objectMap   ""

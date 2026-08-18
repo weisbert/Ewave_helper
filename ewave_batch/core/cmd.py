@@ -81,7 +81,8 @@ BUILTIN_DEFAULT_FLAGS: Mapping[str, FlagValue] = MappingProxyType(
 里面**没有**这三类东西，各有理由：
 
 * 机制 flag（`--nogui` / `-m` / `--cadencePins`）—— 在 `locked` 层，由工具自己算；
-* `--key` —— 站点身份，只能从官方 run 目录学（硬约束 1b）；
+* `--key` —— 站点身份，源码里写死一个值就是把站点坐标提交上去了（硬约束 1b）。
+  它的取值只能来自 `SiteFacts.key`，由 `build_flag_layers` 补进 `defaults` 层（见 `KEY_FLAG`）；
 * `--parallel` —— 跟 dsub 的 `cpu=` 联动，见 `build_flag_layers`，写死一个数字会
   在换机型时静默损失算力（BRIEF §6「`--parallel` ≠ `cpu`」）。
 
@@ -90,6 +91,22 @@ BUILTIN_DEFAULT_FLAGS: Mapping[str, FlagValue] = MappingProxyType(
 
 用 `MappingProxyType` 是防手滑：模块级可变 dict 被某个调用方 `.update()` 一下，
 后面所有 run 的默认值就变了，而且完全静默。
+"""
+
+KEY_FLAG = "--key"
+"""`--key` 的 flag 名。**取值永远来自 `SiteFacts.key`，源码里一个字都不写。**
+
+它是 BRIEF §6「已知的生产默认值」里的一员（官方那条命令有它），但它的取值是站点身份 ⇒
+
+* `core.discover.learn_default_flags` 把它当站点身份从「学到的默认表」里**剔掉**了；
+* `BUILTIN_DEFAULT_FLAGS` 里也不许写死它（硬约束 1b）。
+
+于是不特别处理的话它**谁都不给** —— 端到端拼出来的命令缺 `--key`，而官方那条有。
+补的地方是 `build_flag_layers` 的 `defaults` 层，与「`--parallel` 从 `-R` 的 `cpu=` 推导」
+同一处、同一形状：**值来自站点发现，不来自源码常量**。
+
+🚨 `facts.key` 为空时**不许凭空造一个**（`build_flag_layers` 里那个 `if`）——
+编出来的 key 会让 run 直接失败，而且失败原因极难查。宁可缺，也不许编。
 """
 
 DEFAULT_DIFF_IGNORE: tuple[str, ...] = (
@@ -240,6 +257,7 @@ def build_flag_layers(run: Run, ctx: PlanContext) -> FlagLayers:
 
     * `builtin` = `BUILTIN_DEFAULT_FLAGS`
     * `defaults` = `ctx.defaults`（学自官方 run 目录）**+ 从 `-R` 的 `cpu=` 推出来的 `--parallel`**
+      **+ 来自 `SiteFacts.key` 的 `--key`**
     * `extra` = `ctx.extra_flags` + `ctx.design.extra_flags`（per-design 的后写，赢批次级）
     * `axis` = 该 run 每根轴 `resolve_axis_flags` 的结果
     * `locked` = 工具自己算的（`--workDir` / `--gds` / `--top` / `--sparam` / `--all` /
@@ -252,6 +270,11 @@ def build_flag_layers(run: Run, ctx: PlanContext) -> FlagLayers:
     而"用户刚把 `-R` 改成 cpu=40"必须赢过"上次从官方学到的 20"。
     kit 里 ALPS 那条 `-mt` **必须等于** `cpu` 的硬规则**不适用于 eWave**，照抄会损失算力。
 
+    ⚠️ **`--key` 同理**（见 `KEY_FLAG`）：它是生产默认值的一员，但取值是站点身份 ——
+    「学默认表」那一步把它剔掉了、`BUILTIN_DEFAULT_FLAGS` 又不许写死它 ⇒ 不在这里补
+    就谁都不给，端到端拼出来的命令会缺 `--key`。`ctx.defaults` 里已经有（spec 显式给了）
+    就不动它；`facts.key` 为空则**什么都不加** —— 宁可缺，也不许编一个假 key。
+
     不写盘。
     """
     builtin: FlagDict = dict(BUILTIN_DEFAULT_FLAGS)
@@ -261,6 +284,8 @@ def build_flag_layers(run: Run, ctx: PlanContext) -> FlagLayers:
     parallel = _parallel_from_resources(resources, ctx.options.parallel_multiplier)
     if parallel is not None:
         defaults["--parallel"] = parallel
+    if ctx.facts.key and KEY_FLAG not in defaults:
+        defaults[KEY_FLAG] = ctx.facts.key
 
     extra: FlagDict = dict(ctx.extra_flags)
     extra.update(ctx.design.extra_flags)
