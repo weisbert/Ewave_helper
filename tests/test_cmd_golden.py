@@ -98,6 +98,21 @@ class GoldenCommandLine(unittest.TestCase):
 
     # ---------------- 共用的输入构造路径（正反两向都走这一条）----------------
 
+    def axis_owned_flag_names(self) -> frozenset:
+        """内置轴目录里所有被轴掌管的 flag 名。
+
+        **从 `matrix.builtin_axis_catalog()` 现取，不在测试里手抄一份** ——
+        手抄的清单会和轴定义悄悄漂移，而漂移的方向恰好是"某个 flag 不再被当成轴"，
+        于是它又会被拿去和某个 design 的取值钉死。这正是要防的那件事。
+        """
+        from ewave_batch.core import matrix as _matrix
+
+        owned = set()
+        for axis in _matrix.builtin_axis_catalog().values():
+            owned.update(axis.flags)
+        self.assertIn("-e", owned, "前提：网格是轴。轴目录变了的话上面几条测试要重读")
+        return frozenset(owned)
+
     def fixture_flags(self) -> dict:
         return dict(FIXTURE["flags"])
 
@@ -403,30 +418,91 @@ class GoldenCommandLine(unittest.TestCase):
     # ---------------- 内置默认表 vs 真实生产值 ----------------
 
     def test_builtin_defaults_match_production(self) -> None:
-        """`BUILTIN_DEFAULT_FLAGS` 里的每一条都要和真实生产命令对上（BRIEF §6）。
+        """内置默认表 vs 真实生产命令 —— **分两类比，因为它们的性质不同**。
 
-        这张表是"学不到默认表时的兜底"，兜底值要是错的，红区之外拼出来的命令就是错的。
+        ## 这条测试为什么被重写（2026-08-19 红区实测）
+
+        原来它断言「内置默认表的每一条都要和真实生产命令对上」，依据是
+        `PROJECT_BRIEF.md` §6「已知的生产默认值（来自真实生产脚本）」。
+        红区第一次 dry-run 换了**另一个** view 的官方 run 目录，当场推翻了这个前提：
+        网格三件套 0.4 vs **0.5**、`--equalCurrent` 有 vs **没有**、
+        扫频 `0:0.1:40` vs **`0:0.1:30`**。两边都是真实生产命令 ——
+        **设计师给不同 design 配的设定本来就不一样，"生产默认值"这个全局常量不存在。**
+
+        ⇒ 于是分两类：
+
+        * **非轴 flag**（`--viaMode` / `--sparamImpedance` / `--labelDepth` …）——
+          §11 的「默认表」层，影响结果但基本不动，跨 design 应当一致
+          ⇒ **仍然逐条对生产命令，强度一点没降**。
+        * **轴掌管的 flag**（网格 / 扫频 / equalCurrent / 两个 tolerance）——
+          §11 的「界面」层，**就是用来扫的东西**，因 design 而异是它的本分
+          ⇒ 只验形状（键在官方命令里存在），**不验取值**。
+          取值由用户拍板（当前：网格 0.5、equalCurrent 关、0–40 GHz 步进 0.1）。
+
+        拿一个 design 的取值去钉死另一个 design，正是被推翻的那个错误。
         """
         expected = self.fixture_flags()
         builtin = dict(cmd.BUILTIN_DEFAULT_FLAGS)
+        axis_owned = self.axis_owned_flag_names()
+
+        # 形状：内置默认表里的每个键，官方命令里都该有（否则我们在给一个没人认的 flag）
         missing = [flag for flag in builtin if flag not in expected]
         self.assertEqual(missing, [], f"内置默认表里有官方命令没有的 flag: {missing}")
-        diff = cmd.diff_flags(builtin, {flag: expected[flag] for flag in builtin})
+
+        non_axis = {f: v for f, v in builtin.items() if f not in axis_owned}
+        axis_part = {f: v for f, v in builtin.items() if f in axis_owned}
+
+        # 防空过：两类都必须非空，否则这条测试可以因为分类写歪而什么都没比
+        self.assertGreaterEqual(len(non_axis), 3, "非轴那一类空了 —— 分类逻辑有问题")
+        self.assertGreaterEqual(len(axis_part), 3, "轴那一类空了 —— 分类逻辑有问题")
+        self.assertEqual(len(non_axis) + len(axis_part), len(builtin))
+
+        # 非轴：逐条对生产值（原来的强度）
+        diff = cmd.diff_flags(non_axis, {flag: expected[flag] for flag in non_axis})
         self.assertTrue(
             diff.clean,
-            f"内置默认和生产值对不上: {[(d.flag, d.actual, d.expected) for d in diff.differing]}",
+            "非轴的内置默认和生产值对不上（这一类跨 design 应当一致）: "
+            f"{[(d.flag, d.actual, d.expected) for d in diff.differing]}",
         )
-        self.assertEqual(diff.compared_count, len(builtin))
+        self.assertEqual(diff.compared_count, len(non_axis))
         self.assertGreaterEqual(len(builtin), 10, "内置默认表被删空了？")
 
     def test_builtin_defaults_match_production_negative(self) -> None:
-        """反向：把内置默认表的一个值改坏（改副本，不动模块级常量）→ 必须被报出来。"""
+        """反向：把**非轴**那一类的一个值改坏（改副本，不动模块级常量）→ 必须被报出来。
+
+        故意挑非轴的 `--viaMode` —— 轴那一类现在不比取值了，拿它做反向验证会空过。
+        """
         expected = self.fixture_flags()
-        builtin = dict(cmd.BUILTIN_DEFAULT_FLAGS)
-        builtin["--viaMode"] = str(builtin["--viaMode"]) + "7"
-        diff = cmd.diff_flags(builtin, {flag: expected[flag] for flag in builtin})
+        axis_owned = self.axis_owned_flag_names()
+        non_axis = {
+            f: v for f, v in cmd.BUILTIN_DEFAULT_FLAGS.items() if f not in axis_owned
+        }
+        self.assertIn("--viaMode", non_axis, "前提：--viaMode 是非轴的（分类变了就要重写这条）")
+        non_axis["--viaMode"] = str(non_axis["--viaMode"]) + "7"
+        diff = cmd.diff_flags(non_axis, {flag: expected[flag] for flag in non_axis})
         self.assertFalse(diff.clean)
         self.assertEqual([d.flag for d in diff.differing], ["--viaMode"])
+
+    def test_axis_owned_defaults_are_deliberately_not_pinned(self) -> None:
+        """把「轴掌管的默认值不对着任何一个 design 钉死」这件事本身变成断言。
+
+        这条不是在验代码，是在**防止有人把上面那条改回去** —— 红区实测证明了
+        两个 design 的这些值不同，谁再把它们钉死，这条会提醒他先读那段历史。
+        """
+        axis_owned = self.axis_owned_flag_names()
+        builtin = dict(cmd.BUILTIN_DEFAULT_FLAGS)
+        pinned = [f for f in ("-e", "-d", "--viaMergeSpace", "--equalCurrent") if f in builtin]
+        self.assertEqual(
+            sorted(pinned), sorted(f for f in pinned if f in axis_owned),
+            "网格/equalCurrent 应当全部由轴掌管 —— 它们是 §11 的「界面」层",
+        )
+        # 当前取值由用户 2026-08-19 拍板。改它是允许的（改这里就行），
+        # 但**不许**改成"从某个 design 的官方命令抄一份"。
+        self.assertEqual(builtin["-e"], "0.5")
+        self.assertEqual(builtin["-d"], "0.5")
+        self.assertEqual(builtin["--viaMergeSpace"], "0.5")
+        self.assertIs(builtin["--equalCurrent"], False)
+        self.assertEqual(builtin["--multiSweep"], "adaptive,0:0.1:40")
 
     # ---------------- 机制层 ----------------
 

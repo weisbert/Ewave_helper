@@ -91,8 +91,8 @@ EXP_DSUB_RESOURCES = "cpu=20;mem=100000"
 EXP_GDSOUT_FIELD_COUNT = 24
 EXP_PORT_COUNT = 5
 EXP_SIGNAL_COUNT = 4
-EXP_OFFICIAL_FLAG_COUNT = 22
-EXP_PRODUCTION_FLAG_COUNT = 16  # 22 - 6 个站点身份项（见 _SITE_IDENTITY_FLAGS）
+EXP_OFFICIAL_FLAG_COUNT = 21   # 2026-08-19：合成基准跟着新默认去掉了 --equalCurrent
+EXP_PRODUCTION_FLAG_COUNT = 15  # 21 - 6 个站点身份项（见 _SITE_IDENTITY_FLAGS）
 EXP_LEARNED_FLAG_COUNT = 3
 
 # 学出来的默认表 —— 正好是 BRIEF §11「默认表」那一层：影响结果、基本不动、不进目录名。
@@ -654,8 +654,11 @@ class SiteFactsFromSyntheticDir(unittest.TestCase):
         facts = self.facts()
         self.assertEqual(len(facts.official_flags), EXP_OFFICIAL_FLAG_COUNT)
         self.assertIs(facts.official_flags["--nogui"], True)
-        self.assertIs(facts.official_flags["--equalCurrent"], True)
-        self.assertEqual(facts.official_flags["-e"], "0.4")
+        # `--equalCurrent` 现在**不在**合成基准里（2026-08-19 用户把默认改成 OFF，
+        # 合成基准跟着对齐）。裸 flag 的解析形状由 `--nogui` / `-m` 继续覆盖。
+        self.assertNotIn("--equalCurrent", facts.official_flags)
+        self.assertIs(facts.official_flags["--nogui"], True)
+        self.assertEqual(facts.official_flags["-e"], "0.5")
         self.assertEqual(facts.official_flags["--emssTechFile"], EXP_PTXT)
         self.assertEqual(facts.official_flags["--sparamImpedance"], "50")
 
@@ -1044,7 +1047,7 @@ class ProductionCrossCheck(unittest.TestCase):
     def test_flags_match_the_human_extracted_golden_negative(self) -> None:
         """反向：把真实脚本里的 `-e 0.4` 改成 `-e 0.5` —— 必须**且只**报这一处。
 
-        （`-e 0.4` 是 eWave 的工具语义，不是站点坐标，可以写进源码。）
+        （`-e` 的取值是 eWave 的工具语义，不是站点坐标，可以写进源码。）
         """
         script = Path(self.offdir) / "run_ewave_from_kit.sh"
         rewrite(script, "-e 0.4", "-e 0.5")

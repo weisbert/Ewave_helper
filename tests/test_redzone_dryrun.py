@@ -132,7 +132,6 @@ GOLDEN_ARGV: tuple[str, ...] = (
     "--cadencePins=1",  # 机制层
     "--corner=typical",  # 轴（取值来自 fixture 的 --corner）
     f"--emssTechFile={PTXT}",  # 轴（corner 轴同时改这一个，BRIEF §7）
-    "--equalCurrent",  # 源码内置默认（True → 裸 flag）
     f"--gds={BATCH_DIR}/gds/{DESIGN_KEY}.gds",  # 机制层（BRIEF §5 归档布局）
     "--includePortOrder=1",  # 机制层（D1d）—— 官方那条没有，我们有
     "--key=000000",  # 从 SiteFacts.key 补回默认表层（见 redzone_dryrun.KEY_FLAG）
@@ -146,26 +145,29 @@ GOLDEN_ARGV: tuple[str, ...] = (
     "--sparamImpedance=50",  # 学自 fixture 的默认表
     "--temperature=-40.0",  # 轴
     "--top=MY_CELL",  # 机制层 = Design.cell
-    "--viaMergeSpace=0.4",  # 源码内置默认
+    "--viaMergeSpace=0.5",  # 源码内置默认
     "--viaMode=1",  # 学自 fixture 的默认表
     f"--workDir={BATCH_DIR}/runs/{DESIGN_KEY}/base",  # 机制层（D2：每个组合一个独立 workDir）
     # ---- 短 flag（ASCII 下 `--x` 全在 `-x` 前面），每个两项 ----
     "-d",
-    "0.4",  # 源码内置默认
+    "0.5",  # 源码内置默认
     "-e",
-    "0.4",  # 源码内置默认
+    "0.5",  # 源码内置默认
     "-m",  # 机制层（True → 裸 flag）
 )
 """没给 --spec 时那唯一一个 run 的完整 argv。27 项。"""
 
-EXPECTED_ARGV_LEN = 27
-"""= 1 个程序名 + 21 个长 flag + 2×2 个短 flag(带值) + 1 个裸短 flag。人数出来的。"""
+EXPECTED_ARGV_LEN = 26
+"""= 1 个程序名 + 20 个长 flag + 2×2 个短 flag(带值) + 1 个裸短 flag。人数出来的。
 
-EXPECTED_OFFICIAL_FLAGS = 22
-"""fixture 的 README 写死的：那条官方命令有 22 个 ewave flag。"""
+2026-08-19：由 27 减为 26 —— `--equalCurrent` 默认改成 OFF（用户拍板），
+`False` 在 `render_flags` 里不渲染，所以它整个从 argv 里消失了。"""
 
-EXPECTED_COMPARED_FLAGS = 20
-"""参与比较的条数 = 22 − 2。
+EXPECTED_OFFICIAL_FLAGS = 21
+"""fixture 的 README 写死的：那条官方命令有 21 个 ewave flag。"""
+
+EXPECTED_COMPARED_FLAGS = 19
+"""参与比较的条数 = 21 − 2。
 
 减掉的 2 条是 `DEFAULT_DIFF_IGNORE` 里**官方也有**的（`--workDir` / `--gds`）；
 另外两条 `--all` / `--includePortOrder` 只有我们有，官方那边根本没这个键 ⇒
@@ -185,8 +187,8 @@ EXPECTED_SELF_PROVING = ("--key", "--labelDepth", "--sparamImpedance", "--viaMod
 `test_learned_flag_mutation_is_structurally_invisible` 把这条"必然相等"演给人看。
 """
 
-EXPECTED_INDEPENDENT = 16
-"""真独立验证的条数 = 20 − 4。**这个数字才是这趟比对的含金量。**"""
+EXPECTED_INDEPENDENT = 15
+"""真独立验证的条数 = 19 − 4。**这个数字才是这趟比对的含金量。**"""
 
 EXPECTED_PORT_COUNT = 5
 """fixture 里 `-p` 的个数（README 写死：5 个 -p、4 个 -i）。"""
@@ -522,19 +524,19 @@ class EndToEndNegative(unittest.TestCase):
         return _report(offdir)
 
     def test_builtin_default_mismatch_is_reported_negative(self) -> None:
-        """把官方的 `--viaMergeSpace=0.4` 改成 0.8 → 我们仍给 0.4（源码内置）⇒ 必须报差异。
+        """把官方的 `--viaMergeSpace=0.5` 改成 0.8 → 我们仍给 0.5（源码内置）⇒ 必须报差异。
 
         选它而不是选 `--viaMode` 是有讲究的：`--viaMode` 的取值是**学**来的，
         改了官方脚本两边一起变、永远绿（见 `SelfProvingHonesty`）。
         `--viaMergeSpace` 被 mesh 轴掌管 ⇒ 学不进默认表 ⇒ 取值来自源码常量，
         这才是一次真的比较。
         """
-        report = self._mutated_report("--viaMergeSpace=0.4", "--viaMergeSpace=0.8")
+        report = self._mutated_report("--viaMergeSpace=0.5", "--viaMergeSpace=0.8")
         diff = report.comparison.flag_diff
         self.assertEqual(report.comparison.status, "diff")
         self.assertEqual(report.exit_code, rz.EXIT_DIFF)
         self.assertEqual([d.flag for d in diff.differing], ["--viaMergeSpace"])
-        self.assertEqual(diff.differing[0].actual, "0.4")
+        self.assertEqual(diff.differing[0].actual, "0.5")
         self.assertEqual(diff.differing[0].expected, "0.8")
         # 计数不变：只是某一条的取值不同，参与比较的条数还是那么多。
         self.assertEqual(diff.compared_count, EXPECTED_COMPARED_FLAGS)

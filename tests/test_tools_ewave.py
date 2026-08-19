@@ -278,7 +278,6 @@ GOLDEN_ARGV = (
     FAKE_EWAVE_BIN,
     "--all",
     "--cadencePins=1",
-    "--equalCurrent",
     "--gds=/tmp/ewb/gds/d0.gds",
     "--includePortOrder=1",
     "--labelDepth=0",
@@ -289,11 +288,11 @@ GOLDEN_ARGV = (
     "--sparam=TESTCELL",
     "--sparamImpedance=50",
     "--top=TESTCELL",
-    "--viaMergeSpace=0.4",
+    "--viaMergeSpace=0.5",
     "--viaMode=1",
     "--workDir=/tmp/ewb/runs/d0/base",
-    "-d", "0.4",
-    "-e", "0.4",
+    "-d", "0.5",
+    "-e", "0.5",
     "-m",
 )
 """**期望值：手写**，由三份文档逐条推出来（没有一处抄自被测代码的输出）：
@@ -316,6 +315,11 @@ GOLDEN_ARGV = (
 GOLDEN_FLAG_NAMES = (
     "--all",
     "--cadencePins",
+    # ⚠️ `--equalCurrent` **在这张名单里**，尽管它不出现在 argv 里。
+    # 2026-08-19 起它的内置默认是 `False`（用户拍板 OFF）：
+    # `merge_flag_layers` 保留这个键（值 False），`render_flags` 不渲染它。
+    # 两者是不同的东西 —— 键留着才能把学到的默认表里那个 `--equalCurrent` **抵消掉**，
+    # 光是"不写"做不到（INTERFACES 契约 1）。所以名单数不变，argv 长度减一。
     "--equalCurrent",
     "--gds",
     "--includePortOrder",
@@ -334,6 +338,13 @@ GOLDEN_FLAG_NAMES = (
     "-e",
     "-m",
 )
+GOLDEN_UNRENDERED = ("--equalCurrent",)
+"""在 flag dict 里、但**渲染不进 argv** 的那些（值是 `False` = 显式缺席）。
+
+它们存在的意义是**抵消**低层给的同名 flag：学到的默认表里若有 `--equalCurrent`，
+只有一个 `False` 能把它压掉，"不写"做不到（INTERFACES 契约 1）。
+"""
+
 """手写的 flag 名清单 —— 19 个 = 内置默认 10（BRIEF §6）+ 机制层 9（§5 / D1b / D1d）。
 
 计数断言的锚：合并出来的 flag 集合必须恰好是这些。少一个 = 某一层没被合进去，
@@ -353,7 +364,7 @@ class EwavePlan(unittest.TestCase):
         self.assertEqual(plan.argv[0], ewave.ewave_program(_ctx().facts))
 
     def test_build_ewave_plan_argv_golden_negative_wrong_work_dir(self) -> None:
-        """同一条构造路径，只改坏 `work_dir` —— 断言比较逻辑报告了这一处，且**真的比了 19 条**。
+        """同一条构造路径，只改坏 `work_dir` —— 断言比较逻辑报告了这一处，且**真的比了 18 条**。
 
         选 `--workDir` 来改坏不是随便挑的：它是我们绕开"同 corner/temp 静默覆盖"的
         全部手段（D2）。它错了，两个组合的产物会互相覆盖，而两条命令都退 0。
@@ -366,12 +377,27 @@ class EwavePlan(unittest.TestCase):
         # 期望值**不从被测函数取**（那就是自己证明自己）：把手写的 GOLDEN_ARGV 交给
         # `core.template.parse_command_line` 反解成 flag dict —— 一条独立的解析路径。
         expected_flags = template.parse_command_line(" ".join(GOLDEN_ARGV)).flags
-        self.assertEqual(len(expected_flags), len(GOLDEN_FLAG_NAMES))
+        # flag dict 有 19 个键，argv 里只渲染得出 18 个 —— 差的那个是 `--equalCurrent`
+        # （值 False = 显式缺席，见 GOLDEN_FLAG_NAMES 的注释）。
+        # 写成"减去 GOLDEN_UNRENDERED"而不是直接写 18：哪天又多一个 False 的默认，
+        # 这里会逼人回来把它登记进去，而不是把数字改大了事。
+        self.assertEqual(
+            len(expected_flags), len(GOLDEN_FLAG_NAMES) - len(GOLDEN_UNRENDERED)
+        )
+        for unrendered in GOLDEN_UNRENDERED:
+            self.assertNotIn(unrendered, expected_flags, f"{unrendered} 不该出现在 argv 里")
+            self.assertIn(unrendered, plan.flags, f"{unrendered} 应当还在 flag dict 里（值 False）")
+            self.assertIs(plan.flags[unrendered], False)
         diff = cmd.diff_flags(plan.flags, expected_flags)
         self.assertFalse(diff.clean)
         self.assertEqual([d.flag for d in diff.differing], ["--workDir"])
         self.assertEqual(diff.differing[0].actual, "/tmp/ewb/runs/d0/WRONG")
-        self.assertEqual(diff.compared_count, len(GOLDEN_FLAG_NAMES))
+        # 18 而不是 19：`diff_flags` 把「一边是 False、另一边没这个键」算作一致
+        # 并且不计入 compared_count（model 里 FlagValue 的契约）。
+        # 所以这里减掉 GOLDEN_UNRENDERED —— 减法本身就是那条契约的断言。
+        self.assertEqual(
+            diff.compared_count, len(GOLDEN_FLAG_NAMES) - len(GOLDEN_UNRENDERED)
+        )
         self.assertEqual(diff.ignored, ())
 
     def test_flag_names_match_hand_written_list(self) -> None:

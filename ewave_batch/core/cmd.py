@@ -63,10 +63,14 @@ from ..model import (
 BUILTIN_DEFAULT_FLAGS: Mapping[str, FlagValue] = MappingProxyType(
     {
         "--labelDepth": "0",
-        "-e": "0.4",
-        "-d": "0.4",
-        "--viaMergeSpace": "0.4",
-        "--equalCurrent": True,
+        # ★ 网格密度：0.5 = eWave 自己的默认值（用户 2026-08-19 定）。
+        # 原来是 0.4 —— 那是**某一个 design 的某一次运行**的值，见下面「为什么改」。
+        "-e": "0.5",
+        "-d": "0.5",
+        "--viaMergeSpace": "0.5",
+        # ★ 显式 OFF（用户 2026-08-19 定）。`False` = 「显式缺席」，`render_flags` 不渲染它，
+        # 而且它能把学到的默认表里那个 `--equalCurrent` **抵消掉** —— 光是"不写"做不到这件事。
+        "--equalCurrent": False,
         "--viaMode": "1",
         "--multiSweep": "adaptive,0:0.1:40",
         "--sparamImpedance": "50",
@@ -74,7 +78,39 @@ BUILTIN_DEFAULT_FLAGS: Mapping[str, FlagValue] = MappingProxyType(
         "--relativeCurrentTolerance": "0.001",
     }
 )
-"""**兜底**的内置默认（BRIEF §6「已知的生产默认值」）—— 只在没学到默认表时生效。
+"""**兜底**的内置默认。只在没学到默认表时生效。
+
+## ⚠️ 2026-08-19 红区实测推翻了这张表原来的立论，务必读一遍
+
+原来这张表整个抄自 `PROJECT_BRIEF.md` §6「已知的生产默认值（**来自真实生产脚本**）」——
+而那串值只来自**一个 design 的一次运行**（MVP 用的那个 run 目录）。§6 的标题是单数的，
+我们却把它当成了"生产默认值"这样一个全局常量。
+
+红区第一次 dry-run（换了**另一个** view 的官方 run 目录）当场把这个假设打掉了：
+
+| flag | MVP 那个目录 | 另一个目录 |
+|---|---|---|
+| `-e` / `-d` / `--viaMergeSpace` | 0.4 / 0.4 / 0.4 | **0.5 / 0.5 / 0.5**（= eWave 自己的默认） |
+| `--equalCurrent` | 有 | **没有** |
+| `--multiSweep` | `adaptive,0:0.1:40` | `adaptive,0:0.1:30` |
+
+两边都是"真实生产命令"，只是**设计师给这两个 design 配的设定本来就不一样** ——
+一个调过网格、一个用了 GUI 默认。所以"生产默认值"这个东西根本不存在。
+
+⇒ 这张表的定位因此改了：**它不再声称"复现生产"，它是"用户选定的兜底默认"。**
+当前取值由用户 2026-08-19 拍板：网格 0.5/0.5/0.5（eWave 默认）、`--equalCurrent` 关、
+频率 0–40 GHz 步进 0.1 自适应。
+
+**不要再拿它去对任何一个官方 run 目录求逐条相等** —— 那正是上面那个错误。
+`tests/test_cmd_golden.py` 里对应的测试已经按这条重写：非轴 flag 仍逐条对生产命令，
+轴掌管的 flag 只验形状、不验取值（因为它们本来就因 design 而异）。
+
+真正想"复现某个 design 官方那次"的话，路径是 `core.discover.learn_default_flags`
+从那个 run 目录学，或者在 spec/界面上把轴显式写死 —— 不是改这张表。
+
+---
+
+原文保留：
 
 §11 规则 1 是"默认表的值不写死在源码，第一次运行时从官方 run 目录学"，所以这张表的地位
 是**最低层**：`ctx.defaults`（学来的）一来就把它盖掉。它存在的意义只有一个 ——
