@@ -28,6 +28,8 @@ from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 
 from ..model import (
+    RUN_LOG_NAME,
+    RUN_LOG_TEMPLATE,
     GDS_DIRNAME,
     LONG_FLAG_ASSIGN,
     PLACEHOLDER_PTXT,
@@ -518,6 +520,20 @@ def render_flags(flags: FlagDict) -> list[str]:
     return argv
 
 
+def _run_log_name(run: Run) -> str:
+    """这个 run 的 stdout 日志文件名 —— **每个 run 一份**，不是固定的 `run.log`。
+
+    与 `core.layout` 的 `_per_run_name` 是同一条规矩、同一个理由（见 `model.CMD_SH_TEMPLATE`）：
+    `<axes-slug>` 不含 corner/temperature ⇒ 同一个 `run_dir` 下有 N 个 run。
+    这里刻意**不 import `core.layout`**（那会把 cmd 层绑到布局层），但两边必须给出同一个名字，
+    所以 `tests/test_cmd_log_path.py` 有一条断言把它们钉在一起 —— 各写各的才是真危险。
+    """
+    stem = run.ewave_dir or run.run_id.rsplit("/", 1)[-1].strip()
+    if not stem:
+        return RUN_LOG_NAME
+    return RUN_LOG_TEMPLATE.format(stem=stem)
+
+
 def build_command_plan(run: Run, ctx: PlanContext) -> CommandPlan:
     """一个 run → 完整 `CommandPlan`（阶段 2）。四层合并 + 冲突检测 + argv 渲染都在这。
 
@@ -557,7 +573,14 @@ def build_command_plan(run: Run, ctx: PlanContext) -> CommandPlan:
         design_key=run.design_key,
         flags=flags,
         port_spec=port_spec,
-        log_path=posixpath.join(run.work_dir, "run.log"),
+        # ⚠️ **不是**固定的 `run.log`。`<axes-slug>` 按定义不含 corner/temperature，
+        # 所以同一个 `work_dir` 底下住着 N 个 run；写死固定名 ⇒ N 条命令的 log_path 指向
+        # 同一个文件，而 `sched.donau` 拿它当 `dsub -o` ⇒ N 个 job 的 stdout 混进一份日志。
+        # 症状不是崩溃，是日志「看起来有」—— 出事时你翻开它，里面是几个 job 交织的输出。
+        # 与 `model.RunPaths.run_log` / `CMD_SH_TEMPLATE` 同一条规矩（2026-08-18 已为 cmd.sh
+        # 修过一次，这里是同一个坑的第二处）。词根取 `<corner>_<temp>`，预测不出来时退回
+        # run_id 的最后一段（`expand_runs` 保证它在同一个 run_dir 下唯一）。
+        log_path=posixpath.join(run.work_dir, _run_log_name(run)),
     )
 
 
