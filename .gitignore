@@ -23,6 +23,10 @@ site.local.sh
 # 构建产物
 mvp/mvp_pack.sh
 mvp/dist/
+deploy/dist/
+# 部署运行时状态（备份 / staging / scratch）——只存在于装好的那台机器上。
+# 开发机上跑一次 deploy/doctor.sh 也会建出来，别让它混进提交。
+.deploy/
 
 # 本机专属（写死了 memory 目录的绝对路径 → 换机器需重建，见记忆 memory-maintenance-discipline）
 .claude/settings.local.json

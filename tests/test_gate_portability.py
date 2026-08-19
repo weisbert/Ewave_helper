@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -102,6 +103,26 @@ class RedzoneScanFileSet(unittest.TestCase):
     # 既验到了我改的东西（**扫哪些文件**，与命中哪条规则无关），又顺带验了第 2 层词表生效。
     LOCAL_PATTERN = "NOT_A_REAL_TOKEN_[0-9]+"
     BAIT = 'tag = "NOT_A_REAL_TOKEN_42"\n'
+
+    @classmethod
+    def setUpClass(cls):
+        """平台性 skip（2026-08-19，P6 部署实测发现）。
+
+        这三条验的是**开发侧的提交闸门**，需要两样东西：`git`（要建临时 repo）
+        和 `scripts/redzone_scan.sh`。装到红区的那份包里两样都没有 ——
+        红区本来就没装 git，而闸门脚本被 `.gitattributes` `export-ignore` 掉了
+        （理由见 `deploy/README.md`「为什么 scripts/ 不进包」）。
+        而 `bash deploy/doctor.sh --test` 会跑这一整套测试。
+
+        不跳的话，红区会看到三条**与安装质量无关**的红 —— 而「一套全绿的测试」
+        正是那台没网的机器上唯一能拿到的最强证据，被这三条毁掉太亏。
+        开发机上 git 和脚本都在，所以这条**永远不会**在这里跳过：
+        闸门本身的牙一颗没少。
+        """
+        if shutil.which("git") is None:
+            raise unittest.SkipTest("平台性 skip：这台机器没有 git（装好的红区安装目录的正常情况）")
+        if not Path(cls.SCAN).exists():
+            raise unittest.SkipTest("平台性 skip：这份安装里没有 scripts/redzone_scan.sh（它只在开发机上）")
 
     def _tmp_repo(self, stack):
         d = Path(stack.enter_context(tempfile.TemporaryDirectory()))

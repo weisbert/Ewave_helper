@@ -21,6 +21,23 @@ docs/OVERNIGHT.md export-ignore
 mockups/         export-ignore
 mvp/             export-ignore
 
+# scripts/ 下这四条是**开发侧的提交闸门**，不是产品的一部分：
+# 每一条开头都是 `git rev-parse --show-toplevel`，而红区没有 git ⇒ 装过去就是
+# 四个必然 `exit 1`（`check.sh` 连一行说明都不打）的脚本。实测（2026-08-19）：
+# 把它们 copy 到一个非 git 目录里跑，`check.sh` / `redzone_scan.sh` /
+# `redzone_crosscheck.sh` 全部 exit 1，其中两条只打 "not a git repo"。
+# 红区用户敲一句 `sh scripts/check.sh` 得到一个没头没尾的 exit 1，会以为装坏了 ——
+# 这正是「假红」，和 CRLF 一样属于最没法调试的那一类。
+# 而且它们的职责是「拦住红区坐标别进 public GitHub」，在红区内部本来就没有意义。
+# 红区侧的等价物是 `deploy/doctor.sh --test`（跑装好的整套单测）。
+#
+# ⚠ 逐条列名而**不是**写 `scripts/`：保持「新加的脚本自动进包」这条零维护性质。
+# 以后再往 scripts/ 加东西，默认仍然进包，除非它也只能在开发机上跑。
+scripts/check.sh              export-ignore
+scripts/redzone_scan.sh       export-ignore
+scripts/redzone_crosscheck.sh export-ignore
+scripts/install_hooks.sh      export-ignore
+
 # 版本戳 ------------------------------------------------------------------
 # `git archive` 会把下面这行替换掉；工作树里它保持字面量。
 # 红区那边靠它回答「我现在装的是哪一版」—— 对一个当信道用的库，这个问题很常问。
