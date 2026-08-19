@@ -812,3 +812,118 @@ class LazyTkinterImport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(TK_SKIP, TK_SKIP)
+class SplitDividerIsDraggable(unittest.TestCase):
+    """1c 的左右分隔必须是**可拖的 sash**，左栏宽度必须由**内容**决定。
+
+    ## 出处：2026-08-19 用户实测 + 截图
+
+    原来 split 的写法是 `Frame(width=452)` + `pack_propagate(False)` + `ttk.Separator`：
+
+    * `Separator` 是画上去的一条线，**拖不动** —— 用户明确反馈了这一条；
+    * `pack_propagate(False)` 把左栏钉死在 452px，内容超出就**被裁掉**。
+      裁掉的东西里包括 **Corner 那行的第 5 个勾选框（`typical`）** ——
+      最常用的工艺角**点不到**。那不是观感问题，是功能缺陷。
+
+    452 是照设计稿抄的，而设计稿是拿 Windows 默认字体画的；红区是 Linux，
+    字体度量不同 ⇒ 同样的内容更宽、裁得更狠。**任何写死的像素宽度都会在气隙对面
+    变成另一个 bug**，所以这里钉的不是"宽度等于多少"，而是"宽度不许被写死"。
+    """
+
+    def setUp(self) -> None:
+        import tkinter
+
+        self.root = tkinter.Tk()
+        self.root.withdraw()
+
+    def tearDown(self) -> None:
+        self.root.destroy()
+
+    def _build_split(self):
+        """用**真的** `GuiState` 而不是 StubBridge。
+
+        这几条测的是「真实内容有多宽」——替身给的是空数据，撑不出真实宽度，
+        测出来的结论就不是用户看到的那个界面（而这几条正是为一个"用户看到了、
+        我们没看到"的 bug 加的）。
+        """
+        from gui.state import GuiState
+
+        module = LAYOUTS["split"]
+        return module.build_frame(self.root, GuiState())
+
+    def _walk(self, widget):
+        yield widget
+        for child in widget.winfo_children():
+            yield from self._walk(child)
+
+    def test_split_uses_a_paned_window(self) -> None:
+        """分隔条得是 `ttk.Panedwindow` 的 sash —— 那才是能拖的东西。"""
+        from tkinter import ttk
+
+        frame = self._build_split()
+        paned = [w for w in self._walk(frame) if isinstance(w, ttk.Panedwindow)]
+        self.assertEqual(
+            len(paned), 1,
+            "split 里应当恰好有一个 PanedWindow（左右两栏之间那个可拖的分隔）",
+        )
+        # 两个 pane：左配置、右 Runs。计数断言 —— 少一个就说明有一栏没被放进去，
+        # 那时 sash 无处可拖，等于退回了不可拖的老样子。
+        self.assertEqual(len(paned[0].panes()), 2)
+
+    def test_no_pane_has_propagation_disabled(self) -> None:
+        """`pack_propagate(False)` / `grid_propagate(False)` 是内容被裁的直接原因。
+
+        它们的语义是"我不管孩子要多大，我就这么大"。在一个字体度量会变的目标平台上，
+        这等于"到了那边就裁给你看"。整棵树里都不许有。
+        """
+        frame = self._build_split()
+        offenders = []
+        for widget in self._walk(frame):
+            try:
+                if widget.pack_propagate() is False or widget.grid_propagate() is False:
+                    offenders.append(str(widget))
+            except Exception:  # pragma: no cover - 个别控件不支持这两个查询
+                continue
+        self.assertEqual(
+            offenders, [],
+            "这些控件关掉了尺寸传播，内容超出时会被静默裁掉：%s" % offenders,
+        )
+
+    def test_left_pane_is_wide_enough_for_its_content(self) -> None:
+        """左栏**请求**的宽度要能装下它最宽的那个子控件。
+
+        这条是「typical 勾选框看不见」那个 bug 的直接判据：内容要求 N 像素，
+        左栏却只有 452，差额就是被裁掉的部分。
+        """
+        from tkinter import ttk
+
+        frame = self._build_split()
+        frame.update_idletasks()
+        paned = [w for w in self._walk(frame) if isinstance(w, ttk.Panedwindow)][0]
+        left = frame.nametowidget(paned.panes()[0])
+        need = max((c.winfo_reqwidth() for c in left.winfo_children()), default=0)
+        self.assertGreater(need, 0, "左栏一个子控件都没有？前提变了，这条测试要重写")
+        self.assertGreaterEqual(
+            left.winfo_reqwidth(), need,
+            "左栏请求的宽度装不下它自己的内容 —— 超出的部分会被裁掉，"
+            "而被裁掉的东西是点不到的",
+        )
+
+    def test_split_window_is_wider_than_the_shared_default_negative(self) -> None:
+        """反向的一半：1c 的默认窗口必须比共用默认宽。
+
+        左栏由内容决定宽度之后，共用的 1180 减掉它，右边 Runs 表只剩四百来像素 ——
+        而"勾选和 run 表同屏"是选这一版的**全部理由**。表被挤瘦 = 理由没了。
+        """
+        module = LAYOUTS["split"]
+        shared = int(_ui_module().BaseApp.GEOMETRY.split("x")[0])
+        mine = int(module.SplitApp.GEOMETRY.split("x")[0])
+        self.assertGreater(mine, shared, "1c 的默认窗口应当比共用默认更宽")
+
+
+def _ui_module():
+    from gui import _ui
+
+    return _ui

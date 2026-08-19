@@ -43,8 +43,26 @@ SECTIONS: tuple[str, ...] = (
 """
 
 LEFT_WIDTH = 452
-"""左栏宽度（px）。照设计稿 1c；`pack_propagate(False)` 把它钉住，
-否则里面的 Settings 一撑，右边的 Runs 表就没地方了。"""
+"""左栏的**起始**宽度（px），照设计稿 1c。**下限不是它，内容说了算**。
+
+⚠️ 2026-08-19 用户实测反馈 + 截图确认：原来这里是 `width=LEFT_WIDTH` 配
+`pack_propagate(False)`，把左栏**硬钉死**在 452px。后果不是"有点挤"，是**内容被裁掉**：
+
+* `Add row` / `Remove row` 两个按钮被切成 `Add ro` / `Remov`；
+* Corner 那行的**第 5 个勾选框（`typical`）整个看不见** —— 最常用的工艺角**点不到**，
+  这是功能性缺陷不是观感问题；
+* `+ Advanced` 摘要行、Resources 的提示行右侧全被截断。
+
+根因有两条，都得治：
+
+1. 452 这个数字是照设计稿抄的，而设计稿是用 Windows 默认字体画的。真实内容
+   （Designs 三列 120+130+110 = 360 + 侧边按钮 ~90 + padding）本来就超过它。
+2. **红区是 Linux，默认字体度量与开发机不同** ⇒ 同样的内容更宽，裁得更狠。
+   任何写死的像素宽度都会在气隙对面变成另一个样子。
+
+⇒ 现在用 `ttk.PanedWindow`：起始位置取 `max(LEFT_WIDTH, 左栏内容要求的宽度)`，
+**并且分隔条可以拖**。写死的像素只决定"一开始多宽"，不再决定"最多多宽"。
+"""
 
 RUN_ROWS = 25
 """右栏能留几行 run。1c 的全部优势就在这个数字上（1a 只有 ~9 行）。"""
@@ -53,22 +71,34 @@ RUN_ROWS = 25
 class SplitApp(_ui.BaseApp):
     """1c：batchbar / 左配置 / 右 Runs / actionbar / statusbar。"""
 
+    GEOMETRY = "1560x900"
+    """比另外两版宽。1c 是**左右分栏**：左边那条配置栏的宽度由内容决定（见 LEFT_WIDTH），
+    共用层的默认 1180 减掉它之后，右边的 Runs 表只剩四百来像素 —— 而"勾选和 run 表同屏"
+    正是选这一版的**全部理由**，表被挤瘦就等于把这个理由丢了。
+
+    2026-08-19 用户反馈「屏幕显示太窄」+ 截图确认后加的。窗口管理器会自己夹到屏幕尺寸，
+    所以在小屏上不会出事；大屏上多出来的宽度按 weight 全给右边。
+    """
+
     def layout(self) -> None:
         root = self.frame
 
         self.build_batchbar(root).pack(fill=tk.X)
         ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
-        body = ttk.Frame(root)
+        # 可拖的分隔条。用 PanedWindow 而不是 Frame + Separator：
+        # 后者的分隔线是画上去的，拖不动，左栏宽度就成了写死的（见 LEFT_WIDTH 的注释）。
+        body = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
 
-        left = ttk.Frame(body, width=LEFT_WIDTH, padding=(8, 8, 6, 4))
-        left.pack(side=tk.LEFT, fill=tk.Y)
-        left.pack_propagate(False)
-        ttk.Separator(body, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y)
-
+        left = ttk.Frame(body, padding=(8, 8, 6, 4))
         right = ttk.Frame(body, padding=(8, 8, 8, 4))
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # weight=0：窗口变大时多出来的空间**全给右边的 Runs 表**，左栏宽度不动。
+        # 左栏装的是固定几行设定，越拉越宽没有意义；表格多一行都是赚的。
+        body.add(left, weight=0)
+        body.add(right, weight=1)
+        self._paned = body
+        self._left_pane = left
 
         self.build_designs(left, widths=(120, 130, 110), rows=3).pack(fill=tk.X, pady=(4, 6))
         self.build_settings(left, compact=True, show_formula=True).pack(fill=tk.X, pady=(0, 6))
@@ -79,10 +109,43 @@ class SplitApp(_ui.BaseApp):
         )
         self.build_detail(right).pack(fill=tk.X, pady=(6, 0))
 
+        # sash 初始位置：见 `_place_sash`。必须等窗口**真正映射**之后才算得准，
+        # 所以绑在第一次 <Configure> 上，而不是 after_idle。
+        self._sash_done = False
+        body.bind("<Configure>", self._place_sash, add="+")
+
         ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
         self.build_actionbar(root).pack(fill=tk.X)
         ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
         self.build_statusbar(root).pack(fill=tk.X)
+
+
+    def _place_sash(self, _event: object = None) -> None:
+        """把分隔条放到「左栏内容真正需要的宽度」上。
+
+        取 `max(LEFT_WIDTH, left.winfo_reqwidth())`：设计稿的 452 只当**下限**，
+        内容更宽就听内容的 —— 红区是 Linux，字体度量和开发机不同，
+        任何写死的像素数到那边都会重新变成一个裁剪 bug（这正是 2026-08-19 那次的根因）。
+
+        绑在第一次 `<Configure>` 上而不是 `after_idle`：窗口还没映射时
+        `winfo_width()` 是 1，`sashpos` 会被 Tk **夹到 0**，左栏当场整个消失
+        （2026-08-19 修这个 bug 时第一版就是这么翻车的，截图为证）。
+        所以要等到 paned 自己有真实宽度了再放，放完一次就不再动 —— 用户拖过之后
+        不该被我们回弹。`EWB_SMOKE=1` 不进 mainloop ⇒ 不触发，也不需要。
+        """
+        if self._sash_done:
+            return
+        try:
+            total = self._paned.winfo_width()
+            if total <= 1:
+                return  # 还没映射，Tk 会把 sashpos 夹到 0 —— 等下一次 <Configure>
+            want = max(LEFT_WIDTH, self._left_pane.winfo_reqwidth())
+            # 别把右边挤没了：最多占一半。
+            want = min(want, max(LEFT_WIDTH, total // 2))
+            self._paned.sashpos(0, want)
+            self._sash_done = True
+        except tk.TclError:  # pragma: no cover - 窗口已经关掉的竞态
+            pass
 
 
 def build_frame(parent: object, bridge: object) -> object:
