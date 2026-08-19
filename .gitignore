@@ -44,3 +44,16 @@ venv/
 *.msh
 ewave.log
 batches/
+
+# 合成 fixture（P4 logparse）——「运行产物」那几条会误伤它，这里放行。
+# 它们不是运行产物，是手写的测试素材：行格式照抄证据、**数值全是编的**
+# （出处表见 tests/fixtures/ewave_log_synthetic/README.md）。
+# 不放行的话上面的 `ewave.log` 和 `*.s[0-9]p` 会把它们挡在 git 外面 ——
+# 本机测试全绿，别人克隆下来却少文件，而且是**静默**少。
+!tests/fixtures/ewave_log_synthetic/**
+# 但真实日志永远挡着：这两条把 `*.local` / `*.local.*` 重新排除回去，
+# 免得有人图省事把红区日志放进这个已放行的目录。
+# （真实日志的正确落点是 tests/fixtures/*.local.* —— 见第 7 行那条规则，
+#   目录形式请用 `<name>.local.d/`，它同样命中那条。）
+tests/fixtures/ewave_log_synthetic/**/*.local
+tests/fixtures/ewave_log_synthetic/**/*.local.*

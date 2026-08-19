@@ -30,9 +30,20 @@ set -u
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "not a git repo"; exit 1; }
 cd "$ROOT" || exit 1
 
-EVIDENCE=references
-if [ ! -d "$EVIDENCE" ]; then
-    echo "crosscheck: skip —— 本机没有 $EVIDENCE/（公开克隆者的正常情况，无证据可核对）"
+# 证据源**不止 references/**。2026-08-19 夜跑 P4 又漏了一次，漏在这儿：
+# 泄漏的值来自 `PROJECT_BRIEF.md` §10（红区实测数值），而当时本脚本只扫 references/ ⇒ 报 clean。
+# 同一课第二次：P3 漏的是 kit 里的 job id，这次漏的是 BRIEF 里的测量值。
+# 根因不是规则不够严，是**证据源覆盖不全** —— 凡是「不进 git 的红区资料」都该算证据。
+EVIDENCE_DIRS="references"
+EVIDENCE_FILES="PROJECT_BRIEF.md ENVIRONMENT.local.md"
+
+EVIDENCE=""
+for _d in $EVIDENCE_DIRS; do [ -d "$_d" ] && EVIDENCE="$EVIDENCE $_d"; done
+for _f in $EVIDENCE_FILES; do [ -f "$_f" ] && EVIDENCE="$EVIDENCE $_f"; done
+EVIDENCE=$(echo "$EVIDENCE" | sed 's/^ *//')
+
+if [ -z "$EVIDENCE" ]; then
+    echo "crosscheck: skip —— 本机没有红区资料（公开克隆者的正常情况，无证据可核对）"
     exit 0
 fi
 
@@ -46,7 +57,7 @@ trap 'rm -f "$TOKENS" "$HITS"' EXIT
 # 候选 token：长数字串（可带一个字母前缀，工号就是那个形状）。
 # 7 位是刻意的下限：eWave 的工具语义数值（0.4 / 200 / 50 / 1e-05 / 401）都远短于它，
 # 而 job id / 工号 / 长 id 都到得了。短了会淹在噪声里，长了会漏。
-grep -rhoE '[A-Za-z]?[0-9]{7,}' "$EVIDENCE" 2>/dev/null | grep -vE '^[0-9]0*$' | sort -u > "$TOKENS"
+grep -rhoE '[A-Za-z]?[0-9]{7,}' $EVIDENCE 2>/dev/null | grep -vE '^[0-9]0*$' | sort -u > "$TOKENS"
 # `grep -vE '^[0-9]0*$'` 剔掉"整数量级"（1000000000 = 1e9 的单位换算、100000000 …）。
 # 它们是**工具语义的数值**不是 id：`mvp/redzone/step4_verify.sh` 里就有一个 1000000000
 # 用来把 Hz 换算成 GHz。留着它们只会制造假阳性，而假阳性多了闸门就会被人关掉。

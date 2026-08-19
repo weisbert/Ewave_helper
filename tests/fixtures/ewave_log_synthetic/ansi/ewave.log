@@ -1,0 +1,13 @@
+[1meWave 9999.99.sp9[0m
+]0;ewave running[info] reading layout from synthetic.gds
+[36m[info][0m All Ports size is [32m4[0m:
+Port: PIN_A PIN_B PIN_C PIN_D
+Ground:
+Execute em[0mesh done.
+[2mExecute eresist done.[22m
+[info] Invalid Via count: 0
+Sweep on [1m21[0m points.
+Calculated on [1;33m3[0m points.
+Execute emsolver done.M
+[info] 0 error, 0 warning
+Wall Clock Time: 1[0m11 s

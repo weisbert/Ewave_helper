@@ -1,0 +1,10 @@
+[info] emsolver start, 4 threads
+[info] All Ports size is 4:
+Port: PIN_A PIN_B PIN_C PIN_D
+Ground:
+[info] iterative solver converged in 7 steps
+Calculated on 3 points.
+peak memory: 7.5 GB
+average cpu usage: 250%
+Execute emsolver done.
+Wall Clock Time: 96 s

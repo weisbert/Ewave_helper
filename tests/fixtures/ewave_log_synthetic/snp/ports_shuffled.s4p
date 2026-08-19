@@ -1,0 +1,7 @@
+! Synthetic Touchstone - port comments deliberately out of numeric order.
+! Port[3] = PIN_C | ref
+! Port[1] = PIN_A | ref
+! Port[4] = PIN_D | ref
+! Port[2] = PIN_B | ref
+# HZ   S   RI   R    50
+1.0e9  0.1 0.0 0.2 0.0 0.3 0.0 0.4 0.0

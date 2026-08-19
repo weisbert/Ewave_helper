@@ -1,0 +1,13 @@
+eWave 9999.99.sp9
+[info] reading layout from synthetic.gds
+[info] All Ports size is 4:
+Port: PIN_A PIN_B PIN_C PIN_D
+Ground:
+Execute emesh done.
+Execute eresist done.
+[info] Invalid Via count: 0
+Sweep on 21 points.
+Calculated on 3 points.
+Execute emsolver done.
+[info] 0 error, 0 warning
+Wall Clock Time: 111 s
