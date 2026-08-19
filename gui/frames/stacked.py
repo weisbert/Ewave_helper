@@ -1,0 +1,387 @@
+# -*- coding: utf-8 -*-
+"""布局 A —— Stacked：单窗口纵向堆叠（草图 1a，`mockups/stacked.py`）。
+
+Batch -> Designs -> Settings -> Resources -> Runs 全部同屏，勾一下和它的后果隔不到几厘米。
+代价：Runs 表只剩 ~9 行。
+
+**这个模块只负责摆放。** 八个 section 的控件由 `gui/` 共用层（`gui._ui.BaseApp`）的
+`build_<section>` 出，frame 里不许有业务逻辑；要跟核心说话一律走 `bridge`
+（`ewave_batch.model.GuiBridgeProtocol`）。这正是草图的结构：`mockups/_ui.py` 提供构件，
+三个 frame 只写布局。
+
+🚨 模块顶层**不许 import tkinter**，也不许 import 共用层（它自己 import tkinter）——
+CLAUDE.md 硬约束 5：无 ``$DISPLAY`` 的纯 ssh 会话里 CLI 必须照常可用。
+`python -m ewave_batch dry-run --self-test` 会 import 本模块，那时也不该碰显示。
+
+headless 冒烟（`scripts/check.sh` 第 5 步）::
+
+    EWB_SMOKE=1 python -m gui.frames.stacked     # 必须退 0
+
+界面上给用户看的字符串一律**英文**（照 SNP_RLC_Extractor 的先例，用户 2026-08-18 定）；
+代码注释仍然中文。
+"""
+
+from __future__ import annotations
+
+import importlib
+import inspect
+import os
+import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - 只为类型检查，运行时一行都不 import
+    from collections.abc import Sequence
+
+    from ewave_batch.model import GuiBridgeProtocol, TickReport
+
+LAYOUT_NAME = "stacked"
+"""本模块的布局名。三版互不相同，且等于模块名（`tests/test_gui_frames.py` 盯着）。"""
+
+SECTIONS: tuple[str, ...] = (
+    "batchbar",
+    "designs",
+    "settings",
+    "resources",
+    "runs",
+    "detail",
+    "actionbar",
+    "statusbar",
+)
+"""三版**必须暴露同一组**顶层构件 —— 这是「界面手感一致」唯一的机器判据。
+
+名字对应共用层的 `build_<section>`，和 `mockups/_ui.py` 里那八个 `build_*` 一一对上。
+布局只决定它们摆在哪、留几行，**不决定有没有**：少一个 section 就是三版分岔的开始。
+"""
+
+SECTION_TITLES: dict[str, str] = {
+    "batchbar": "Batch",
+    "designs": "Designs",
+    "settings": "Settings",
+    "resources": "Resources",
+    "runs": "Runs",
+    "detail": "Selected run",
+    "actionbar": "Actions",
+    "statusbar": "Status",
+}
+"""占位构件上写的标题（共用层缺席时才用得上）。界面字符串 = 英文。"""
+
+BRIDGE_METHODS: tuple[str, ...] = (
+    "axes",
+    "cancel",
+    "command_text",
+    "designs",
+    "load_spec",
+    "plan",
+    "runs",
+    "start",
+    "summary",
+    "tick",
+)
+"""`model.GuiBridgeProtocol` 的全部方法。测试断言这份清单与冻结面**逐字相等**。
+
+写死一份是为了让参数检查不必 import model（frame 该能独立建起来），
+但「写死的这份和冻结面对不上」必须当场红 —— 不许两边慢慢漂开。
+"""
+
+SHARED_LAYER_MODULE = "gui._ui"
+"""共用构件层。`build_frame` 惰性 import 它（它自己 import tkinter，顶层碰不得）。"""
+
+SHARED_LAYER_BRIDGE_EXTRAS: tuple[str, ...] = (
+    "axis_selection",
+    "batch_name",
+    "extra_flags_text",
+    "official_run_dir",
+    "submit_command",
+    "sweep",
+)
+"""⚠️ **已报备的接口缺口**：`gui._ui.BaseApp` 建界面时用到的这几样，
+`model.GuiBridgeProtocol` 里**没有**（冻结面只有 10 个方法，见 `BRIDGE_METHODS`）。
+
+于是「满足冻结面」的 bridge 不一定喂得饱共用层。这里拿它当**判据**而不是当假设：
+bridge 有这些 → 走共用层，建真界面；没有（例如只实现冻结面的测试替身）→ 走占位版，
+布局照样建得起来、headless 冒烟照样退 0。
+
+正解是把这几样并进 `GuiBridgeProtocol`（或从共用层里挪走），走
+`[interface-change]` 流程 —— 已写进本阶段的 `interface_change_requests`。
+在那之前，这份名单是两边之间唯一的桥，**不许悄悄扩张**。
+"""
+
+
+def import_shared_layer() -> object | None:
+    """惰性 import 共用构件层。没有 tkinter / 共用层还没写 → None，**绝不 ImportError**。
+
+    理由：`gui.frames.*` 要能被 self-test import、要能在没有显示的机器上 headless 冒烟，
+    这两件事都不该因为共用层缺席而炸。
+    """
+    try:
+        return importlib.import_module(SHARED_LAYER_MODULE)
+    except ImportError:
+        return None
+
+
+def shared_layer_usable(shared: object | None, bridge: object) -> bool:
+    """能不能走共用层：它得有 `BaseApp` + `build`，bridge 得喂得饱它。
+
+    两个条件都**显式检查**，不靠 try/except 兜底 —— 吞掉 AttributeError 会把共用层的
+    真 bug 变成「界面少了一半但没人报错」。
+    """
+    if shared is None:
+        return False
+    if not isinstance(getattr(shared, "BaseApp", None), type):
+        return False
+    if not callable(getattr(shared, "build", None)):
+        return False
+    return all(hasattr(bridge, name) for name in SHARED_LAYER_BRIDGE_EXTRAS)
+
+
+def describe_argument_problems(parent: object, bridge: object) -> list[str]:
+    """检查 `build_frame` 的两个入参，返回问题描述（空 list = 干净）。
+
+    单独一个函数是为了让测试能不起 Tk 就验它，**也为了让错误发生在建任何控件之前**：
+    参数坏了要当场喊，不许静默建出半个界面 —— 半个界面比崩掉更难查。
+    """
+    problems: list[str] = []
+    if parent is None or not hasattr(parent, "tk"):
+        problems.append(
+            "parent must be a tkinter container widget, got %s" % type(parent).__name__
+        )
+    missing = [name for name in BRIDGE_METHODS if not callable(getattr(bridge, name, None))]
+    if missing:
+        problems.append(
+            "bridge does not satisfy GuiBridgeProtocol, missing: %s" % ", ".join(missing)
+        )
+    return problems
+
+
+def build_section(kit: object | None, name: str, parent: object, bridge: object, **hints: object):
+    """建一个 section，返回 `(widget, 被丢掉的布局提示)`。
+
+    `kit` 是构件层：`gui._ui.BaseApp` 的实例，或 None（占位版）。
+    `hints` 是**布局提示**（`rows=9` / `compact=True` / …）：构件层接哪个就给哪个，
+    不接的**报告出来**而不是悄悄吞掉 —— 「Runs 表能留几行」正是三版分岔的地方，
+    静默丢失会让三个布局长得一模一样却没人发现。
+    """
+    builder = getattr(kit, "build_" + name, None) if kit is not None else None
+    if not callable(builder):
+        return _placeholder(parent, name), tuple(sorted(hints))
+    try:
+        params = inspect.signature(builder).parameters
+    except (TypeError, ValueError):  # pragma: no cover - C 实现的可调用对象，签名读不到
+        params = {}
+    takes_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    if takes_kwargs:
+        accepted = dict(hints)
+        dropped: tuple[str, ...] = ()
+    else:
+        accepted = {k: v for k, v in hints.items() if k in params}
+        dropped = tuple(sorted(k for k in hints if k not in params))
+    if takes_kwargs or "bridge" in params:
+        accepted["bridge"] = bridge
+    return builder(parent, **accepted), dropped
+
+
+def _placeholder(parent: object, name: str):
+    """共用层缺席时的占位构件 —— 让布局仍然建得起来，且一眼看得出缺了什么。"""
+    from tkinter import ttk
+
+    box = ttk.LabelFrame(parent, text=" %s " % SECTION_TITLES.get(name, name), padding=6)
+    ttk.Label(box, text="Shared widget layer unavailable (placeholder).").pack(anchor="w")
+    return box
+
+
+def count_widgets(widget: object) -> int:
+    """整棵子树里有多少个 widget（含自己）。冒烟拿它当「树真的建起来了」的数字判据。"""
+    return 1 + sum(count_widgets(child) for child in widget.winfo_children())
+
+
+def place_sections(kit: object | None, root: object, bridge: object) -> dict:
+    """把八个 section 摆进 `root` —— **本版布局的全部内容**，两条路共用这一份。
+
+    摆放照 `mockups/stacked.py`：批次栏在顶、状态栏在底，中间从上到下
+    Designs / Settings / Resources / Runs / Selected run / 动作栏。
+
+    返回 `{"built": (...), "dropped": (...)}`，好让 `build_frame` 挂到 frame 上、
+    让测试不起整个 app 也能验「递给构件层的布局参数对不对」。
+    """
+    import tkinter as tk
+    from tkinter import ttk
+
+    built: list[str] = []
+    dropped: list[str] = []
+
+    def section(name: str, where: object, **hints: object):
+        widget, missed = build_section(kit, name, where, bridge, **hints)
+        built.append(name)
+        dropped.extend("%s.%s" % (name, key) for key in missed)
+        return widget
+
+    section("batchbar", root).pack(fill=tk.X)
+    ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+    body = ttk.Frame(root, padding=(8, 6))
+    body.pack(fill=tk.BOTH, expand=True)
+
+    # 草图 1a 的取舍：Designs 只留 2 行、Runs 只留 9 行，换「全部同屏」。
+    section("designs", body, widths=(250, 250, 210), rows=2).pack(fill=tk.X, pady=(4, 6))
+    section("settings", body, compact=False, show_formula=False).pack(fill=tk.X, pady=(0, 6))
+    section("resources", body).pack(fill=tk.X, pady=(0, 6))
+    section("runs", body, rows=9).pack(fill=tk.BOTH, expand=True)
+    section("detail", body).pack(fill=tk.X, pady=(6, 0))
+    section("actionbar", body).pack(fill=tk.X, pady=(4, 0))
+
+    ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
+    section("statusbar", root).pack(fill=tk.X)
+
+    return {"built": tuple(built), "dropped": tuple(dropped)}
+
+
+def build_frame(parent: object, bridge: GuiBridgeProtocol) -> object:
+    """建 stacked 版的主 frame，返回它的根 widget。
+
+    有共用层且 bridge 喂得饱它 → 真界面（`gui._ui.build` 造 app，`layout()` 里摆 section）；
+    否则 → 占位版（同样八个 section，控件是占位框）。走了哪条路看 `frame.widget_kit_name`。
+
+    入参坏了抛 `TypeError`，**在建任何控件之前**。
+    """
+    problems = describe_argument_problems(parent, bridge)
+    if problems:
+        raise TypeError("gui.frames.%s.build_frame: %s" % (LAYOUT_NAME, "; ".join(problems)))
+
+    shared = import_shared_layer()
+    placed: dict = {}
+    if shared_layer_usable(shared, bridge):
+
+        class StackedApp(shared.BaseApp):  # type: ignore[misc, name-defined]
+            """布局 A 的 app —— 只实现 `layout()`，其它全在共用层里。"""
+
+            def layout(self) -> None:
+                placed.update(place_sections(self, self.frame, self.bridge))
+
+        frame = shared.build(StackedApp, parent, bridge)
+        kit_name = SHARED_LAYER_MODULE
+    else:
+        from tkinter import ttk
+
+        frame = ttk.Frame(parent)
+        placed = place_sections(None, frame, bridge)
+        kit_name = ""
+
+    frame.layout_name = LAYOUT_NAME
+    frame.sections_built = placed.get("built", ())
+    frame.dropped_hints = placed.get("dropped", ())
+    frame.widget_kit_name = kit_name
+    return frame
+
+
+class NullBridge:
+    """一个只满足冻结面的 bridge —— 独立 headless 冒烟专用（共用层缺席时的那条路）。
+
+    它证明的只有一件事：**控件树建得起来**。业务对不对由 `gui.state.GuiState`
+    和它自己的测试负责。故意不 import model：冒烟不该依赖任何还在写的模块。
+    """
+
+    def load_spec(self, path: str) -> None:
+        return None
+
+    def plan(self) -> None:
+        return None
+
+    def start(self, *, dry_run: bool = False) -> None:
+        return None
+
+    def tick(self) -> TickReport | None:
+        return None
+
+    def cancel(self) -> None:
+        return None
+
+    def runs(self) -> tuple:
+        return ()
+
+    def designs(self) -> tuple:
+        return ()
+
+    def axes(self) -> tuple:
+        return ()
+
+    def command_text(self, run_id: str) -> str:
+        return ""
+
+    def summary(self) -> dict:
+        return {}
+
+
+def smoke() -> int:
+    """独立 headless 自检：建完整棵控件树就销毁，**不进 mainloop**。退出码就是判据。
+
+    走的是「只满足冻结面的 bridge」那条路 —— 于是这条冒烟不依赖 `gui.app` / `gui.state`，
+    共用层还没写完时也能证明本布局自己是好的。整条产品路径由
+    `EWB_SMOKE=1 python -m gui.frames.stacked` 走（那条会经过共用层）。
+
+    tkinter 没装 / 没有显示 → 打印一句人话后**退 0**：那是平台降级（tier 3），
+    和 self-test 把 import 失败报成 `blocked:` 是同一个判断。
+    tkinter 在、建树炸了 → 让异常原样抛出去，那才是真 bug。
+    """
+    try:
+        import tkinter as tk
+    except ImportError as exc:  # pragma: no cover - 本机装了 tkinter
+        print("smoke %s: skipped, tkinter is not installed (%s)" % (LAYOUT_NAME, exc))
+        return 0
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:  # pragma: no cover - 本机有显示
+        print("smoke %s: skipped, no display (%s)" % (LAYOUT_NAME, exc))
+        return 0
+    try:
+        root.withdraw()
+        frame = build_frame(root, NullBridge())
+        frame.pack(fill="both", expand=True)
+        root.update_idletasks()
+        print(
+            "smoke %s: ok, %d/%d sections, %d widgets, kit=%s"
+            % (
+                LAYOUT_NAME,
+                len(frame.sections_built),
+                len(SECTIONS),
+                count_widgets(frame),
+                frame.widget_kit_name or "none (placeholders)",
+            )
+        )
+        if frame.widget_kit_name and frame.dropped_hints:
+            # 静默丢掉布局提示 = 三版长得一样却没人发现，所以这里必须出声。
+            print(
+                "smoke %s: layout hints ignored by %s: %s"
+                % (LAYOUT_NAME, frame.widget_kit_name, ", ".join(frame.dropped_hints))
+            )
+    finally:
+        root.destroy()
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """入口。三版共用 `gui._ui.frame_main`（同一份代码 → 三版行为必然一致）。
+
+    `--smoke` 是本模块自己的逃生口：不经共用层、不经 `gui.app`，只证明这一版布局
+    自己建得起来。共用层缺席时 `EWB_SMOKE=1` 也退回它 —— 闸门第 5 步不该因为
+    别人的模块没写完而红。
+    """
+    from ewave_batch._stdio import ascii_safe_stdio
+
+    ascii_safe_stdio()
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--smoke" in args:
+        return smoke()
+    shared = import_shared_layer()
+    if shared is None or not callable(getattr(shared, "frame_main", None)):
+        if os.environ.get("EWB_SMOKE") == "1":
+            return smoke()
+        print(
+            "%s is not available; cannot open a window (try --smoke)." % SHARED_LAYER_MODULE,
+            file=sys.stderr,
+        )
+        return 2
+    return int(shared.frame_main(LAYOUT_NAME, args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
