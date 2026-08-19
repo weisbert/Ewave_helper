@@ -221,7 +221,7 @@ def archive_run(paths: RunPaths, run: Run, *, keep: Sequence[str] = (), keep_log
 def check_port_consistency(state: BatchState) -> list[str]:
     # 批次内互相比对每个 run 的端口列表，返回问题描述（空 list = 一致）。
 def port_count_from_suffix(path: str) -> int | None:
-    # 从 `.s17p` / `.y16p` 这种后缀里取端口数；认不出返回 None。不读文件内容。
+    # 从 `.s4p` / `.y3p` 这种后缀里取端口数；认不出返回 None。不读文件内容。
 def state_to_dict(state: BatchState) -> dict[str, object]:
     # `BatchState` → 可 JSON 序列化的 dict（枚举落 `.value`，元组落 list）。纯函数。
 def state_from_dict(data: Mapping[str, object]) -> BatchState:

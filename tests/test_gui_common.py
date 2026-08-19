@@ -452,6 +452,11 @@ class LazyImport(unittest.TestCase):
             cwd=str(ROOT),
             capture_output=True,
             text=True,
+            # 显式 encoding/errors：`text=True` 默认按本机 locale 解码子进程输出，
+            # 而子进程可能吐 UTF-8 ⇒ 读取线程抛 UnicodeDecodeError、stdout 变 None，
+            # 把真正的失败原因盖掉。见 tests/test_cli.py::_python 的长注释。
+            encoding="utf-8",
+            errors="replace",
             timeout=180,
         )
 
@@ -591,6 +596,11 @@ class HeadlessBuild(_SmokeTest):
             cwd=str(ROOT),
             capture_output=True,
             text=True,
+            # 显式 encoding/errors：`text=True` 默认按本机 locale 解码子进程输出，
+            # 而子进程可能吐 UTF-8 ⇒ 读取线程抛 UnicodeDecodeError、stdout 变 None，
+            # 把真正的失败原因盖掉。见 tests/test_cli.py::_python 的长注释。
+            encoding="utf-8",
+            errors="replace",
             env=env,
             timeout=180,
         )
@@ -605,6 +615,11 @@ class HeadlessBuild(_SmokeTest):
             cwd=str(ROOT),
             capture_output=True,
             text=True,
+            # 显式 encoding/errors：`text=True` 默认按本机 locale 解码子进程输出，
+            # 而子进程可能吐 UTF-8 ⇒ 读取线程抛 UnicodeDecodeError、stdout 变 None，
+            # 把真正的失败原因盖掉。见 tests/test_cli.py::_python 的长注释。
+            encoding="utf-8",
+            errors="replace",
             env=env,
             timeout=180,
         )

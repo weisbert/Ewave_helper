@@ -620,7 +620,7 @@ class Driver:
         所以直接看目录：`sparam/<design>__<slug>__<corner>_<temp>` + 后缀。
 
         🚨 **不是裸 `startswith`。** 词根后面只认 `core.layout._flat_suffix` 会产生的那两种形状：
-        `.s17p` 和 `_sample.s17p`。裸前缀会让温度 `25.0` 的 run 把 `25.05` 的产物也认领走
+        `.s4p` 和 `_sample.s4p`。裸前缀会让温度 `25.0` 的 run 把 `25.05` 的产物也认领走
         （`typical_25_0` 是 `typical_25_05` 的前缀）—— 与 MVP 那个 `--sparam` 前缀吃掉
         `--sparamImpedance` 的真 bug 是同一类，而且症状同样好看：两个 run 都"有产物"。
         """

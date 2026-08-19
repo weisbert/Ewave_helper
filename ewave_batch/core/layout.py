@@ -8,7 +8,7 @@
   runs.csv                          汇总表
   gds/<design>.gds                  阶段 1 的产物，整个设定矩阵共用（D1a）
   gdsout/<design>.gdsout_setup      渲染出来的 strmout 模板，留档可追溯（D1c）
-  sparam/<design>__<slug>__<corner>_<temp>.s17p    成功 run 的参数文件扁平汇聚
+  sparam/<design>__<slug>__<corner>_<temp>.s4p    成功 run 的参数文件扁平汇聚
   runs/<design>/<axes-slug>/        ← ★ --workDir 指到这里
     cmd.sh                          该 run 的完整命令（可单独手工重跑）
     <corner>_<temp>/                ← ★ eWave 自己建的那层，我们控制不了名字
@@ -116,8 +116,8 @@ SET_CURRENT_LOG_NAME = "set_current.log"
 """`set_run_as_current` 的审计日志。写进批次的 `logs/`，**不写进 spine**。"""
 
 _TOUCHSTONE_SUFFIX = re.compile(r"\.([A-Za-z])(\d+)[pP]$")
-"""Touchstone 后缀：`.s17p` / `.y16p` / `.z2p`。**锚在字符串末尾** ——
-`x.s17p.bak` 不算，那是备份不是产物。"""
+"""Touchstone 后缀：`.s4p` / `.y3p` / `.z2p`。**锚在字符串末尾** ——
+`x.s4p.bak` 不算，那是备份不是产物。"""
 
 _SAMPLE_MARK = "_sample"
 """eWave 顺带产的「求解器真算过的频点」那份（BRIEF §5 官方布局）。
@@ -227,7 +227,7 @@ def _atomic_write_text(path: str, text: str, *, newline: str = "\n") -> None:
 
 
 def _is_sparam_name(name: str) -> bool:
-    """是不是 S 参数产物（`.s17p` / `.S17P`）。`.y17p` 不算 —— 用户只要 S 参数（D5）。"""
+    """是不是 S 参数产物（`.s4p` / `.S17P`）。`.y4p` 不算 —— 用户只要 S 参数（D5）。"""
     match = _TOUCHSTONE_SUFFIX.search(name)
     return bool(match) and match.group(1).lower() == "s"
 
@@ -235,10 +235,10 @@ def _is_sparam_name(name: str) -> bool:
 def _flat_suffix(name: str) -> str | None:
     """扁平区文件名里接在 `RunPaths.sparam_prefix` 后面的那一截。
 
-    `<Cell>_<corner>_<temp>.s17p`        → `.s17p`
-    `<Cell>_<corner>_<temp>_sample.s17p` → `_sample.s17p`
+    `<Cell>_<corner>_<temp>.s4p`        → `.s4p`
+    `<Cell>_<corner>_<temp>_sample.s4p` → `_sample.s4p`
 
-    端口数来自产物本身（`.s17p` 的 17），所以 prefix 不带后缀 —— 见 `RunPaths.sparam_prefix`。
+    端口数来自产物本身（`.s4p` 的 17），所以 prefix 不带后缀 —— 见 `RunPaths.sparam_prefix`。
     认不出 Touchstone 后缀的文件返回 None（= 不进扁平区，只留在 run 目录里）。
     """
     match = _TOUCHSTONE_SUFFIX.search(name)
@@ -420,7 +420,7 @@ def write_cmd_sh(paths: RunPaths, plan: CommandPlan, *, dry_run: bool = False) -
 
 
 def port_count_from_suffix(path: str) -> int | None:
-    """从 `.s17p` / `.y16p` 这种后缀里取端口数；认不出返回 None。不读文件内容。"""
+    """从 `.s4p` / `.y3p` 这种后缀里取端口数；认不出返回 None。不读文件内容。"""
     match = _TOUCHSTONE_SUFFIX.search(_posix(str(path)))
     if match is None:
         return None
@@ -580,7 +580,7 @@ def archive_run(
 
     * `keep` 是 fnmatch 模式（默认用 `BatchOptions.archive_keep`）。
     * run 失败且 `keep_logs_on_failure` → 保留 `ewave.log` / `emsolver.log` 做诊断。
-    * 扁平区的文件名 = `RunPaths.sparam_prefix` + 原后缀（`.s17p` 这种，端口数来自产物本身）。
+    * 扁平区的文件名 = `RunPaths.sparam_prefix` + 原后缀（`.s4p` 这种，端口数来自产物本身）。
     * **删除只在 `paths.ewave_dir` 里发生**，别的地方一个文件都不许删。
     写盘（`dry_run=True` 时只报告不动手）。
 

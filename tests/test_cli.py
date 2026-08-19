@@ -1070,6 +1070,17 @@ def _python(code: str) -> subprocess.CompletedProcess:
         cwd=ROOT,
         capture_output=True,
         text=True,
+        # ⚠️ **必须显式给 encoding/errors，不能靠 `text=True` 的默认值。**
+        # 默认是「用这台机器的 locale 编码解码子进程输出」——本机 locale 是 GBK，
+        # 而子进程在 PYTHONIOENCODING=utf-8 下吐 UTF-8 ⇒ 读取线程里抛 UnicodeDecodeError，
+        # `proc.stdout`/`stderr` 双双变成 None，随后 `proc.stdout + proc.stderr` 抛 TypeError，
+        # **把真正的失败原因盖掉**。2026-08-19 实测：
+        #   python -m unittest tests.test_cli.LazyImport            -> OK
+        #   PYTHONIOENCODING=utf-8 python -m unittest ...           -> ERROR（就是这个）
+        # 又是一条「绿得取决于跑测试那台机器的偶然状态」——本项目今晚栽过的同一类。
+        # 红区 locale 与本机不同，那边会稳定发作。
+        encoding="utf-8",
+        errors="replace",
         timeout=180,
     )
 

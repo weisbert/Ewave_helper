@@ -104,11 +104,11 @@ class Syntax(unittest.TestCase):
         sh = shutil.which("sh") or shutil.which("dash")
         if sh is None:  # pragma: no cover
             self.skipTest("平台性 skip：本机没有 sh/dash")
-        proc = subprocess.run([sh, "-n", BUNDLE], capture_output=True, text=True, errors="replace")
+        proc = subprocess.run([sh, "-n", BUNDLE], capture_output=True, text=True, encoding="utf-8", errors="replace")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_bash_syntax(self) -> None:
-        proc = subprocess.run([_bash(), "-n", BUNDLE], capture_output=True, text=True, errors="replace")
+        proc = subprocess.run([_bash(), "-n", BUNDLE], capture_output=True, text=True, encoding="utf-8", errors="replace")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_shebang_is_plain_sh(self) -> None:

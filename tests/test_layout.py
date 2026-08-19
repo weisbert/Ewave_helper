@@ -64,13 +64,13 @@ EWAVE_DIR = "typical_-40_0"
 CELL_STEM = "demo_cell_typical_-40_0"
 """官方产物的文件名形状：`<Cell>_<corner>_<temp>`（BRIEF §5 那棵树）。"""
 
-PORTS_17 = tuple(f"pin{index:02d}" for index in range(17))
+PORTS_4 = tuple(f"pin{index:02d}" for index in range(4))
 
 PARAM_FILES = (
-    f"{CELL_STEM}.s17p",
-    f"{CELL_STEM}.y17p",
-    f"{CELL_STEM}_sample.s17p",
-    f"{CELL_STEM}_sample.y17p",
+    f"{CELL_STEM}.s4p",
+    f"{CELL_STEM}.y4p",
+    f"{CELL_STEM}_sample.s4p",
+    f"{CELL_STEM}_sample.y4p",
 )
 """BRIEF §5 官方布局里的 **4 个参数文件**（S/Y × 全量/_sample）。"""
 
@@ -92,7 +92,7 @@ D5 说这些要删掉 —— 用户"手动一个一个 copy"的来源就是它�
 def make_run(
     *,
     axes_slug: str = "base",
-    ports: tuple[str, ...] = PORTS_17,
+    ports: tuple[str, ...] = PORTS_4,
     status: RunStatus = RunStatus.DONE,
 ) -> Run:
     """本文件里所有测试共用的 run 构造路径（正反两条测试必须走同一条，见配方 3）。"""
@@ -199,7 +199,7 @@ class ComputeRunPaths(unittest.TestCase):
         #   `  batch.json` / `  runs.csv`
         #   `  gds/<design>.gds`
         #   `  gdsout/<design>.gdsout_setup`
-        #   `  sparam/<design>__<axes-slug>__<corner>_<temp>.s17p`
+        #   `  sparam/<design>__<axes-slug>__<corner>_<temp>.s4p`
         #   `  runs/<design>/<axes-slug>/`  ← ★ --workDir 指到这里
         #   `    cmd.sh`
         #   `    <corner>_<temp>/`          ← ★ eWave 自己建的那层
@@ -451,15 +451,15 @@ class WriteCmdSh(unittest.TestCase):
 class PortCountFromSuffix(unittest.TestCase):
     def test_reads_the_port_count(self) -> None:
         # 期望值手写。来源：BRIEF §5 官方布局里的真实文件名形状
-        # （`<Cell>_<corner>_<temp>.s17p` / `.y17p`），以及 model 里 `port_count_from_suffix`
-        # 的 docstring（"从 .s17p / .y16p 这种后缀里取端口数"）。
+        # （`<Cell>_<corner>_<temp>.s4p` / `.y4p`），以及 model 里 `port_count_from_suffix`
+        # 的 docstring（"从 .s4p / .y3p 这种后缀里取端口数"）。
         cases = {
-            "demo_cell_typical_-40_0.s17p": 17,
-            "demo_cell_typical_-40_0.y17p": 17,
-            "demo_cell_typical_-40_0_sample.s17p": 17,
-            "/batches/demo/sparam/x__base__typical_-40_0.s16p": 16,
+            "demo_cell_typical_-40_0.s4p": 4,
+            "demo_cell_typical_-40_0.y4p": 4,
+            "demo_cell_typical_-40_0_sample.s4p": 4,
+            "/batches/demo/sparam/x__base__typical_-40_0.s3p": 3,
             "a.s2p": 2,
-            "A.S17P": 17,
+            "A.S9P": 9,
         }
         for path, expected in cases.items():
             with self.subTest(path=path):
@@ -474,7 +474,7 @@ class PortCountFromSuffix(unittest.TestCase):
             "resist.rst",
             "ewave.log",
             "demo_cell.gds",
-            "demo_cell_typical_-40_0.s17p.bak",  # 备份不是产物
+            "demo_cell_typical_-40_0.s4p.bak",  # 备份不是产物
             "demo_cell.snp",  # N 不是数字
             "demo_cell.s0p",  # 0 端口 = 认不出，不是 0
         )
@@ -500,7 +500,7 @@ class VerifyRunOutputs(unittest.TestCase):
             report = layout.verify_run_outputs(paths, run)
         self.assertTrue(report.ok, report.reasons)
         self.assertEqual(report.reasons, ())
-        self.assertEqual(report.port_count, 17)
+        self.assertEqual(report.port_count, 4)
         self.assertEqual(len(report.sparam_files), 1)
         self.assertGreater(report.total_bytes, 0)
 
@@ -541,30 +541,30 @@ class VerifyRunOutputs(unittest.TestCase):
         """`--all` 的代价：pin 集合一变所有端口编号平移，**而且静默**（BRIEF §5）。"""
         with tempfile.TemporaryDirectory() as tmp:
             paths, run = build_run_dir(
-                f"{tmp}/demo".replace("\\", "/"), sparam_name=f"{CELL_STEM}.s16p"
+                f"{tmp}/demo".replace("\\", "/"), sparam_name=f"{CELL_STEM}.s3p"
             )
-            self.assertEqual(len(run.ports), 17, "前提：这个 run 有 17 个端口")
+            self.assertEqual(len(run.ports), 4, "前提：这个 run 有 4 个端口")
             report = layout.verify_run_outputs(paths, run)
-        self.assertFalse(report.ok, ".s16p 配 17 端口的 run 被放行了 —— 静默错位就是这么来的")
+        self.assertFalse(report.ok, ".s3p 配 4 端口的 run 被放行了 —— 静默错位就是这么来的")
         self.assertTrue(any("端口数不符" in reason for reason in report.reasons), report.reasons)
-        self.assertEqual(report.port_count, 16)
+        self.assertEqual(report.port_count, 3)
 
     def test_port_count_mismatch_is_rejected_negative(self) -> None:
-        """同一个构造路径，只把 `.s16p` 换回 `.s17p` → 必须通过。"""
+        """同一个构造路径，只把 `.s3p` 换回 `.s4p` → 必须通过。"""
         with tempfile.TemporaryDirectory() as tmp:
             paths, run = build_run_dir(
-                f"{tmp}/demo".replace("\\", "/"), sparam_name=f"{CELL_STEM}.s17p"
+                f"{tmp}/demo".replace("\\", "/"), sparam_name=f"{CELL_STEM}.s4p"
             )
             report = layout.verify_run_outputs(paths, run)
         self.assertTrue(report.ok, report.reasons)
-        self.assertEqual(report.port_count, 17)
+        self.assertEqual(report.port_count, 4)
 
     # ---- 其余边角 ---------------------------------------------------------
 
     def test_explicit_expected_port_count_wins(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths, run = build_run_dir(f"{tmp}/demo".replace("\\", "/"))
-            report = layout.verify_run_outputs(paths, run, expected_port_count=16)
+            report = layout.verify_run_outputs(paths, run, expected_port_count=3)
         self.assertFalse(report.ok)
         self.assertTrue(any("端口数不符" in reason for reason in report.reasons))
 
@@ -580,7 +580,7 @@ class VerifyRunOutputs(unittest.TestCase):
     def test_mixed_port_counts_in_one_run_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths, run = build_run_dir(f"{tmp}/demo".replace("\\", "/"))
-            write_file(f"{paths.ewave_dir}/{CELL_STEM}_sample.s16p", "! touchstone\n")
+            write_file(f"{paths.ewave_dir}/{CELL_STEM}_sample.s3p", "! touchstone\n")
             report = layout.verify_run_outputs(paths, run)
         self.assertFalse(report.ok)
         self.assertTrue(any("不一致" in reason for reason in report.reasons), report.reasons)
@@ -595,19 +595,19 @@ ALL_KEEP = ("*.s[0-9]*p", "*.y[0-9]*p")
 默认表只留 S 参数（`BatchOptions.archive_keep`），另有一条测试盯着它。"""
 
 # 手写期望值。来源：BRIEF §5「归档布局」的
-#   `sparam/<design>__<axes-slug>__<corner>_<temp>.s17p`
+#   `sparam/<design>__<axes-slug>__<corner>_<temp>.s4p`
 EXPECTED_FLAT_NAMES = (
-    "demo_lib_demo_cell_layout__base__typical_-40_0.s17p",
-    "demo_lib_demo_cell_layout__base__typical_-40_0.y17p",
-    "demo_lib_demo_cell_layout__base__typical_-40_0_sample.s17p",
-    "demo_lib_demo_cell_layout__base__typical_-40_0_sample.y17p",
+    "demo_lib_demo_cell_layout__base__typical_-40_0.s4p",
+    "demo_lib_demo_cell_layout__base__typical_-40_0.y4p",
+    "demo_lib_demo_cell_layout__base__typical_-40_0_sample.s4p",
+    "demo_lib_demo_cell_layout__base__typical_-40_0_sample.y4p",
 )
 
 
 def build_finished_run(batch_dir: str, *, broken: bool = False, status: RunStatus = RunStatus.DONE):
     """造一个官方形状的 run 目录：4 个参数文件 + 9 个中间件。
 
-    正向和 `_negative` **共用这一个构造路径**，`broken=True` 只把主 `.s17p` 弄成 0 字节。
+    正向和 `_negative` **共用这一个构造路径**，`broken=True` 只把主 `.s4p` 弄成 0 字节。
     """
     run = make_run(status=status)
     paths = layout.compute_run_paths(batch_dir, DESIGN, run)
@@ -664,7 +664,7 @@ class ArchiveRun(unittest.TestCase):
                 self.assertGreater(os.path.getsize(f"{paths.sparam_dir}/{name}"), 0)
 
     def test_counts_kept_and_removed_negative(self) -> None:
-        """同一个构造路径，只把主 `.s17p` 弄成 0 字节 → **先验后删**：一个都不许删。
+        """同一个构造路径，只把主 `.s4p` 弄成 0 字节 → **先验后删**：一个都不许删。
 
         0 字节产物是实测过的真坑（BRIEF §10）。此时 mesh 和日志正是诊断材料。
         """
@@ -688,7 +688,7 @@ class ArchiveRun(unittest.TestCase):
         """`BatchOptions.archive_keep` 默认只留 S 参数（D5：用户明确只要 S 参数）。
 
         顺带是过滤器的过/欠匹配测试：`*.s[0-9]*p` 必须
-        **同时**盖住 `.s17p` 和 `_sample.s17p`、**且不许**吃掉 `.y17p` 或 `pmsh.gtxt.msh`。
+        **同时**盖住 `.s4p` 和 `_sample.s4p`、**且不许**吃掉 `.y4p` 或 `pmsh.gtxt.msh`。
         """
         with tempfile.TemporaryDirectory() as tmp:
             paths, run, _ = build_finished_run(f"{tmp}/demo".replace("\\", "/"))
@@ -696,11 +696,11 @@ class ArchiveRun(unittest.TestCase):
 
             self.assertEqual(
                 sorted(report.kept),
-                sorted([f"{CELL_STEM}.s17p", f"{CELL_STEM}_sample.s17p"]),
+                sorted([f"{CELL_STEM}.s4p", f"{CELL_STEM}_sample.s4p"]),
             )
             self.assertEqual(len(report.removed), 11)
             self.assertEqual(len(report.kept) + len(report.removed), 13)
-            self.assertIn(f"{CELL_STEM}.y17p", report.removed, "Y 参数默认不留（D5）")
+            self.assertIn(f"{CELL_STEM}.y4p", report.removed, "Y 参数默认不留（D5）")
             self.assertIn("pmsh.gtxt.msh", report.removed, "mesh 中间件不许被 keep 模式误吃")
 
     def test_keep_pattern_that_matches_nothing_deletes_nothing(self) -> None:
@@ -783,7 +783,7 @@ class PortConsistency(unittest.TestCase):
         BRIEF §5：设计师改一个 pin 名 ⇒ 所有端口编号平移 ⇒ 归档的 .sNp 和 nport
         **静默**错位，两份数字还挺像。
         """
-        drifted = list(PORTS_17)
+        drifted = list(PORTS_4)
         drifted[3] = "pin03_renamed"
         runs = [
             make_run(axes_slug="base"),
@@ -801,7 +801,7 @@ class PortConsistency(unittest.TestCase):
             design_key="other_design",
             axes_slug="base",
             ewave_dir=EWAVE_DIR,
-            ports=tuple(f"pin{i:02d}" for i in range(16)),
+            ports=tuple(f"pin{i:02d}" for i in range(3)),
         )
         self.assertEqual(layout.check_port_consistency(self._state([make_run(), other])), [])
 
@@ -873,8 +873,8 @@ def rich_state(batch_dir: str) -> BatchState:
                 attempts=1,
                 wall_seconds=12.5,
                 argv=("ewave", "--nogui"),
-                artifacts=("sparam/demo.s17p",),
-                ports=PORTS_17,
+                artifacts=("sparam/demo.s4p",),
+                ports=PORTS_4,
                 log_facts=LogFacts(ok=False, converged=None, peak_memory_mb=1024.5),
                 message="崩了但 exit=0",
             ),
@@ -1047,7 +1047,7 @@ class RunsCsv(unittest.TestCase):
         self.assertEqual(
             lines[2],
             "demo_lib_demo_cell_layout,demo_lib_demo_cell_layout/eqI-off/typical_-40_0,"
-            "eqI-off,typical_-40_0,failed,1234,,,12.5,1024.5,17,,sparam/demo.s17p,崩了但 exit=0",
+            "eqI-off,typical_-40_0,failed,1234,,,12.5,1024.5,4,,sparam/demo.s4p,崩了但 exit=0",
         )
         self.assertEqual(lines[-1], "", "最后一行该是 LF 收尾")
 
@@ -1081,7 +1081,7 @@ class SetRunAsCurrent(unittest.TestCase):
     def _official(self, tmp: str) -> str:
         """造一个官方 design 目录（BRIEF §5「官方流程的既有布局」的形状）。"""
         official = f"{tmp}/spine/{DESIGN_DIR}".replace("\\", "/")
-        write_file(f"{official}/{EWAVE_DIR}/{CELL_STEM}.s17p", "OLD DATA\n")
+        write_file(f"{official}/{EWAVE_DIR}/{CELL_STEM}.s4p", "OLD DATA\n")
         return official
 
     def test_copies_with_backup_and_log(self) -> None:
@@ -1091,7 +1091,7 @@ class SetRunAsCurrent(unittest.TestCase):
 
             actions = layout.set_run_as_current(paths, run, DESIGN, target_dir=official)
 
-            dest = f"{official}/{EWAVE_DIR}/{CELL_STEM}.s17p"
+            dest = f"{official}/{EWAVE_DIR}/{CELL_STEM}.s4p"
             with open(dest, encoding="utf-8") as handle:
                 self.assertEqual(handle.read(), "NEW DATA\n", "没把新数据落到官方路径上")
             backups = [n for n in os.listdir(f"{official}/{EWAVE_DIR}") if ".bak." in n]
@@ -1113,10 +1113,10 @@ class SetRunAsCurrent(unittest.TestCase):
 
             actions = layout.set_run_as_current(paths, run, DESIGN, target_dir=official, dry_run=True)
 
-            dest = f"{official}/{EWAVE_DIR}/{CELL_STEM}.s17p"
+            dest = f"{official}/{EWAVE_DIR}/{CELL_STEM}.s4p"
             with open(dest, encoding="utf-8") as handle:
                 self.assertEqual(handle.read(), "OLD DATA\n", "dry-run 改了设计师的 spine")
-            self.assertEqual(os.listdir(f"{official}/{EWAVE_DIR}"), [f"{CELL_STEM}.s17p"])
+            self.assertEqual(os.listdir(f"{official}/{EWAVE_DIR}"), [f"{CELL_STEM}.s4p"])
             self.assertFalse(os.path.exists(f"{paths.logs_dir}/{layout.SET_CURRENT_LOG_NAME}"))
             self.assertTrue(all(line.startswith("[dry-run]") for line in actions), actions)
 
@@ -1135,7 +1135,7 @@ class SetRunAsCurrent(unittest.TestCase):
             paths, run = build_run_dir(f"{tmp}/demo".replace("\\", "/"), sparam_text="")
             with self.assertRaises(StateError):
                 layout.set_run_as_current(paths, run, DESIGN, target_dir=official)
-            with open(f"{official}/{EWAVE_DIR}/{CELL_STEM}.s17p", encoding="utf-8") as handle:
+            with open(f"{official}/{EWAVE_DIR}/{CELL_STEM}.s4p", encoding="utf-8") as handle:
                 self.assertEqual(handle.read(), "OLD DATA\n")
 
     def test_target_may_be_the_ewave_dir_itself(self) -> None:

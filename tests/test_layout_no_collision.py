@@ -203,7 +203,7 @@ class DiscoverEwaveDirAtVerifyTime(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = self._run_dir_with(
-                tmp, {"typical_-40_0": {"x.s17p": "!", "ewave.log": "ok"}}
+                tmp, {"typical_-40_0": {"x.s4p": "!", "ewave.log": "ok"}}
             )
             found = _discover_ewave_dirs(run_dir)
             self.assertEqual(len(found), 1)
@@ -225,7 +225,7 @@ class DiscoverEwaveDirAtVerifyTime(unittest.TestCase):
                 tmp,
                 {
                     "scratch": {"notes.txt": "not an ewave output"},
-                    "typical_-40_0": {"x.s17p": "!"},
+                    "typical_-40_0": {"x.s4p": "!"},
                 },
             )
             found = _discover_ewave_dirs(run_dir)
@@ -247,8 +247,8 @@ class DiscoverEwaveDirAtVerifyTime(unittest.TestCase):
             run_dir = self._run_dir_with(
                 tmp,
                 {
-                    "typical_-40_0": {"a.s17p": "!"},
-                    "typical_125_0": {"b.s17p": "!"},
+                    "typical_-40_0": {"a.s4p": "!"},
+                    "typical_125_0": {"b.s4p": "!"},
                 },
             )
             paths = model.RunPaths(

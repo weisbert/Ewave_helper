@@ -1385,7 +1385,7 @@ def archive_run(
 
     * `keep` 是 fnmatch 模式（默认用 `BatchOptions.archive_keep`）。
     * run 失败且 `keep_logs_on_failure` → 保留 `ewave.log` / `emsolver.log` 做诊断。
-    * 扁平区的文件名 = `RunPaths.sparam_prefix` + 原后缀（`.s17p` 这种，端口数来自产物本身）。
+    * 扁平区的文件名 = `RunPaths.sparam_prefix` + 原后缀（`.s4p` 这种，端口数来自产物本身）。
     * **删除只在 `paths.ewave_dir` 里发生**，别的地方一个文件都不许删。
     写盘（`dry_run=True` 时只报告不动手）。
     """
@@ -1403,7 +1403,7 @@ def check_port_consistency(state: BatchState) -> list[str]:
 
 
 def port_count_from_suffix(path: str) -> int | None:
-    """从 `.s17p` / `.y16p` 这种后缀里取端口数；认不出返回 None。不读文件内容。"""
+    """从 `.s4p` / `.y3p` 这种后缀里取端口数；认不出返回 None。不读文件内容。"""
     raise NotImplementedError
 
 

@@ -105,7 +105,7 @@ class FakeFailureMode(enum.Enum):
     """
 
     WRONG_PORT_COUNT = "wrong_port_count"
-    """**产物齐、非空，但端口数不对**（该 17 端口的出了 `.s16p`）。
+    """**产物齐、非空，但端口数不对**（该 17 端口的出了 `.s3p`）。
 
     对应 D1b 的真实风险（BRIEF §5「`--all` 的代价」）：设计师加/删/改名一个 pin ⇒
     所有端口编号平移 ⇒ 之前建的 nport 和归档的 `.sNp` 全部错位，**而且静默**。
@@ -552,7 +552,7 @@ class FakeRunner:
     ) -> None:
         """阶段 2 的落盘 —— 形状照 BRIEF §5「官方流程的既有布局」那棵树。
 
-        产物基名 = `<--sparam 的值>_<corner>_<temp>`，与官方 `<Cell>_<corner>_<temp>.s17p`
+        产物基名 = `<--sparam 的值>_<corner>_<temp>`，与官方 `<Cell>_<corner>_<temp>.s4p`
         同形。`--sparam` 的取值来自 argv（`core.cmd._locked_flags` 把它设成 `Design.cell`），
         **源码里没有任何 cell 名**。
         """
