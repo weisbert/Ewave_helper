@@ -1909,6 +1909,12 @@ FROZEN: dict[str, tuple[str, ...]] = {
         "effective_axis_values",
     ),
     "ewave_batch.core.spec": (
+        # 序列化那一侧（GUI 的「Save spec as…」）。spec 是本工具的**工程文件** ——
+        # `batch.json` 存的是跑起来之后的状态，存不了「我打算怎么跑」。
+        "spec_to_mapping",
+        "dump_spec",
+        "save_spec",
+        "have_yaml",
         "load_spec",
         "parse_spec_mapping",
         "spec_sha256",

@@ -29,6 +29,7 @@ import tkinter as tk
 from collections.abc import Sequence
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
+from ewave_batch.core import spec as spec_module
 from ewave_batch.model import EwaveBatchError, Run
 
 from . import state as gui_state
@@ -1074,7 +1075,30 @@ class BaseApp:
         self.dsub.set(self.bridge.submit_command)
 
     def do_save_spec(self) -> None:
-        _todo("write the current settings back out as a spec file")
+        """把界面上当前的设定写成一份 spec 文件 —— 这就是本工具的「工程文件」。
+
+        `batch.json` 存的是**跑起来之后**的状态（resume 用），存不了「我打算怎么跑」。
+        所以关掉窗口前想留住勾选，只有这一条路。
+        """
+        suggested = (self.bridge.batch_name or "batch") + (
+            ".yaml" if spec_module.have_yaml() else ".json"
+        )
+        path = filedialog.asksaveasfilename(
+            title="Save batch spec as",
+            initialfile=suggested,
+            defaultextension=".yaml" if spec_module.have_yaml() else ".json",
+            filetypes=[("Spec files", "*.yaml *.yml *.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            written = spec_module.save_spec(self.bridge.spec_snapshot(), path)
+        except (EwaveBatchError, OSError) as exc:
+            _error("Cannot save spec", str(exc))
+            return
+        # 显示**真正写到的**路径：没装 PyYAML 时 save_spec 会把 .yaml 换成 .json，
+        # 否则用户会拿着一个自己打不开的文件（load_spec 按扩展名选解析器）。
+        self.status_lbl.config(text="Saved spec: %s" % written)
 
     def do_pick_offdir(self) -> None:
         path = filedialog.askdirectory(title="Pick an official run dir (contains gdsout_setup)")

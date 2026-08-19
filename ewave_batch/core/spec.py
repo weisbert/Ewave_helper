@@ -25,6 +25,7 @@ import json
 import os
 import platform
 import shlex
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import fields as dataclass_fields
@@ -531,6 +532,182 @@ def _parse_design_axes(raw: object, where: str) -> dict[str, tuple[str, ...]]:
             )
         out[str(name)] = tuple(items)
     return out
+
+
+def spec_to_mapping(spec: BatchSpec) -> dict:
+    """`BatchSpec` → 一个能被 `parse_spec_mapping` **原样读回来**的 mapping。
+
+    这是 `parse_spec_mapping` 的反函数，也是 GUI「Save spec as…」的落笔处。
+
+    只写**非默认**的字段：spec 是给人读、给人改的，写一堆 `resources: ""` 只会淹没重点。
+    往返（dump → load → dump）必须是不动点，`tests/test_spec_dump.py` 有断言盯着 ——
+    少序列化一个字段的后果是「用户在界面上设了、保存了、下次打开没了」，而且**无声**。
+    """
+    out: dict = {}
+    if spec.batch_name:
+        out["batch_name"] = spec.batch_name
+    if spec.batch_root:
+        out["batch_root"] = spec.batch_root
+
+    designs: list[dict] = []
+    for design in spec.designs:
+        entry: dict = {"library": design.library, "cell": design.cell, "view": design.view}
+        for name, value in (
+            ("official_run_dir", design.official_run_dir),
+            ("key", design.key),
+            ("label", design.label),
+            ("resources", design.resources),
+            ("gds_path", design.gds_path),
+        ):
+            if value:
+                entry[name] = value
+        if design.axis_overrides:
+            entry["axes"] = {k: list(v) for k, v in design.axis_overrides.items()}
+        if design.extra_flags:
+            entry["extra_flags"] = _flags_to_mapping(design.extra_flags)
+        ports = _ports_to_spec_value(design.port_spec)
+        if ports is not None:
+            entry["ports"] = ports
+        designs.append(entry)
+    out["designs"] = designs
+
+    if spec.axes:
+        # 轴写成 `轴名: [取值…]` —— 内置轴只需要取值，flag/kind 那些由目录给。
+        # 自定义轴（spec 里带 flag/flags 的）要把定义一起写回去，否则读回来就不认识它了。
+        axes: dict = {}
+        catalog = matrix.builtin_axis_catalog()
+        for axis in spec.axes:
+            values = [av.value for av in axis.values]
+            builtin = catalog.get(axis.name)
+            if builtin is not None and tuple(builtin.flags) == tuple(axis.flags):
+                axes[axis.name] = values
+                continue
+            body: dict = {"values": values}
+            if len(axis.flags) == 1:
+                body["flag"] = axis.flags[0]
+            elif axis.flags:
+                body["flags"] = list(axis.flags)
+            if axis.short:
+                body["short"] = axis.short
+            if axis.description:
+                body["description"] = axis.description
+            axes[axis.name] = body
+        out["axes"] = axes
+
+    if spec.defaults:
+        out["defaults"] = _flags_to_mapping(spec.defaults)
+    if spec.extra_flags:
+        out["extra_flags"] = _flags_to_mapping(spec.extra_flags)
+
+    options = _options_to_mapping(spec.options)
+    if options:
+        out["options"] = options
+    return out
+
+
+def _flags_to_mapping(flags: FlagDict) -> dict:
+    """flag dict → spec 里的写法。`True`/`False` 原样保留（`False` = 显式关掉，有语义）。"""
+    return {name: value for name, value in flags.items()}
+
+
+def _ports_to_spec_value(port_spec: PortSpec | None) -> object:
+    """`PortSpec` → `ports:` 的值。默认（`--all`）返回 None = 不写这一项。"""
+    if port_spec is None:
+        return None
+    if port_spec.mode is PortMode.ALL and not port_spec.mapping:
+        return None
+    body: dict = {"mapping": [f"{pid}={pin}" for pid, pin in port_spec.mapping]}
+    if port_spec.signal_ports:
+        body["signal"] = list(port_spec.signal_ports)
+    return body
+
+
+def _options_to_mapping(options: BatchOptions) -> dict:
+    """只写和默认值**不同**的 option。"""
+    default = BatchOptions()
+    out: dict = {}
+    for field_info in dataclass_fields(BatchOptions):
+        value = getattr(options, field_info.name)
+        if value != getattr(default, field_info.name):
+            out[field_info.name] = list(value) if isinstance(value, tuple) else value
+    return out
+
+
+def have_yaml() -> bool:
+    """这台机器能不能写/读 YAML。惰性探测，不在 import 时就依赖 PyYAML。
+
+    红区装了 6.0.1；开发机和公开克隆者可能没有。`save_spec` 用它决定落哪种格式，
+    **并据此决定文件扩展名** —— 见那里的说明。
+    """
+    try:
+        import yaml  # noqa: F401, PLC0415 - 只探测存在性
+    except ImportError:
+        return False
+    return True
+
+
+def dump_spec(spec: BatchSpec, *, as_json: bool | None = None) -> str:
+    """`BatchSpec` → 写进文件的文本。
+
+    默认有 PyYAML（红区装了 6.0.1）就出 YAML —— 人能读、能改、能加注释；
+    没有就出 **JSON**（字段名完全一样）。`as_json=True/False` 可以强制。
+
+    ⚠️ **JSON 分支不加 `#` 注释头** —— JSON 没有注释语法，加了就不是合法 JSON，
+    而 `load_spec` 在没有 PyYAML 的机器上正是靠 `json.loads` 读它
+    ⇒ 会出现"自己写的文件自己读不回来"。YAML 分支才加（YAML 认 `#`）。
+    """
+    data = spec_to_mapping(spec)
+    if as_json is None:
+        as_json = not have_yaml()
+    if as_json:
+        return json.dumps(data, indent=2, ensure_ascii=False, sort_keys=False) + "\n"
+    import yaml  # noqa: PLC0415 - 惰性：上面已确认可用
+
+    header = (
+        "# ewave_batch batch spec\n"
+        "# 由 GUI 的「Save spec as…」写出。可以直接手改，也可以再 Open 回去。\n"
+        "# 字段含义见 docs/spec_example.yaml。\n"
+    )
+    body = yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False)
+    return header + body
+
+
+def save_spec(spec: BatchSpec, path: str) -> str:
+    """把 spec 写到 `path`（**原子写**：同目录临时文件 + `os.replace`）。**返回真正写到的路径。**
+
+    ## 为什么返回路径而不是文本
+
+    `load_spec` 是**按扩展名**决定用 YAML 还是 JSON 解析的。所以在一台没有 PyYAML 的机器上
+    存成 `xxx.yaml`，内容会是 JSON、而读的时候按 YAML 走 ⇒ **自己写的文件自己打不开**。
+    与其让用户撞上这个，不如落盘时就把扩展名换成 `.json`，并把真实路径交回去
+    （GUI 在状态栏显示它）。两种格式字段名完全一样，换机器（红区有 PyYAML）照样读得回来。
+
+    调用方要文本的话自己 `dump_spec`。
+
+    原子写的理由和 `batch.json` 一样：写到一半断电或磁盘满，不能留半份 spec ——
+    半份 YAML 读回来要么报错、要么**语义不同**，后者更坏。
+    """
+    target = str(path)
+    as_json = not have_yaml()
+    if as_json and os.path.splitext(target)[1].lower() in (".yaml", ".yml"):
+        target = os.path.splitext(target)[0] + ".json"
+    text = dump_spec(spec, as_json=as_json)
+    directory = os.path.dirname(os.path.abspath(target)) or "."
+    os.makedirs(directory, exist_ok=True)
+    handle, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return target
 
 
 def _parse_ports(raw: object, where: str) -> PortSpec | None:
