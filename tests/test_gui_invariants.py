@@ -225,6 +225,14 @@ class _Walker:
         self.app.refresh_designs()
         self.app.recompute()
 
+    def edit_max_parallel(self) -> None:
+        """Donau submit 里的「Max in flight」。**走 `on_max_parallel()` 而不是 `recompute()`**
+        —— 那一格故意不走 `push()`（它要能在批次跑起来之后改），所以按 `recompute()`
+        驱动它等于测了一条界面上不存在的路。
+        """
+        self.app.maxpar.set(self.rng.choice(("1", "4", "12", "999", "", "four")))
+        self.app.on_max_parallel()
+
     def new_batch(self) -> None:
         self.app.do_new_batch()
 
@@ -246,6 +254,7 @@ class _Walker:
             "add_design",
             "duplicate_design_row",
             "fix_design_rows",
+            "edit_max_parallel",
             "new_batch",
         )
         return tuple((name, getattr(self, name)) for name in names)
