@@ -2141,5 +2141,210 @@ class DuplicateAndRemoveRunGroup(_SmokeTest):
         self.assertFalse(app.group_hint.winfo_manager(), "回到 base 这行字必须收起来")
 
 
+class StaleRunsTableSaysSo(_SmokeTest):
+    """★ 设定临时非法时，界面不许自相矛盾（2026-08-20 用不变量哈内斯扫出来的）。
+
+    症状：Runs 表读的是 `bridge.runs()`（上一次 plan 成功留下的），Total 那行公式
+    读的是现算的展开 —— **两块面板两个源**。设定一旦展不开，用户同时看到
+    「表里 6 行」和「= 0 runs」，而唯一的解释是状态栏里一条被截断的 SpecError。
+
+    最便宜的入口是 Designs 表的 `Duplicate row`：按一次就有两行一模一样的 design，
+    每个 run 撞 run_id ⇒ 整个矩阵被拒。而"复制一行再改 cell 名"**正是那个按钮的
+    预期用法**，也就是说这个自相矛盾的状态是正常流程里必经的一站。
+
+    修法不是让表跟着清空（每敲一个键闪一次比陈旧更难用），是**让它说出自己是旧的**。
+    """
+
+    def _app(self):
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        bridge, _runner, _sched = _gui(self.root)
+        return bridge, split.build_frame(root, bridge)._ewb_app
+
+    def test_duplicating_a_design_row_marks_the_table_stale(self) -> None:
+        bridge, app = self._app()
+        before = len(app.tree.get_children())
+        self.assertEqual(before, EXPECTED_RUN_COUNT, "前提：现在是一份有效的预览")
+        self.assertFalse(app.runs_stale.winfo_manager(), "一切正常时不该有那条红字")
+
+        app.dtree.selection_set(app.dtree.get_children()[0])
+        app.dup_design()
+
+        self.assertEqual(bridge.run_count(), 0, "两行一样的 design 就是展不开")
+        self.assertEqual(
+            len(app.tree.get_children()), before, "表**故意**不清空（清空=每敲一键闪一次）"
+        )
+        self.assertTrue(app.runs_stale.winfo_manager(), "那就必须写明白这些行是旧的")
+        self.assertIn("LAST VALID", app.runs_stale.cget("text"))
+
+    def test_a_valid_change_takes_the_warning_away_negative(self) -> None:
+        """反向：把重复的那行改掉，红字必须消失 —— 否则它就是一条永远在的红字。"""
+        bridge, app = self._app()
+        app.dtree.selection_set(app.dtree.get_children()[0])
+        app.dup_design()
+        self.assertTrue(app.runs_stale.winfo_manager())
+
+        rows = list(bridge.design_rows())
+        bridge.set_designs([rows[0], (rows[1][0], "CELL_FIXED", rows[1][2])])
+        app.refresh_designs()
+        app.recompute()
+
+        self.assertFalse(app.runs_stale.winfo_manager(), "改好了红字还在 = 狼来了")
+        self.assertEqual(bridge.run_count(), len(app.tree.get_children()))
+
+    def test_duplicate_design_rows_are_marked_in_the_table(self) -> None:
+        """一模一样的两行标红 —— 红字说"有问题"，这个说"问题在这两行"。"""
+        _bridge, app = self._app()
+        app.dtree.selection_set(app.dtree.get_children()[0])
+        app.dup_design()
+        tags = [app.dtree.item(iid, "tags") for iid in app.dtree.get_children()]
+        # 4 行：CELL_A 被复制成两行（标红），CELL_B 那行不受牵连。
+        self.assertEqual(sum(1 for t in tags if "dupe" in t), 2)
+        self.assertEqual(sum(1 for t in tags if "dupe" not in t), 1)
+
+    def test_preflight_names_the_real_culprit(self) -> None:
+        """★ preflight 不许把人指到错的地方去。
+
+        原来它说 "tick at least one value on every axis" —— 而每根轴都勾着，
+        真凶在 Designs 表里。一句指错方向的"下一步"比没有"下一步"更贵。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        rows = list(bridge.design_rows())
+        bridge.set_designs([rows[0], rows[0]])
+        problems = " ".join(bridge.preflight())
+        self.assertIn("identical", problems)
+        self.assertNotIn("tick at least one value", problems, "别再指错方向")
+        self.assertIn("Next:", problems)
+        self.assertTrue(all(ord(ch) < 128 for ch in problems), "红区 LANG 常是 C => 纯 ASCII")
+
+    def test_preflight_reports_the_real_reason_for_zero_runs_negative(self) -> None:
+        """反向：换一个**别的**展不开的原因，preflight 必须换一句话。
+
+        选的是扫频那条（`step` 选中但格子空着）—— 顺手证明另一件事：
+        原来那句 "tick at least one value on every axis" 描述的情形**根本不存在**
+        （取值为空的轴不进笛卡尔积，`_base_axes` 直接跳过它），它对每一条
+        真实的出错路径都是错的建议。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_sweep(mode="linear", spacing="step", start="0", stop="40", step="", points="")
+        problems = " ".join(bridge.preflight())
+        self.assertIn("0 runs", problems)
+        self.assertIn("Frequency sweep", problems, "得说出真正的原因")
+        self.assertNotIn("identical", problems)
+
+    def test_an_empty_axis_does_not_collapse_the_matrix(self) -> None:
+        """把上一条依赖的那个事实单独钉一条：取值为空的轴 = 这根轴不扫，**不是** 0 runs。
+
+        期望值来源：`GuiState._base_axes` 的 docstring（"取值为空的轴直接不出现"）。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_axis_values("corner", ())
+        self.assertGreater(bridge.run_count(), 0, "空轴把矩阵塌成 0 的话，上一条就白证了")
+        self.assertEqual(bridge.preflight(), [])
+
+    def test_the_empty_table_hint_matches_the_reason(self) -> None:
+        """空表中央那句话是同一条误导的**第三个家**。
+
+        两行重复的 design + 一个 design 都没有，看到的该是两句不同的话。
+        """
+        bridge, app = self._app()
+        bridge.set_designs([])
+        app.refresh_designs()
+        app.recompute()
+        self.assertIn("Add a design", app.empty_lbl.cget("text"))
+
+        bridge.set_designs([("MY_LIB", "CELL_A", "layout"), ("MY_LIB", "CELL_A", "layout")])
+        app.refresh_designs()
+        app.recompute()
+        self.assertIn("cannot be expanded", app.empty_lbl.cget("text"))
+        self.assertNotIn("Add a design", app.empty_lbl.cget("text"), "指错方向的第三处")
+
+
+class UserNamesTheRunGroup(_SmokeTest):
+    """★ 建组 / 复制组时用户自己起名（用户 2026-08-20 要求）。
+
+    组名不只是表里的一行字：它进 Runs 表、进每一条关于这个组的消息、还进**产物
+    目录名**。`eqcur-off` 和 `group-2` 在三个月后差别巨大，而唯一不用回想的时机
+    就是建它的那一刻。
+    """
+
+    def _app(self):
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        bridge, _runner, _sched = _gui(self.root)
+        return bridge, split.build_frame(root, bridge)._ewb_app
+
+    def test_a_typed_name_is_used_verbatim(self) -> None:
+        bridge, _runner, _sched = _gui(self.root)
+        self.assertEqual(bridge.add_group("eqcur-off"), "eqcur-off")
+        self.assertEqual(bridge.duplicate_group("eqcur-off", "fullwave"), "fullwave")
+        self.assertEqual(
+            [group.name for group in bridge.groups()],
+            [gui_state.BASE_GROUP, "eqcur-off", "fullwave"],
+        )
+
+    def test_a_taken_name_gets_a_suffix_not_a_merge(self) -> None:
+        """重名不许静默合并（两个组一个名字 = 互相遮蔽），加后缀。"""
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.add_group("hot")
+        self.assertEqual(bridge.duplicate_group(gui_state.BASE_GROUP, "hot"), "hot-2")
+
+    def test_base_cannot_be_reused_as_a_name(self) -> None:
+        """`base` 是保留名。**拦下来**，而不是悄悄给个 `base-2`。
+
+        用户是打字打出来的；得到一个自己没打过的名字比被拦下来更难理解。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        with self.assertRaises(SpecError):
+            bridge.add_group(gui_state.BASE_GROUP)
+        with self.assertRaises(SpecError):
+            bridge.duplicate_group(gui_state.BASE_GROUP, gui_state.BASE_GROUP)
+
+    def test_an_auto_name_still_gets_a_suffix_negative(self) -> None:
+        """反向：**没**指定名字时照旧自动加后缀 —— 那不是用户的选择，不该拦。"""
+        bridge, _runner, _sched = _gui(self.root)
+        self.assertEqual(bridge.add_group(), "group")
+        self.assertEqual(bridge.add_group(), "group-2")
+
+    def test_the_dialog_suggests_the_name_that_would_really_be_used(self) -> None:
+        """建议名必须**就是**不填时真会用的那个，否则对话框在说谎。"""
+        bridge, _runner, _sched = _gui(self.root)
+        self.assertEqual(bridge.suggest_group_name(), "group")
+        bridge.add_group()
+        self.assertEqual(bridge.suggest_group_name(), "group-2")
+        self.assertEqual(bridge.suggest_group_name("hot"), "hot")
+        # 只是"建议"，问一次不许真造出组来。
+        self.assertEqual([g.name for g in bridge.groups()], [gui_state.BASE_GROUP, "group"])
+
+    def test_the_buttons_go_through_the_name_dialog(self) -> None:
+        """界面那两个按钮走的是同一条路。
+
+        `EWB_SMOKE=1` 下 `_ask_group_name` 返回**建议名**（= 用户接受了建议），
+        所以 headless 里这两个按钮照样把组建出来 —— 返回 None（取消）的话
+        整块 run group 在动作序列测试里就形同不存在。
+        """
+        bridge, app = self._app()
+        app.do_add_group()
+        self.assertEqual([g.name for g in bridge.groups()], [gui_state.BASE_GROUP, "group"])
+        app.gtree.selection_set("group")
+        app.do_duplicate_group()
+        self.assertEqual(
+            [g.name for g in bridge.groups()], [gui_state.BASE_GROUP, "group", "group-copy"]
+        )
+
+    def test_cancelling_the_dialog_adds_nothing(self) -> None:
+        """取消 = 什么都不发生。**不许**留下一个用户没要的组。"""
+        bridge, app = self._app()
+        original = app._ask_group_name
+        app._ask_group_name = lambda *a, **k: None  # 用户按了 Cancel
+        self.addCleanup(setattr, app, "_ask_group_name", original)
+        app.do_add_group()
+        app.gtree.selection_set(gui_state.BASE_GROUP)
+        app.do_duplicate_group()
+        self.assertEqual([g.name for g in bridge.groups()], [gui_state.BASE_GROUP])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -993,25 +993,43 @@ class GuiState:
             self._require_group(cleaned)
         self._active_group = cleaned
 
+    def suggest_group_name(self, wanted: str = "") -> str:
+        """**不建组**，只回答"叫这个名字的话实际会叫什么"。
+
+        界面上的「新建 / 复制」对话框拿它当输入框的默认值 —— 用户看到的建议名
+        必须就是不填时真会用的那个，否则对话框在说谎。
+        """
+        return self._unique_group_name(wanted or "group")
+
     def add_group(self, name: str = "") -> str:
         """加一个空组并切过去，返回**实际用的名字**（重名自动加后缀）。
 
         新组一根轴都不覆盖 => 它展开出来的 run 与 base 逐字相同 => 全被跨组去重吃掉
         => 贡献 0 个 run。这不是 bug，是"还没配"的正常中间态；`group_run_counts()`
         照样给它一行 0，界面上看得见。
+
+        名字**显式**写成 `base` -> `SpecError`（与 `rename_group` 同一条规矩）。
+        不叫"自动加后缀变成 base-2"：用户是打字打出来的，得到一个自己没打过的名字
+        比被拦下来更难理解。留空则用 `group`（那不是用户的选择，加后缀理所当然）。
         """
+        self._reject_reserved(name)
         actual = self._unique_group_name(name or "group")
         self._groups.append(RunGroup(name=actual))
         self._active_group = actual
         self._invalidate()
         return actual
 
-    def duplicate_group(self, name: str) -> str:
+    def duplicate_group(self, name: str, new_name: str = "") -> str:
         """复制一个组（base 也能复制）成新组并切过去，返回新名字。
 
         复制 base 时把当前勾选**逐轴写成显式覆盖** - 空覆盖的副本没有意义
         （它就是 base），而写成显式覆盖之后用户改一根轴就得到一个真正的变体。
+
+        `new_name` 留空 -> `<源名>-copy`（重名自动加后缀）。给了就用给的那个 ——
+        组名会出现在 Runs 表、每一条关于这个组的消息、以及**产物目录名**里，
+        所以"eqcur-off"比"base-copy-2"值钱得多，用户应该能在建它的那一刻就定下来。
         """
+        self._reject_reserved(new_name)
         source = str(name).strip() or BASE_GROUP
         if source == BASE_GROUP:
             overrides = {
@@ -1022,7 +1040,7 @@ class GuiState:
             group = self._require_group(source)
             overrides = {k: tuple(v) for k, v in group.axis_overrides.items()}
             label = group.label
-        actual = self._unique_group_name(f"{source}-copy")
+        actual = self._unique_group_name(str(new_name).strip() or f"{source}-copy")
         self._groups.append(RunGroup(name=actual, axis_overrides=overrides, label=label))
         self._active_group = actual
         self._invalidate()
@@ -1611,13 +1629,64 @@ class GuiState:
                 "  Next: fill in 'Official run dir' at the top, or use 'Browse...' to pick "
                 "the design dir the official GUI already ran once (it contains gdsout_setup)."
             )
-        if self._designs and not self.run_count():
+        duplicates = self._duplicate_designs()
+        if duplicates:
+            # ★ 这一条必须排在下面那条**前面**，而且排掉它。
+            #   两行一模一样的 design 会让每个 run 撞 run_id => 整个矩阵展不开
+            #   => run_count() 是 0 => 用户会读到"tick at least one value on every
+            #   axis"，可每根轴都勾着，真凶在 Designs 表里。一句指错方向的
+            #   "下一步"比没有"下一步"更贵。按一次 Duplicate row 就到这儿，
+            #   而"复制一行再改 cell 名"正是那个按钮的预期用法。
             problems.append(
-                "The current settings expand to 0 runs." + _NL +
-                "  Next: tick at least one value on every axis (a single empty axis "
-                "collapses the whole matrix)."
+                "Two design rows are identical: %s. Every run of the second one would "
+                "land in the same directory as the first, so the whole matrix is refused."
+                % ", ".join(duplicates) + _NL +
+                "  Next: double-click one of them to change the cell (or 'Remove row')."
+            )
+        elif self._designs and not self.run_count():
+            # ★ 展不开的**理由**要原样端出来，不许换成一句猜的。
+            #   原来这里恒定写 "tick at least one value on every axis"，而
+            #   2026-08-20 写反向测试时才发现：取值为空的轴根本不进笛卡尔积
+            #   （`_base_axes` 直接跳过它）=> 那句话描述的情形**一次都不会发生**，
+            #   它对每一条真实的出错路径都是错的建议。真实的路径是扫频那种
+            #   "选了 step 但格子是空的"，而 `_expansion()` 把那条异常吞掉了。
+            reason = self.expansion_error()
+            problems.append(
+                "The current settings expand to 0 runs." + _NL + "  " + reason
+                if reason
+                else "The current settings expand to 0 runs." + _NL +
+                "  Next: check the axes and the frequency sweep - something in them "
+                "cannot be turned into a run."
             )
         return problems
+
+    def expansion_error(self) -> str:
+        """展不开的话，**为什么**。展得开 -> 空串。
+
+        `_expansion()` 有意吞掉这条异常（展不开在界面上是常态，边勾边看的时候
+        不该弹东西）。但按下 Dry-run / Submit 的那一刻用户要的就是这句话，
+        所以这里把同一条路再走一遍、只把消息取出来。多算一次的代价只在按键那一下。
+        """
+        try:
+            axes, groups = self._axes_and_groups()
+            matrix_module.expand_runs_detailed(
+                self._designs, axes, options=self._options, groups=groups
+            )
+        except EwaveBatchError as exc:
+            return str(exc)
+        return ""
+
+    def _duplicate_designs(self) -> list[str]:
+        """出现了不止一次的 design（按 `matrix.design_key` 的口径），保序去重。
+
+        口径必须是 `design_key` 而不是 `(library, cell, view)` 的字面量比较 ——
+        run_id 是拿 `design_key` 拼的，判"会不会撞"就得用同一把尺子。
+        """
+        seen: dict[str, int] = {}
+        for design in self._designs:
+            key = matrix_module.design_key(design)
+            seen[key] = seen.get(key, 0) + 1
+        return [key for key, count in seen.items() if count > 1]
 
     def reset(self) -> None:
         """New batch：把上一次的 driver / 状态 / 事件丢掉，**保留界面上的勾选**。"""
@@ -1722,6 +1791,15 @@ class GuiState:
 
     def _active(self) -> RunGroup:
         return self._require_group(self.active_group())
+
+    def _reject_reserved(self, name: str) -> None:
+        """用户**显式**要了 `base` 这个名字 -> 拦。措辞与 `rename_group` 保持一份。"""
+        if str(name).strip() == BASE_GROUP:
+            raise SpecError(
+                f"{BASE_GROUP!r} is a reserved group name (it means the top-level axes), "
+                "so it cannot be reused.\n"
+                "  Next: pick another name, e.g. eqcur-off"
+            )
 
     def _unique_group_name(self, wanted: str) -> str:
         """想要的名字 -> 没被占用的名字。`base` 是保留名，也算被占用。"""

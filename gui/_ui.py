@@ -177,6 +177,48 @@ GROUP_EDIT_HINT = (
 只是界面一个字都没说 —— 一个不解释自己的禁用状态，跟坏了没有区别。
 """
 
+GROUP_NAME_HINT = (
+    "The name shows up in the Runs table, in every message about this group, and in the "
+    "output directory names. Leave it as suggested if you have no better one."
+)
+"""建组 / 复制组那个输入框底下的灰字。**目录名**那一句是重点：
+组名不是个装饰，三个月后翻产物目录的人只有它可看。"""
+
+RUNS_EMPTY_HINT = (
+    "Nothing to run yet.\n"
+    "Add a design and tick at least one corner and temperature -\n"
+    "runs appear here as you type."
+)
+"""空表时表中央那句话。**只在"确实还没配"时才对**，见 `RUNS_EMPTY_BLOCKED`。"""
+
+RUNS_EMPTY_BLOCKED = (
+    "The current settings cannot be expanded.\n"
+    "See the message at the bottom of the window -\n"
+    "runs appear here as soon as it is fixed."
+)
+"""空表 + 有错时表中央那句话。
+
+原来这里恒定是 `RUNS_EMPTY_HINT`。2026-08-20 截图实证：两行一模一样的 design
+（按一次 Duplicate row 就是）⇒ 矩阵被拒 ⇒ 表空 ⇒ 中间写着"加一个 design、
+勾至少一个 corner 和温度"，而 design 有两行、corner 也勾着。
+这是 `preflight()` 那条错建议的**第三个家** —— 同一句误导在界面上有三处出口
+（preflight / 空表提示 / 陈旧的表），一处一处堵。
+"""
+
+RUNS_STALE_WARNING = (
+    "!  These rows are the LAST VALID preview, not the current settings - the settings "
+    "below do not expand (see the message at the bottom of the window). Fix that and the "
+    "table refreshes by itself."
+)
+"""Runs 表上方那条红字。
+
+为什么必须有：设定一旦临时非法（重复的 design 行、取消掉最后一个 corner、
+温度框清空重打、spacing 选了 points 还没填数），表里留着的是**上一次**的矩阵，
+而 Total 那行公式写的是现算的 `= 0 runs` —— 两块面板读两个源，界面自己跟自己打架。
+表不跟着清空是**有意**的（每敲一个键闪一次比陈旧更难用），所以缺的不是刷新，
+是"这张表现在是旧的"这句话。
+"""
+
 OVERRIDE_TIP = (
     "%s\n"
     "  ticked  : this run group sets it itself\n"
@@ -900,6 +942,8 @@ class BaseApp:
         self.groups_box: ttk.Widget | None = None
         self.groups_hint: ttk.Label | None = None
         self.groups_warn: tk.Label | None = None
+        self.runs_stale: tk.Label | None = None
+        self._runs_stale_anchor: object | None = None
         self.group_hint: tk.Label | None = None
         self.settings_grid: ttk.Frame | None = None
         self.sw_combo: ttk.Combobox | None = None
@@ -1150,9 +1194,23 @@ class BaseApp:
         return box
 
     def refresh_designs(self) -> None:
+        """重画 designs 表。**一模一样的两行标红。**
+
+        按一次 `Duplicate row` 就会出现这种行 —— 而那正是那个按钮的预期用法
+        （复制一行再改 cell 名）。两行相同 ⇒ 每个 run 撞 run_id ⇒ 整个矩阵被拒 ⇒
+        右边的表和 Total 那行当场自相矛盾。红色让人一眼看见"要改的是这儿"，
+        `preflight()` 里那条专门的消息说清楚"改成什么"。
+        """
         self.dtree.delete(*self.dtree.get_children())
-        for row in self.bridge.design_rows():
-            self.dtree.insert("", tk.END, values=row)
+        rows = list(self.bridge.design_rows())
+        seen: dict[tuple[str, ...], int] = {}
+        for row in rows:
+            key = tuple(row)
+            seen[key] = seen.get(key, 0) + 1
+        for row in rows:
+            duplicate = seen.get(tuple(row), 0) > 1
+            self.dtree.insert("", tk.END, values=row, tags=("dupe",) if duplicate else ())
+        self.dtree.tag_configure("dupe", background="#ffe6e6", foreground=RED)
         _fit_tree_columns(
             self.dtree,
             ("lib", "cell", "view"),
@@ -1476,36 +1534,86 @@ class BaseApp:
         self.recompute()
 
     def do_add_group(self) -> None:
-        """加一个空组并切过去。名字先自动取，双击改。
+        """加一个空组并切过去 —— **先问名字**（用户 2026-08-20 要求）。
+
+        为什么值得多一个对话框：组名不只是表里的一行字，它会进 Runs 表、进每一条
+        关于这个组的消息、还会**进产物目录名**。`eqcur-off` 和 `group-2` 在三个月后
+        差别巨大，而在建它的那一刻用户脑子里恰好有那个名字 —— 那是唯一不用回想的时机。
+        （改名照旧：双击组名那一列。）
 
         新组一根轴都不覆盖 ⇒ 展开出来与 base 逐字相同 ⇒ 全被跨组去重吃掉 ⇒ 贡献
         0 个 run。表里那个 `-> 0` 不是 bug，是"还没配"—— 勾一根轴上去它就变了。
         """
         if not self.groups_ok:
             return
+        name = self._ask_group_name("New run group", self._suggest_group_name())
+        if name is None:  # 取消
+            return
         if not self.bridge.is_running() and not self.bridge.has_submitted():
             self._guard(self.push)
         try:
-            self.bridge.add_group()
+            actual = self.bridge.add_group(name)
         except EwaveBatchError as exc:
             _error("Cannot add run group", str(exc))
             return
+        self._warn_if_renamed(name, actual)
         self._reload_group_vars()
         self.recompute()
 
     def do_duplicate_group(self) -> None:
-        """复制选中的组（base 也能复制 —— 那会把当前勾选写成一份显式覆盖）。"""
+        """复制选中的组（base 也能复制 —— 那会把当前勾选写成一份显式覆盖），**先问名字**。"""
         if not self.groups_ok:
+            return
+        source = self._selected_group()
+        name = self._ask_group_name(
+            "Duplicate run group", self._suggest_group_name("%s-copy" % source), source=source
+        )
+        if name is None:  # 取消
             return
         if not self.bridge.is_running() and not self.bridge.has_submitted():
             self._guard(self.push)
         try:
-            self.bridge.duplicate_group(self._selected_group())
+            actual = self.bridge.duplicate_group(source, name)
         except EwaveBatchError as exc:
             _error("Cannot duplicate run group", str(exc))
             return
+        self._warn_if_renamed(name, actual)
         self._reload_group_vars()
         self.recompute()
+
+    def _suggest_group_name(self, wanted: str = "") -> str:
+        """对话框里摆的那个建议名。bridge 老到没有这个方法时退回 `wanted`。"""
+        suggest = getattr(self.bridge, "suggest_group_name", None)
+        if callable(suggest):
+            return str(suggest(wanted))
+        return wanted or "group"
+
+    def _ask_group_name(self, title: str, initial: str, source: str = "") -> str | None:
+        """问一个组名。取消 -> None；留空 -> 用建议名。
+
+        `EWB_SMOKE=1` 下直接返回建议名（`_ask_text` 的 `on_smoke`）——
+        headless 里"取消"会让整条动作变成 no-op，那样 run group 这一块在
+        `tests/test_gui_invariants.py` 的动作序列里就形同不存在。
+        """
+        hint = GROUP_NAME_HINT
+        if source:
+            hint = "Copy of %r. " % source + hint
+        return self._ask_text(
+            title, "Group name", initial, hint=hint, on_empty=initial, on_smoke=initial
+        )
+
+    def _warn_if_renamed(self, wanted: str, actual: str) -> None:
+        """要的名字被占了、自动加了后缀 —— **说一声**。
+
+        静默改名的代价：用户在 Runs 表里找 `hot`，看到的是 `hot-2`，
+        而他从来没打过那个名字。
+        """
+        if actual and wanted and actual != wanted:
+            _info(
+                "Run group renamed",
+                "There is already a group called %r, so this one is called %r."
+                % (wanted, actual),
+            )
 
     def do_remove_group(self) -> None:
         """删掉选中的组。删完退回 base（`remove_group` 自己会做）。"""
@@ -1883,6 +1991,13 @@ class BaseApp:
         self.runs_box = box
         self.runs_titled = titled
 
+        # 陈旧告警。**建在表上面**（不是状态栏里）—— 它说的是"这张表"，
+        # 而状态栏在窗口最底下，离表最远。tk.Label 不是 ttk：前景色走 style
+        # 会污染别的标签（同 `extra_warn` / `groups_warn`）。
+        self.runs_stale = tk.Label(
+            box, font=self.f_ui, fg=RED, anchor=tk.W, justify=tk.LEFT, wraplength=760
+        )
+
         if not header_in_title:
             head = ttk.Frame(box)
             head.pack(fill=tk.X, pady=(0, 4))
@@ -1918,11 +2033,7 @@ class BaseApp:
             fg="#8d8d8d",
             bg="white",
             font=self.f_ui,
-            text=(
-                "Nothing to run yet.\n"
-                "Add a design and tick at least one corner and temperature -\n"
-                "runs appear here as you type."
-            ),
+            text=RUNS_EMPTY_HINT,
         )
 
         self.menu = tk.Menu(self.top, tearoff=0)
@@ -1935,6 +2046,10 @@ class BaseApp:
                     item,
                     None if item in DISABLED_MENU_ITEMS else (lambda t=item: self.on_row_action(t)),
                 )
+        # `_sync_runs_stale` 要把红字插到**第一个子件之前**（= 表的上面）。
+        # 建完才知道第一个是谁（`header_in_title` 决定有没有那条 head）。
+        slaves = box.pack_slaves()
+        self._runs_stale_anchor = slaves[0] if slaves else None
         return box
 
     def build_detail(self, parent: object) -> ttk.LabelFrame:
@@ -2256,6 +2371,9 @@ class BaseApp:
             self._guard(self._sync_extra_warning)
             self._guard(self._sync_groups_panel)
             self.refresh_tree()
+            # ★ 必须在 `refresh_tree()` **之后**：判据是"表上有行、而现在的设定
+            #   展不开"，前一半只有画完才知道。
+            self._sync_runs_stale()
             self.update_status()
             self.sync_buttons()
         finally:
@@ -2276,6 +2394,45 @@ class BaseApp:
         except EwaveBatchError as exc:
             message = f"{exc.__class__.__name__}: {exc}"
             self._error = message if not self._error else self._error
+
+    def _runs_are_stale(self) -> bool:
+        """Runs 表现在画的是不是**上一次**的矩阵。
+
+        两半缺一不可：这一轮 `plan()` 炸了（`_error` 非空），**并且**表上还有行
+        （那些行只可能是上一次成功展开留下来的）。跑完一批之后界面本来就不再重新
+        展开矩阵，但那条路上 `plan()` 根本没被调用 ⇒ `_error` 是空的 ⇒ 不会误报。
+        """
+        return bool(self._error) and bool(self.tree.get_children())
+
+    def _sync_runs_stale(self) -> None:
+        """Runs 表现在是不是旧的 —— 是就在表上面写明白（`RUNS_STALE_WARNING`）。
+
+        判据两半，缺一不可：
+        * `self._error` 非空 = 这一轮 `plan()` 炸了（`_guard` 把它变成了状态栏一行字）；
+        * 表上还有行 = 那些行是上一次成功展开留下来的。
+
+        跑完一批之后界面本来就**不再**重新展开矩阵（那会让 done/failed 消失），
+        但那条路上 `plan()` 根本没被调用 ⇒ `_error` 是空的 ⇒ 这里不会误报。
+        """
+        if self.runs_stale is None:
+            return
+        blocked = bool(self._error)
+        if self.empty_lbl is not None:
+            self.empty_lbl.config(text=RUNS_EMPTY_BLOCKED if blocked else RUNS_EMPTY_HINT)
+        stale = self._runs_are_stale()
+        if stale:
+            self.runs_stale.config(text=RUNS_STALE_WARNING)
+            if not self.runs_stale.winfo_manager():
+                # 每次 recompute 都 re-pack 会闪，只在没摆出来的时候摆一次。
+                # `before=` 那个锚点是建界面时记下的第一个子件 —— 没有它的话
+                # 重新 pack 会把这条红字放到**表的下面**，而它说的是上面那张表。
+                anchor = self._runs_stale_anchor
+                if anchor is not None:
+                    self.runs_stale.pack(fill=tk.X, pady=(0, 4), before=anchor)
+                else:  # pragma: no cover - 表还没建完
+                    self.runs_stale.pack(fill=tk.X, pady=(0, 4))
+        elif self.runs_stale.winfo_manager():
+            self.runs_stale.pack_forget()
 
     def _sync_freq_fields(self) -> None:
         """扫描模式决定哪几个格子有意义 —— 其余置灰。
@@ -2525,6 +2682,10 @@ class BaseApp:
         if self.right_lbl is not None:
             self.right_lbl.config(text=right)
         header = self._runs_summary(counts, total)
+        # 表是旧的时候，这行摘要里那个 run 数也是旧的 —— 它紧挨着 Total 那行现算的
+        # `= 0 runs`，不标一下就是界面上最后一处自相矛盾的数字。判据与红字同源。
+        if self._runs_are_stale():
+            header += "  (stale)"
         if self.runs_header is not None:
             self.runs_header.config(text=header)
         elif self.runs_titled:
@@ -2769,14 +2930,29 @@ class BaseApp:
         self.recompute()
 
     # ----------------------------------------------------------- 菜单动作
-    def _ask_text(self, title: str, label: str, initial: str, hint: str = "") -> str | None:
-        """一个输入框的模态小对话框。取消 / 空输入 -> None。
+    def _ask_text(
+        self,
+        title: str,
+        label: str,
+        initial: str,
+        hint: str = "",
+        *,
+        on_empty: str | None = None,
+        on_smoke: str | None = None,
+    ) -> str | None:
+        """一个输入框的模态小对话框。取消 -> None。
 
-        `EWB_SMOKE=1` 时直接返回 None：冒烟要建完整棵控件树就退，
-        而 `wait_window()` 会在那儿一直等下去。
+        `on_empty` = 用户把输入框清空后按 OK 时返回什么。默认 `None`（= 当成取消，
+        这是本方法原来的唯一行为）。给了值就是"留空 = 用这个"—— 建组那两个框要的
+        就是这个手感：建议名摆在那儿，直接回车即可。
+
+        `on_smoke` = `EWB_SMOKE=1` 时返回什么，默认 `None`。冒烟不能进
+        `wait_window()`（会一直等下去），但**返回 None 等于"用户按了取消"**，
+        于是整条动作在 headless 下什么都不做、也就测不到 —— 建组那两个框把它设成
+        建议名，headless 下就等价于"用户接受了建议"，动作序列测试才走得下去。
         """
         if smoke_enabled():
-            return None
+            return on_smoke
         dlg = tk.Toplevel(self.top)
         dlg.title(title)
         dlg.transient(self.top)
@@ -2792,7 +2968,7 @@ class BaseApp:
         answer: dict[str, str | None] = {"value": None}
 
         def ok(_event: object = None) -> None:
-            answer["value"] = var.get().strip() or None
+            answer["value"] = var.get().strip() or on_empty
             dlg.destroy()
 
         def cancel(_event: object = None) -> None:

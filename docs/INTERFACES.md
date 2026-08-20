@@ -772,7 +772,9 @@ def tick(self) -> TickReport | None: ...
   |---|---|
   | `groups() -> tuple[RunGroup, ...]` | 全部组，**第一个恒为 base**（`name == BASE_GROUP`）|
   | `active_group() -> str` / `set_active_group(name)` | 当前在编辑哪个组，默认 base |
-  | `add_group(name="") -> str` / `duplicate_group(name) -> str` | 建组 / 复制一个组（含 base）；**返回实际用的名字**（重名自动加后缀）|
+  | `add_group(name="") -> str` / `duplicate_group(name, new_name="") -> str` | 建组 / 复制一个组（含 base）；**返回实际用的名字**（重名自动加后缀）。`name` / `new_name` 显式写成 `base` -> `SpecError`（保留名，不静默改成 `base-2`）|
+  | `suggest_group_name(wanted="") -> str` | **不建组**，只回答"叫这个名字的话实际会叫什么"——界面那两个命名对话框的默认值 |
+  | `expansion_error() -> str` | 展不开的**理由**（展得开 -> 空串）。`preflight()` 拿它给出真正的下一步 |
   | `remove_group(name)` / `rename_group(old, new)` | base 不可删 |
   | `group_override(axis, group="") -> tuple[str, ...] \| None` | **`None` = 这根轴继承 base**；`group` 省略 = active group |
   | `set_group_override(axis, values, group="")` / `clear_group_override(axis, group="")` | 写 / 撤销这一层覆盖 |

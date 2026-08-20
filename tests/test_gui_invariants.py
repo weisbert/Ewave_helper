@@ -25,13 +25,14 @@
 | A 组表画出来的行 == 模型里的组 | `_ui.refresh_groups` 的职责：它画的就是 `bridge.groups()` |
 | B 恰好一行带 `*`，且它是 active | 同上（`* ` 是"当前组"的唯一可见标记） |
 | C runs 表 == `bridge.runs()` | `_ui.refresh_tree` 的职责 |
+| D 表和现算的 run 数对不上时，**界面必须明说表是旧的** | `_ui.RUNS_STALE_WARNING` |
 | E 编辑别的组时**不许动基线** | `CLAUDE.md`「run group」：组是 delta；`switch_group` 的 docstring |
-| F 合法动作序列不许弹框 | 弹框 = 界面认定用户做错了；这里走的每一步都是界面自己提供的按钮 |
+| F 走出错误状态时，界面必须**解释得清**（preflight 有话说 + 表已标陈旧） | `_ui.RUNS_STALE_WARNING` / `GuiState.preflight` |
 
-⚠️ **有一条已知不变量没有写在这里**：`bridge.run_count()` 与 runs 表的行数在
-「设定临时非法」时会对不上（表留着上一次的矩阵，公式那行写 `= 0 runs`）。
-那是一条**真的**、当前未修的界面自相矛盾，修法涉及产品决定（要不要给表打上
-"stale"），所以不在这一棒里假装它已经成立 —— 别把它当成漏了。
+D 这一条最初是缺的（2026-08-20 第一版明写了"故意不写"）：那时候表留着上一次的
+矩阵、Total 那行写 `= 0 runs`，两块面板互相打脸而界面一个字都没说。修法不是让
+它们相等（表跟着清空 = 每敲一个键闪一次，比陈旧更难用），是让表说出自己是旧的 ——
+所以不变量的形状是**「相等 或 已标记陈旧」**，不是「相等」。
 
 ⏱ 不 sleep、不读墙钟、不起子进程。种子写死 => 失败可逐字复现（把种子填进
 `FAILING_SEED` 就能单跑那一条路径）。
@@ -151,6 +152,36 @@ class _Walker:
         self.app.f_stop.set(self.rng.choice(("40", "20", "60")))
         self.app.recompute()
 
+    def duplicate_design_row(self) -> None:
+        """Designs 表的 `Duplicate row`。**故意造出两行一模一样的 design。**
+
+        这是"合法按钮 -> 非法状态"的唯一入口，也是不变量 D / F 真正会被踩到的地方。
+        没有它，D 那条在 320 步里一次都不触发（2026-08-20 实测），等于没写。
+        """
+        rows = self.app.dtree.get_children()
+        if not rows:
+            return
+        self.app.dtree.selection_set(self.rng.choice(rows))
+        self.app.dup_design()
+
+    def fix_design_rows(self) -> None:
+        """把重复的 design 行改成唯一的 —— 用户"复制一行再改 cell 名"的后半步。
+
+        走出去也要走得回来：只有能恢复，"恢复之后红字必须消失"才在序列里可测。
+        """
+        rows = list(self.bridge.design_rows())
+        if len(rows) == len(set(rows)):
+            return
+        fixed: list[tuple[str, str, str]] = []
+        for row in rows:
+            while tuple(row) in {tuple(f) for f in fixed}:
+                self._cells += 1
+                row = (row[0], "CELL_%d" % self._cells, row[2])
+            fixed.append(tuple(row))
+        self.bridge.set_designs(fixed)
+        self.app.refresh_designs()
+        self.app.recompute()
+
     def add_design(self) -> None:
         # cell 名必须唯一：两行一模一样的 design 会撞 run_id，那是**另一件事**
         # （见本文件抬头那条"已知不变量"），混进来会把这里要抓的东西盖住。
@@ -178,6 +209,8 @@ class _Walker:
             "toggle_override",
             "edit_sweep",
             "add_design",
+            "duplicate_design_row",
+            "fix_design_rows",
             "new_batch",
         )
         return tuple((name, getattr(self, name)) for name in names)
@@ -235,14 +268,35 @@ class GuiStaysConsistentAcrossActionSequences(unittest.TestCase):
             "C runs 表 != 模型\n" + where,
         )
 
+        # D —— 表和现算的 run 数可以不等（设定临时非法时表**故意**留着旧内容），
+        #      但那时候界面必须已经把它标成陈旧的。二者必居其一。
+        if bridge.run_count() != len(app.tree.get_children()):
+            self.assertTrue(app._runs_are_stale(), "D 对不上却没标陈旧\n" + where)
+            self.assertTrue(app.runs_stale.winfo_manager(), "D 标了却没摆出红字\n" + where)
+
         # E —— **在别的组上做的任何事都不许改到基线。** 组是 delta，不是副本。
         if active_before != BASE:
             self.assertEqual(
                 _base_snapshot(bridge), base_before, "E 改组动了基线\n" + where
             )
 
-        # F —— 走的每一步都是界面自己给的按钮，不该有任何一步被判成用户操作错误。
-        self.assertEqual(app._error, "", "F 合法动作走出了错误\n" + where)
+        # F —— 走的每一步都是界面自己给的按钮。**允许**走进出错状态（按一次
+        #      Duplicate row 就到了，而那是那个按钮的预期用法），但那时候界面
+        #      欠用户三样东西，一样都不许少：
+        #        1. preflight 说得出话（不是空 list）；
+        #        2. 每一条都带"下一步做什么"；
+        #        3. 表要么是空的、要么已经标成陈旧 —— 不许摆着旧内容装作是新的。
+        #      判据写成这个形状而不是"不许出错"，是因为"不许出错"会把
+        #      Duplicate row 这条真实路径整个挡在测试之外。
+        if app._error:
+            problems = bridge.preflight()
+            self.assertTrue(problems, "F 界面自己知道错了，preflight 却没话说\n" + where)
+            for problem in problems:
+                self.assertIn("Next:", problem, "F 只说坏了不说下一步\n" + where)
+            self.assertTrue(
+                not app.tree.get_children() or app._runs_are_stale(),
+                "F 出错了却摆着一张没标记的旧表\n" + where,
+            )
 
     def test_no_action_sequence_desynchronises_the_ui(self) -> None:
         root = _tk_or_skip(self)
