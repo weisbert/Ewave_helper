@@ -98,6 +98,8 @@ SHARED_LAYER_BRIDGE_EXTRAS: tuple[str, ...] = (
     "batch_name",
     "extra_flags_text",
     "official_run_dir",
+    "options",
+    "set_max_parallel",
     "submit_command",
     "sweep",
 )
@@ -111,6 +113,14 @@ bridge 有这些 → 走共用层，建真界面；没有（例如只实现冻�
 正解是把这几样并进 `GuiBridgeProtocol`（或从共用层里挪走），走
 `[interface-change]` 流程 —— 已写进本阶段的 `interface_change_requests`。
 在那之前，这份名单是两边之间唯一的桥，**不许悄悄扩张**。
+
+2026-08-20 加了两条，各自记在这里（"不许悄悄扩张" = 扩张要留下理由，不是不许扩张）：
+
+* `options` —— 其实早就在用了（`BaseApp._poll_ms` 读 `options().poll_interval`），
+  只是**一直没列**。这属于补账，不是新增依赖。
+* `set_max_parallel` —— 「同时在飞几个」那一格（用户 2026-08-20：提交 5 个、
+  4 个 running、第 5 个停在 `ready`，「很奇怪」）。它必须能在批次**跑起来之后**改，
+  所以不能走 `push()` 那条路，只能是 bridge 上一个自己的方法。
 """
 
 

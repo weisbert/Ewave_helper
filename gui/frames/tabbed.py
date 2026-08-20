@@ -99,6 +99,8 @@ SHARED_LAYER_BRIDGE_EXTRAS: tuple[str, ...] = (
     "batch_name",
     "extra_flags_text",
     "official_run_dir",
+    "options",
+    "set_max_parallel",
     "submit_command",
     "sweep",
 )
