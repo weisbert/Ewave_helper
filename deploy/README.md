@@ -38,6 +38,7 @@
 ```
 <workarea>/ewave_helper/              ← 安装目录；叫什么名字都行
 ├── deploy.sh                         ← 更新入口（故意放最外层）
+├── site.local.sh                     ← 这台机器的站点坐标；升级永远留着
 ├── ewave_helper_<short>.tar.gz       ← 你把包传到这里
 ├── ewave_helper_<short>.tar.gz.sha256
 ├── cli.py  VERSION  README.md
@@ -62,7 +63,7 @@
 powershell -ExecutionPolicy Bypass -File deploy\pack.ps1
 ```
 
-在 `deploy\dist\` 下产出**恰好两个**文件：
+在 `deploy\dist\` 下产出两个文件：
 
 | 文件 | 用途 |
 |---|---|
@@ -70,6 +71,10 @@ powershell -ExecutionPolicy Bypass -File deploy\pack.ps1
 | `ewave_helper_<short>.tar.gz.sha256` | 到了那边验完整性 |
 
 两个都传过去。整个交付就这些 —— 故意没有别的东西要 copy、也没得挑。
+
+**外加第三个，只在仓库根有 `site.local.sh` 时**：那份会被 copy 到 `dist\` 旁边
+（**不在** tarball 里，也进不去 —— 它被 gitignore，`git archive` 根本看不见它）。
+只有**头一次装机**要传它；之后每次升级 `deploy.sh` 都保着不动。见下面「站点坐标」。
 
 `-Name <dir>` 可以改包根目录名（默认 `ewave_helper`，也就是 `tar -xzf` 出来的那个目录）。
 
@@ -167,6 +172,30 @@ bash deploy/doctor.sh --test
 
 解出来的那个目录**就是**安装目录。从此每次更新只剩两步：
 「把包传进去」+「`bash deploy.sh`」。
+
+## 站点坐标（`site.local.sh`）
+
+这台机器的 Donau 账号和队列。GUI 一开就把它填进 `Donau submit` 那一格，
+所以**不用每次重打**（用户 2026-08-20）。
+
+```sh
+cp site.example.sh site.local.sh     # 然后按里面的说明改那一行
+```
+
+| | |
+|---|---|
+| 在哪 | 安装目录根（`deploy.sh` 旁边）。也认 `$EWB_SITE_LOCAL` 指定的路径 |
+| 进 git 吗 | **不进**。账号/队列是站点身份，源码零标识符（CLAUDE.md 硬约束 1b）。进 git 的是 `site.example.sh`，值全是占位符 |
+| 进包吗 | **不进**，而且进不去：它被 gitignore，`git archive` 看不见 |
+| 升级会丢吗 | 不会。`deploy.sh` 把它和 `.deploy/` 一起写死在 `PRESERVE` 里，不用往 `preserve.list` 加 |
+
+没有它也能跑：那一格会是 `dsub -A ACCOUNT -q QUEUE …` 的占位符模板，占位符没换掉
+**不许提交**（界面标红 + 提交那一步直接拒）。而且填完 `Official run dir` 之后，
+整条 dsub 命令会从那次官方 run 的 `remote_run_ewave.sh` 里**当场解析出来**顶掉默认值
+—— 真正跑过的那条脚本比任何默认值都准。所以这个文件省的是「填 run dir 之前那段时间」，
+不是唯一入口。
+
+---
 
 ## 保住你自己的数据
 

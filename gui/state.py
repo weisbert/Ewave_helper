@@ -87,7 +87,18 @@ SWEEP_FIELDS: dict[str, tuple[str, ...]] = {
     "logarithmic": ("stop", "points"),
     "discrete": ("start",),
 }
-"""哪个模式下哪几个格子有意义（其余置灰）。照 `mockups/_ui.py::_sync_freq_fields`。"""
+"""哪个模式下哪几个格子**可能**有意义。真正的可编辑集合走 `sweep_live_fields()` ——
+adaptive / linear 还要再按 `spacing` 砍掉一个（见下）。"""
+
+SWEEP_SPACINGS: tuple[str, ...] = ("step", "points")
+"""adaptive / linear 下步长的两种给法，**互斥**。
+
+用户 2026-08-20 指出的界面缺陷：`step` 和 `points` 两个格子同时可编辑、同时有值，
+而 eWave 那条 flag 只有两种写法二选一 ——
+`--multiSweep=adaptive,0:0.1:40`（步长）或 `--multiSweep=adaptive,0-41-40`（点数）。
+两个都填的时候界面完全没说会用哪个（实际是 points 悄悄赢），
+于是"界面显示的"和"真正跑的"能差一整条扫频而没人看得出来。
+"""
 
 STATUS_ORDER: tuple[str, ...] = tuple(status.value for status in RunStatus)
 """6 个状态的显示顺序 = `RunStatus` 的声明顺序：ready / pending / running / done /
@@ -97,22 +108,32 @@ DEFAULT_AXIS_SELECTION: dict[str, tuple[str, ...]] = {
     "corner": ("typical",),
     "temperature": ("-40.0", "55.0", "125.0"),
     "fullWave": ("off", "on"),
-    "equalCurrent": ("on",),
-    "mesh": ("0.4",),
+    "equalCurrent": ("off",),
+    "mesh": ("0.5",),
     "relativeTolerance": ("1e-05",),
     "relativeCurrentTolerance": ("0.001",),
 }
-"""界面打开时的初始勾选。数值取自 BRIEF §6「已知的生产默认值」——
-那是 eWave 的工具语义（和 `core.cmd.BUILTIN_DEFAULT_FLAGS` 同源），不是站点身份。"""
+"""界面打开时的初始勾选。数值是 eWave 的工具语义（和 `core.cmd.BUILTIN_DEFAULT_FLAGS`
+同源），不是站点身份。
+
+⚠️ `equalCurrent` 和 `mesh` 这两条是**用户 2026-08-20 当面订正的**，别照 BRIEF §6
+那张「已知的生产默认值」表改回去：那张表记的是官方 run 目录里**恰好**在用的值
+（`equalCurrent` 开、mesh 0.4），而这里要的是**界面打开时该给什么** ——
+用户要的是 eWave 自己的默认（`equalCurrent` 关、mesh 0.5），不是某一次官方跑的取值。
+两者不是一回事，混淆过一次了。"""
 
 DEFAULT_SWEEP: dict[str, str] = {
     "mode": "adaptive",
+    "spacing": "step",
     "start": "0",
     "stop": "40",
     "step": "0.1",
     "points": "",
 }
-"""生产实际在用的那条扫频（`--multiSweep=adaptive,0:0.1:40`，BRIEF §10）。"""
+"""生产实际在用的那条扫频（`--multiSweep=adaptive,0:0.1:40`，BRIEF §10）。
+
+`spacing="step"` ⇒ `points` 那格从一开始就是空的且不可编辑，
+界面上"看得见的"和命令行里"跑的"只有一条。"""
 
 SWEEP_AXIS_FLAGS: tuple[str, ...] = ("--multiSweep", "--logarithmicSweep", "--discreteFreq")
 """频率扫描这根轴掌管的三个 flag —— 互斥，选中的那个给值，另两个给 `False` 抵消。
@@ -121,12 +142,157 @@ SWEEP_AXIS_FLAGS: tuple[str, ...] = ("--multiSweep", "--logarithmicSweep", "--di
 MESH_FLAGS: tuple[str, ...] = ("-e", "-d", "--viaMergeSpace")
 """网格密度轴掌管的三个 flag（BRIEF §10：**唯一改 mesh 的轴**）。"""
 
+_NL = chr(10)
+"""换行符。`preflight()` 的多行文案用它拼 —— 那几条要在对话框里分行显示。"""
+
 MESH_SEP = "/"
 """网格取值里三个 flag 的分隔符：`0.4` = 三个都 0.4；`0.4/0.5/0.4` = 分别给。"""
 
 _TOGGLE_AXES: frozenset[str] = frozenset({"equalCurrent", "fullWave"})
 """开关轴 —— 取值只能是内置目录里的 `on` / `off`（`matrix.axis_with_values` 对它们
 **拒绝而不是猜**：猜错就是"目录名说 off、命令行说 on"）。"""
+
+
+SUBMIT_ACCOUNT_PLACEHOLDER = "ACCOUNT"
+SUBMIT_QUEUE_PLACEHOLDER = "QUEUE"
+"""`dsub -A` / `-q` 的占位符。站点的账号和队列是身份坐标，**不许进源码**
+（硬约束 1b）—— 这里放两个一眼假的大写词，它们的职责只是把命令的形状摆出来。"""
+
+SUBMIT_PLACEHOLDERS: tuple[str, ...] = (SUBMIT_ACCOUNT_PLACEHOLDER, SUBMIT_QUEUE_PLACEHOLDER)
+"""还留在命令里就**不许真提交**，见 `GuiState.submit_command_placeholders()`。"""
+
+DEFAULT_SUBMIT_COMMAND = (
+    "dsub"
+    f" -A {SUBMIT_ACCOUNT_PLACEHOLDER}"
+    f" -q {SUBMIT_QUEUE_PLACEHOLDER}"
+    " -R 'cpu=20;mem=100000'"
+)
+"""界面打开时 `Donau submit` 那一格里的东西 —— 一条**看得懂形状、改两个词就能用**
+的模板（用户 2026-08-20：不许空着。一个空输入框不告诉任何人它想要什么，
+于是「Donau 在哪里设置」这个问题在界面上无解）。
+
+三件事必须同时成立，缺任何一条这个默认值就变成有害的：
+
+1. **形状是真的**：flag 名与顺序跟 `sched.donau.build_dsub_argv` 同源
+   （`-A` 账号 / `-q` 队列 / `-R` 资源），整条能过 `parse_dsub_prefix` ——
+   它是可执行命令的模板，不是示意图。`tests/test_gui_submit_default.py` 盯着这条同步。
+2. **值是假的，而且一眼假**：账号 / 队列走占位符（硬约束 1b）；`-R` 用的是
+   `docs/spec_example.yaml` 里那条**例子**串，不是红区实测值
+   （`sched.donau` 模块 docstring 第 3 条：别把某一次的快照当默认值）。
+3. **换不掉就提交不了**：占位符还在 ⇒ `submit_command_error()` 标红、
+   `_make_scheduler()` 直接抛。少了这条，这个默认值只是把「空着」换成
+   「提交了一批必然被 dsub 拒掉的作业」，而后者离病根更远、更难看出原因。
+
+有官方 run 目录时模板会被**整条顶掉**：`_site_facts()` 一解析出站点的提交前缀就覆盖它
+（那份比模板准）。所以模板只活在「还没有任何站点坐标」的那段时间里。
+
+⚠️ 这是**兜底**，不是唯一入口：装了 `site.local.sh` 的机器上，开局那格直接就是站点
+真实的那条命令（`default_submit_command()`），占位符根本不出现。见下面那一节。
+"""
+
+SITE_LOCAL_NAME = "site.local.sh"
+"""站点坐标的落点。**不进 git**（`.gitignore` 里有它），模板 `site.example.sh` 进。
+
+这是 CLAUDE.md 硬约束 1b 给的两条路之一（另一条是运行时发现）：真实的 Donau 账号 /
+队列是站点身份，不许写进源码 —— 但**也不该让用户每次开界面重打一遍**。
+两者的交点就是这个文件：值留在跑它的那台机器上，仓库里只有形状。
+
+沿用 `mvp/mvp_pack.sh` 已经在用的那个名字和 `KEY=value` 格式，一台机器只需要一份。
+红区那边它在装机目录根下，`deploy.sh` 把它列进 `PRESERVE` ⇒ 每次升级都留着。"""
+
+SITE_LOCAL_ENV = "EWB_SITE_LOCAL"
+"""显式指一份 site.local.sh（给 doctor / 测试用）。给了就**只**认它，不再往下找。"""
+
+SITE_SUBMIT_KEY = "EWB_SUBMIT_COMMAND"
+"""`site.local.sh` 里那一行的键名：整条 dsub 命令，原样。
+
+存整条命令而不是拆成 `ACCOUNT=` / `QUEUE=` 三个键 —— 界面上暴露给用户改的本来就是
+整条命令（用户 2026-08-18），拆开就要在这里重新拼一遍，而拼法必须和
+`sched.donau.build_dsub_argv` 逐字一致，那是第二份会漂的实现。"""
+
+
+# --------------------------------------------------------------------------
+# site.local.sh —— 站点坐标（纯函数，测试直接用）
+# --------------------------------------------------------------------------
+
+
+def shell_value(raw: str) -> str:
+    """`site.local.sh` 里 `=` 右边那一坨 → 值。**不起 shell**（红区连 sh 都不该多起一个）。
+
+    只认三种写法，够用且没有歧义：
+    `'…'` / `"…"`（取引号内，后面的东西当注释丢掉）、裸值（切到第一个 ` #`）。
+    引号内的 `#` 必须活下来 —— dsub 的资源串里没有 `#`，但路径里有的是。
+    """
+    text = str(raw).strip()
+    if text[:1] in ("'", '"'):
+        quote = text[0]
+        end = text.find(quote, 1)
+        return text[1:end] if end > 0 else text[1:]
+    return text.split(" #", 1)[0].strip()
+
+
+def parse_site_local(text: str) -> dict[str, str]:
+    """`site.local.sh` 的文本 → `{KEY: value}`。认不出的行**跳过**，不抛。
+
+    这个文件是用户手写的，而它的读者是一个 GUI 的构造函数 —— 里面多一个空行、
+    多一句注释、多一个我们不认识的键，代价不该是「界面起不来」。
+    真正会出错的是值本身（比如 dsub 命令写错），那一步有 `submit_command_error()`
+    在界面上标红说清楚。
+    """
+    values: dict[str, str] = {}
+    for line in str(text).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].lstrip()
+        key, sep, raw = stripped.partition("=")
+        key = key.strip()
+        if not sep or not key.isidentifier():
+            continue
+        values[key] = shell_value(raw)
+    return values
+
+
+def site_local_path(env: Mapping[str, str] | None = None) -> str:
+    """这台机器上的 `site.local.sh` 在哪。没有 → 空串。
+
+    找的顺序（先命中先用）：
+
+    1. `$EWB_SITE_LOCAL` —— 显式指路。给了就只认它，找不到就是找不到，**不再往下猜**
+       （猜下去的话，用户指错路径的症状会变成「用了另一台机器的坐标」）。
+    2. **装机目录根**（本文件的上上级）—— 红区解出来的 `ewave_helper/` 就是它，
+       `deploy.sh` 也把 `site.local.sh` 保在这一层。这是红区的正路。
+    3. 当前工作目录 —— 开发机上从别处起 GUI 时的方便口子。
+    """
+    environ: Mapping[str, str] = os.environ if env is None else env
+    explicit = str(environ.get(SITE_LOCAL_ENV, "")).strip()
+    if explicit:
+        return explicit if os.path.isfile(explicit) else ""
+    install_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for base in (install_root, os.getcwd()):
+        candidate = os.path.join(base, SITE_LOCAL_NAME)
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def default_submit_command(env: Mapping[str, str] | None = None) -> str:
+    """界面开局那格里该是什么：`site.local.sh` 给了就用它，否则占位符模板。
+
+    读不出来（文件没了 / 没权限 / 编码坏了）**一律退回模板**，不抛：
+    一个读不了的配置文件不该让 GUI 起不来，而退回去的那条模板本身是安全的
+    （占位符没换掉就提交不了，见 `DEFAULT_SUBMIT_COMMAND` 第 3 条）。
+    """
+    path = site_local_path(env)
+    if not path:
+        return DEFAULT_SUBMIT_COMMAND
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            values = parse_site_local(handle.read())
+    except OSError:
+        return DEFAULT_SUBMIT_COMMAND
+    return values.get(SITE_SUBMIT_KEY, "").strip() or DEFAULT_SUBMIT_COMMAND
 
 
 # --------------------------------------------------------------------------
@@ -155,20 +321,38 @@ def normalize_temperature(value: str) -> str:
     return f"{number:.1f}" if number == round(number, 1) else text
 
 
-def sweep_axis_value(mode: str, start: str, stop: str, step: str, points: str) -> str:
+def sweep_axis_value(
+    mode: str, start: str, stop: str, step: str, points: str, spacing: str = ""
+) -> str:
     """四个格子 → 扫频轴的取值字面量（就是 flag `=` 右边那一整串）。
 
     照 `mockups/_common.sweep_flag` 的形状；两个数值按 BRIEF §10 的实测更正过
     （生产是 `--multiSweep=adaptive,0:0.1:40`，设计稿把 step 当成了 start）。
+
+    `spacing` ∈ `SWEEP_SPACINGS` 时**由它说了算**，选中的那格空着就 `SpecError`
+    （拒绝而不是猜：猜出来的是 `adaptive,0--40` 这种既不报错又跑不对的东西）。
+    `spacing=""` 是**老口径**（points 非空就赢），留给不认识这个参数的调用方 ——
+    签名后加的可选参数，老调用点一个字都不用改。
     """
     if mode == "logarithmic":
         return str(stop).strip()
     if mode == "discrete":
         return str(start).strip()
     kind = "adaptive" if mode == "adaptive" else "lin"
-    if str(points).strip():
-        return f"{kind},{str(start).strip()}-{str(points).strip()}-{str(stop).strip()}"
-    return f"{kind},{str(start).strip()}:{str(step).strip()}:{str(stop).strip()}"
+    head, tail = str(start).strip(), str(stop).strip()
+    want = str(spacing).strip()
+    if want not in SWEEP_SPACINGS:
+        want = "points" if str(points).strip() else "step"
+    chosen = str(points if want == "points" else step).strip()
+    if not chosen:
+        raise SpecError(
+            f"Frequency sweep: '{want}' is selected but empty.\n"
+            f"  Next: type a value for '{want}', or switch to "
+            f"'{'step' if want == 'points' else 'points'}'."
+        )
+    if want == "points":
+        return f"{kind},{head}-{chosen}-{tail}"
+    return f"{kind},{head}:{chosen}:{tail}"
 
 
 def sweep_flag_name(mode: str) -> str:
@@ -377,9 +561,28 @@ class GuiState:
         self.batch_root = batch_root or DEFAULT_BATCH_ROOT
         self.batch_name = batch_name
         self.official_run_dir = official_run_dir
-        self.submit_command = ""
+        self._default_submit_command = default_submit_command(env)
+        """开局那条命令的出处：装了 `site.local.sh` 就是站点真实的那条，
+        否则是 `DEFAULT_SUBMIT_COMMAND` 那条占位符模板。
+
+        存下来是因为「用户动过没有」的判据要跟**这台机器的**默认值比，
+        不是跟模板比 —— 拿模板当判据的话，装了 site.local 的机器上
+        `_submit_is_template` 开局就是 False，站点前缀再也顶不进来。"""
+
+        self.submit_command = self._default_submit_command
         """整条 dsub 命令，**原样暴露给用户改**（用户 2026-08-18 要求）。
-        空 = 还没发现站点的提交前缀（`plan()` 会从 `SiteFacts` 补一条）。"""
+
+        开局**不是空串**（用户 2026-08-20）；`plan()` 一从 `SiteFacts` 解析出站点的
+        提交前缀，就把它整条顶掉 —— 官方 run 目录里那份比任何默认值都准。"""
+
+        self._submit_is_template = True
+        """`submit_command` 还是那条没人动过的默认值吗。
+
+        这个布尔是承重的，不是记账。「用户还没给过命令」从前的判据是 `submit_command`
+        为空串，而现在开局就有内容 —— 少了它会同时坏两处：
+        ① `_site_facts()` 以为用户已经手写过命令，站点的提交前缀**永远灌不进来**；
+        ② 模板里那条**例子**资源串会顶掉官方 run 目录里**真的**那条
+        （`facts.dsub_resources`），`--parallel` 跟着一起错，而界面上两者长得一样。"""
 
         self._scheduler_override = scheduler
         self._runner_override = runner
@@ -413,6 +616,10 @@ class GuiState:
         self._driver: DriverProtocol | None = None
         self._running = False
         self._dirty = True
+        self._dry_run_only = True
+        """上一次交给 driver 的是不是 dry-run。`has_submitted()` 靠它区分预览和真提交。
+        没跑过的时候取 True 是有意的：那时 `has_submitted()` 必须是假，
+        而 `_driver is None` 已经保证了这一点，这里只是不让它变成第二个真值来源。"""
 
     # ============================================================ 冻结面
     def load_spec(self, path: str) -> None:
@@ -532,6 +739,7 @@ class GuiState:
         if self._running:
             return
         self._options.dry_run = dry_run
+        self._dry_run_only = dry_run
         if self._dirty or self._state is None:
             self.plan()
         state = self._state
@@ -580,6 +788,7 @@ class GuiState:
         self._driver = driver
         self._state = driver.state
         self._plans = {}
+        self._dry_run_only = dry_run
         self._running = True
 
     def tick(self) -> TickReport | None:
@@ -980,8 +1189,21 @@ class GuiState:
         self._invalidate()
 
     def sweep_live_fields(self) -> tuple[str, ...]:
-        """当前模式下**有意义**的那几个格子（其余界面上置灰）。"""
-        return SWEEP_FIELDS.get(self._sweep.get("mode", ""), ())
+        """当前**真正可编辑**的那几个格子（其余界面上置灰）。
+
+        模式先砍一刀（`SWEEP_FIELDS`），`spacing` 再砍一刀：`step` 和 `points` 互斥，
+        没被选中的那个不许编辑 —— 两个都能填的时候界面没法说清会用哪一个
+        （用户 2026-08-20 指出的就是这个）。
+        """
+        fields = SWEEP_FIELDS.get(self._sweep.get("mode", ""), ())
+        spacing = self._sweep.get("spacing", "")
+        if spacing not in SWEEP_SPACINGS or not set(SWEEP_SPACINGS) <= set(fields):
+            # 只有**两个都在**的模式（adaptive / linear）才谈得上互斥。
+            # logarithmic 的 SWEEP_FIELDS 里有 points 没有 step，硬套这条规则会把
+            # 它唯一的那格也灰掉。
+            return fields
+        dead = "points" if spacing == "step" else "step"
+        return tuple(name for name in fields if name != dead)
 
     def extra_flags_text(self) -> str:
         return self._extra_text
@@ -1028,6 +1250,7 @@ class GuiState:
         if str(text) == self.submit_command:
             return
         self.submit_command = str(text)
+        self._submit_is_template = self.submit_command == self._default_submit_command
         self._facts.clear()
         self._invalidate()
 
@@ -1042,6 +1265,24 @@ class GuiState:
         except EwaveBatchError:
             return ""
 
+    def submit_command_placeholders(self) -> tuple[str, ...]:
+        """命令里还剩哪些没换掉的占位符（`ACCOUNT` / `QUEUE`）。都换掉了 -> 空元组。
+
+        判据是**逐 token 比对**，不是「整条命令等不等于模板」：最常见的半改状态是
+        账号填了、队列忘了 —— 那条命令和模板已经不同，却照样一个 job 都提交不成。
+        """
+        if not self.submit_command.strip():
+            return ()
+        try:
+            from ewave_batch.sched.donau import parse_dsub_prefix
+
+            tokens: Sequence[str] = parse_dsub_prefix(self.submit_command)
+        except EwaveBatchError:
+            # 命令本身就不合法（`submit_command_error()` 会说清楚是哪种毛病）——
+            # 这里退回粗分词，好让「又非法、又没换占位符」两条都报得出来。
+            tokens = self.submit_command.split()
+        return tuple(name for name in SUBMIT_PLACEHOLDERS if name in tokens)
+
     def submit_command_error(self) -> str:
         """这条 dsub 命令有什么毛病（能提交就返回空串）。界面把它显示成红字。"""
         if not self.submit_command.strip():
@@ -1052,6 +1293,15 @@ class GuiState:
             parse_dsub_prefix(self.submit_command)
         except EwaveBatchError as exc:
             return str(exc)
+        left = self.submit_command_placeholders()
+        if left:
+            return (
+                "placeholder(s) not replaced: %s - as it stands dsub would reject every "
+                "job in this batch (no such account / queue).\n"
+                "  Next: set the official run dir and the whole dsub line is read from it, "
+                "or type the real Donau account / queue here."
+                % " / ".join(left)
+            )
         return ""
 
     def parallel(self) -> int | None:
@@ -1206,16 +1456,67 @@ class GuiState:
         return self._running
 
     def has_started(self) -> bool:
-        """这个批次已经交给 driver 跑过（或 dry-run 过）没有。
+        """这个批次已经交给 driver 跑过（**dry-run 也算**）没有。
 
-        ⚠️ 界面靠它决定**还准不准重新展开矩阵**：跑过之后再 `plan()` 会造一份
-        全新的、每个 run 都是 `READY` 的 `BatchState` —— 表上那 9 个 done 会当场消失，
-        而这看起来只是"界面刷新了一下"。跑过之后要改设定，走 `reset()`（= New batch）。
+        只说明"有一份 driver 的结果摆在表上"，**不**说明"不许再动了" ——
+        那件事问 `has_submitted()`。两者的分家见它的注释。
         """
         return self._driver is not None
 
+    def has_submitted(self) -> bool:
+        """这个批次**真的提交过**没有（dry-run 不算）。
+
+        ⚠️ 这两个判据分家是 2026-08-20 用户报的那个坑修出来的：原来界面拿
+        `has_started()` 当"不许再动了"的闸门，于是**一次 dry-run 就把整个界面锁死** ——
+        Dry-run / Submit 变灰、`recompute()` 也不再重新展开矩阵。
+        用户当时正是漏填了官方 run 目录，dry-run 全 failed，回头去填那一格
+        **界面毫无反应**（矩阵冻住了），而唯一还亮着的按钮是 Resume。
+
+        两者的成本根本不是一个量级：
+        * **dry-run 不提交任何 job、不建目录**（`options.dry_run`），重跑一次的代价是零 ——
+          它就是个预览，预览凭什么只能看一次；
+        * **真提交**会建目录、占集群（一个 run 可能 10 核 100 GB 跑 35 分钟），
+          再按一次 Submit 就是整批从头重跑。那个才值得拦。
+
+        所以：拦 Submit / 冻矩阵一律问**本方法**；`has_started()` 只用来回答
+        "表上这批数字是不是 driver 给的"。
+        """
+        return self._driver is not None and not self._dry_run_only
+
+    def preflight(self) -> list[str]:
+        """现在按下去能不能跑得成 —— 返回**挡路的原因**（空 list = 可以跑）。
+
+        为什么要有这一步而不是"跑起来再说"：漏填官方 run 目录时，每一个 run 都会在
+        拼命令那一步炸掉（`SiteFacts.ewave_bin is empty`），用户看到的是一表 failed
+        加一句面向实现者的报错，而真正要做的只是把顶上那一格填了。
+        与其让他从 6 条一模一样的失败里反推，不如在按下去的那一刻就说清楚。
+
+        文案是**英文 + 纯 ASCII**（红区 LANG 常是 C），而且每条都带"下一步做什么"。
+        """
+        problems: list[str] = []
+        if not self._designs:
+            problems.append("No design yet. Next: add one with 'Add row' under Designs.")
+        offdir = self.official_run_dir.strip() or next(
+            (d.official_run_dir.strip() for d in self._designs if d.official_run_dir.strip()), ""
+        )
+        if not offdir:
+            problems.append(
+                "Official run dir is empty, so the site coordinates (ewave path, ports, "
+                "ptxt, queue) are unknown and no command can be assembled." + _NL +
+                "  Next: fill in 'Official run dir' at the top, or use 'Browse...' to pick "
+                "the design dir the official GUI already ran once (it contains gdsout_setup)."
+            )
+        if self._designs and not self.run_count():
+            problems.append(
+                "The current settings expand to 0 runs." + _NL +
+                "  Next: tick at least one value on every axis (a single empty axis "
+                "collapses the whole matrix)."
+            )
+        return problems
+
     def reset(self) -> None:
         """New batch：把上一次的 driver / 状态 / 事件丢掉，**保留界面上的勾选**。"""
+        self._dry_run_only = True
         self._driver = None
         self._state = None
         self._contexts = {}
@@ -1469,6 +1770,7 @@ class GuiState:
                         self._sweep.get("stop", ""),
                         self._sweep.get("step", ""),
                         self._sweep.get("points", ""),
+                        self._sweep.get("spacing", ""),
                     ),
                 ),
             )
@@ -1533,13 +1835,22 @@ class GuiState:
                 "No official run dir given - site coordinates (ports, ptxt, queue) are "
                 "unknown, so commands cannot be assembled yet."
             )
-        resources = self.resources()
+        # ⚠️ 模板里那条 `-R` 是**例子**，不许顶掉官方 run 目录里真的那条 ——
+        #    只有用户真动过这个框，命令里的 `-R` 才算「用户说了算」。
+        resources = "" if self._submit_is_template else self.resources()
         if resources:
             # 用户改过那条 dsub 命令 ⇒ 以命令里的 `-R` 为准（`--parallel` 跟着它走）。
             facts = replace(facts, dsub_resources=resources)
-        elif facts.dsub_resources and not self.submit_command.strip():
-            # 第一次解析到站点的提交前缀 —— 把整条命令灌进界面让用户改。
+        elif self._submit_is_template and (
+            facts.dsub_account or facts.dsub_queue or facts.dsub_resources
+        ):
+            # 第一次解析到站点的提交前缀 —— 它比模板准，整条顶掉，让用户接着改。
+            # ⚠️ 判据是**三元组里任意一个**，不是只看 `-R`：站点那条 `remote_run_ewave.sh`
+            #    只给 `-A`/`-q` 而不给 `-R` 是完全可能的（资源走队列默认），
+            #    而那正是最该自动填上的两个 —— 账号和队列是用户手打最烦、也最容易打错的。
+            #    只看 `-R` 的话，这种站点会一直停在占位符上，用户以为工具不认识他的集群。
             self.submit_command = _dsub_command_from(facts)
+            self._submit_is_template = False
         self._facts[offdir] = facts
         return facts
 
@@ -1556,6 +1867,18 @@ class GuiState:
             return FakeScheduler()
         from ewave_batch.sched.donau import DonauScheduler, parse_dsub_prefix
 
+        # 占位符还没换掉 ⇒ **提交之前就拦住**。放过去的话 dsub 会逐个 job 拒掉
+        # （账号/队列不存在），一次点击换来 N 条彼此无关、且离病根很远的失败。
+        # dry-run 放行：它一个字节都不发出去，而「先看看命令长什么样」正是模板的用途。
+        left = self.submit_command_placeholders()
+        if left and not self._options.dry_run:
+            raise EwaveBatchError(
+                "the submit command still carries unreplaced placeholder(s) from the "
+                "default template: %s - nothing was submitted.\n"
+                "  Next: put the real Donau account / queue in the Donau submit box, or set "
+                "the official run dir and let the whole dsub line be read from it."
+                % " / ".join(left)
+            )
         facts = next(iter(self._facts.values()), SiteFacts())
         prefix: Sequence[str] = ()
         if self.submit_command.strip():
@@ -1600,6 +1923,15 @@ class GuiState:
                 if ":" in body:
                     sweep["start"], sweep["step"], sweep["stop"] = (body.split(":") + ["", ""])[:3]
                     sweep["points"] = ""
+                    sweep["spacing"] = "step"
+                elif body.count("-") == 2:
+                    # `adaptive,0-41-40` = 点数写法。以前这一支根本没解析，于是
+                    # 「存了一份 points 写法的 spec、再 Open 回来」会静默退回上一次
+                    # 界面里的 step 值 —— 文件说 41 点、界面说 0.1 步长。
+                    # 频率不会是负数，所以按 `-` 拆是安全的。
+                    sweep["start"], sweep["points"], sweep["stop"] = body.split("-")
+                    sweep["step"] = ""
+                    sweep["spacing"] = "points"
         return sweep
 
 

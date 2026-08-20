@@ -66,6 +66,7 @@ from ewave_batch.sched.driver import make_driver
 from ewave_batch.sched.fake import FakeFailureMode, FakeRunner, FakeScheduler
 
 import gui.app as gui_app
+import gui.state as gui_state
 from gui.state import GuiState
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1713,6 +1714,253 @@ class TreeColumnsAreNotSqueezedBack(_SmokeTest):
             app.tree.winfo_width(),
             "列宽之和已经装得进视口了 => ttk 不会压任何列 => 上一条测不到东西",
         )
+
+
+class InterfaceDefaults(_TempRootTest):
+    """★ 界面打开时的那几个默认值 —— 逐条钉死。
+
+    这些数字之前**没有任何测试盯着**，于是 2026-08-20 用户当面指出「equalCurrent
+    你之前忘记改了」。默认值是那种改一次就没人再看第二眼的东西：它错了，界面照样
+    打得开、矩阵照样展得出、命令照样拼得成，只是每一个 run 都跑在错的设定上。
+    所以判据必须是机器的。
+
+    ⚠️ 这里写死的期望值**只能由人改**（照用户当面拍板的那套），不许"跟着实现调"——
+    那样测试就变成了实现的复读机。
+    """
+
+    def test_equal_current_defaults_to_off(self) -> None:
+        """用户 2026-08-20：equalCurrent 默认关。"""
+        self.assertEqual(gui_state.DEFAULT_AXIS_SELECTION["equalCurrent"], ("off",))
+
+    def test_mesh_defaults_to_zero_point_five(self) -> None:
+        """用户 2026-08-20：三个网格数值都默认 0.5（= eWave 自己的默认，不是官方那次跑的 0.4）。"""
+        self.assertEqual(gui_state.DEFAULT_AXIS_SELECTION["mesh"], ("0.5",))
+
+    def test_the_defaults_reach_the_command_line(self) -> None:
+        """★ 光钉常量不够：得证明它们真的落到了 flag 上。
+
+        `equalCurrent off` 必须渲染成**显式缺席**（`False`），不是"没写这个 flag"——
+        低层默认表里有 `--equalCurrent`，不显式抵消就等于界面说关、命令说开。
+        """
+        # ⚠️ 不能用 `_bare_bridge`：它一进来就把 equalCurrent 显式设成 ("on",) 了，
+        #    那就变成"测我自己刚设的值"。默认值只能在**没人碰过**的 GuiState 上量。
+        bridge = GuiState(batch_root=self.root, batch_name="defaults")
+        bridge.add_design("MY_LIB", "CELL_A", "layout")
+        flags = {}
+        for axis in bridge.axes():
+            for value in axis.values:
+                if axis.name in ("mesh", "equalCurrent"):
+                    flags.update(value.flags)
+        self.assertIs(flags["--equalCurrent"], False, "off 必须是显式缺席而不是缺席")
+        self.assertEqual(flags["-e"], "0.5")
+        self.assertEqual(flags["-d"], "0.5")
+        self.assertEqual(flags["--viaMergeSpace"], "0.5")
+
+
+class SweepStepAndPointsAreExclusive(_TempRootTest):
+    """★ 扫频的 step 和 points 二选一（用户 2026-08-20 指出）。
+
+    eWave 那条 flag 只有两种写法：`--multiSweep=adaptive,0:0.1:40`（步长）或
+    `--multiSweep=adaptive,0-41-40`（点数）。原来界面上两个格子同时可编辑、同时有值，
+    而**界面完全没说会用哪一个**（实现里是 points 悄悄赢）—— 于是"界面显示的"和
+    "真正跑的"能差一整条扫频，而这在提交之前看不出来。
+    """
+
+    def test_step_mode_hides_points(self) -> None:
+        bridge = _bare_bridge(self.root)
+        bridge.set_sweep(mode="adaptive", spacing="step")
+        self.assertEqual(bridge.sweep_live_fields(), ("start", "stop", "step"))
+
+    def test_points_mode_hides_step(self) -> None:
+        bridge = _bare_bridge(self.root)
+        bridge.set_sweep(mode="adaptive", spacing="points")
+        self.assertEqual(bridge.sweep_live_fields(), ("start", "stop", "points"))
+
+    def test_the_selected_one_wins_even_when_the_other_still_has_a_value(self) -> None:
+        """★ 承重的一条：切到 points 之后，state 里残留的 step 值不许再赢。
+
+        没有这一条，"互斥"就只是界面上的置灰 —— 而置灰的格子里那个 0.1 仍然会
+        被 `sweep_axis_value` 的老口径（points 非空就赢）绕过去。
+        """
+        self.assertEqual(
+            gui_state.sweep_axis_value("adaptive", "0", "40", "0.1", "41", "step"),
+            "adaptive,0:0.1:40",
+        )
+        self.assertEqual(
+            gui_state.sweep_axis_value("adaptive", "0", "40", "0.1", "41", "points"),
+            "adaptive,0-41-40",
+        )
+
+    def test_an_empty_selection_is_refused_not_guessed(self) -> None:
+        """选中的那格空着 → 报错。猜出来的是 `adaptive,0--40`：不报错，也跑不对。"""
+        with self.assertRaises(SpecError):
+            gui_state.sweep_axis_value("adaptive", "0", "40", "0.1", "", "points")
+        with self.assertRaises(SpecError):
+            gui_state.sweep_axis_value("adaptive", "0", "40", "", "41", "step")
+
+    def test_old_callers_without_spacing_still_work_negative(self) -> None:
+        """反向：不传 `spacing` 的老调用点行为不变（points 非空就赢）。"""
+        self.assertEqual(
+            gui_state.sweep_axis_value("adaptive", "0", "40", "0.1", ""), "adaptive,0:0.1:40"
+        )
+        self.assertEqual(
+            gui_state.sweep_axis_value("adaptive", "0", "40", "0.1", "41"), "adaptive,0-41-40"
+        )
+
+    def test_logarithmic_is_not_hit_by_the_rule(self) -> None:
+        """反向：logarithmic 只有 points 没有 step，不该被互斥规则灰掉唯一那格。"""
+        bridge = _bare_bridge(self.root)
+        bridge.set_sweep(mode="logarithmic", spacing="step")
+        self.assertEqual(bridge.sweep_live_fields(), ("stop", "points"))
+
+    def test_points_form_survives_a_spec_round_trip(self) -> None:
+        """★ 存成 spec 再读回来，points 写法不许退回成 step 写法。
+
+        以前 `_sweep_from_axes` 根本没解析 `a-b-c` 那一支，于是文件说 41 点、
+        界面说 0.1 步长，两边都不报错。
+        """
+        import tempfile
+
+        from ewave_batch.core import spec as spec_module
+
+        bridge = _bare_bridge(self.root)
+        bridge.add_design("MY_LIB", "CELL_A", "layout")
+        bridge.set_sweep(mode="adaptive", spacing="points", start="0", stop="40", points="41")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = spec_module.save_spec(bridge.spec_snapshot(), tmp + "/s.json")
+            fresh = _bare_bridge(self.root)
+            fresh.load_spec(path)
+        self.assertEqual(fresh.sweep()["spacing"], "points")
+        self.assertEqual(fresh.sweep()["points"], "41")
+        self.assertEqual(fresh.sweep_live_fields(), ("start", "stop", "points"))
+
+
+class DryRunMustNotLockTheUi(_SmokeTest):
+    """★ 用户 2026-08-20 报的坑：一次 dry-run 就把整个界面锁死。
+
+    复现路径（他当时就是这么走的）：官方 run 目录空着 -> 按 Dry-run -> 每个 run 都在
+    拼命令那一步炸掉 -> 表上一片 failed，而 **Dry-run / Submit / Cancel 三个按钮
+    一起变灰**，只剩一个 Resume 亮着（而 Resume 要读 dry-run 根本没写过的 batch.json）。
+    更要命的是 `recompute()` 那道闸门同时把矩阵冻住了：回头去把目录填上，
+    界面毫无反应 —— 所以他说"卡在这里，根本没法重跑"。
+
+    根因是把三件事合成了一个布尔：`has_started()` 既表示"正在跑"的反面，
+    又被当成"不许再动了"。而 dry-run **不提交 job、不建目录**，重按一次代价是零。
+    """
+
+    def test_a_dry_run_is_not_a_submit(self) -> None:
+        """判据分家：dry-run 之后 `has_started` 真、`has_submitted` 假。"""
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.start(dry_run=True)
+        _drive_gui(bridge)  # 跑到终态：还在跑的时候按钮本来就该是灰的，那不是 bug
+        self.assertTrue(bridge.has_started())
+        self.assertFalse(bridge.has_submitted(), "dry-run 不算真提交，否则界面会被它锁死")
+
+    def test_a_real_submit_is_a_submit_negative(self) -> None:
+        """反向：真提交必须让 `has_submitted` 变真 —— 否则这个判据就成了永远的假。"""
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.start(dry_run=False)
+        _drive_gui(bridge)
+        self.assertTrue(bridge.has_submitted())
+
+    def test_settings_still_replan_after_a_dry_run(self) -> None:
+        """★ 承重的一条：dry-run 之后改设定，矩阵必须跟着重算。
+
+        这就是"卡住"的真身 —— 按钮只是症状，冻住的矩阵才是让人以为程序死了的东西。
+        """
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        bridge, _runner, _sched = _gui(self.root)
+        app = split.build_frame(root, bridge)._ewb_app
+        before = len(app.tree.get_children())
+        bridge.start(dry_run=True)
+        _drive_gui(bridge)  # 跑到终态：还在跑的时候按钮本来就该是灰的，那不是 bug
+        app.temp.set("-40.0, 55.0")  # 三个温度砍成两个
+        app.recompute()
+        self.assertNotEqual(
+            len(app.tree.get_children()), before, "dry-run 之后界面不再跟着勾选走 = 卡住"
+        )
+
+    def test_buttons_stay_usable_after_a_dry_run(self) -> None:
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        bridge, _runner, _sched = _gui(self.root)
+        app = split.build_frame(root, bridge)._ewb_app
+        bridge.start(dry_run=True)
+        _drive_gui(bridge)  # 跑到终态：还在跑的时候按钮本来就该是灰的，那不是 bug
+        app.sync_buttons()
+        for name in ("Dry-run", "Submit"):
+            self.assertNotIn("disabled", app.btn[name].state(), "%s 不该被 dry-run 关掉" % name)
+
+    def test_a_real_submit_does_lock_them_negative(self) -> None:
+        """反向：真提交之后两个都得关，否则再按一次就是整批从头重跑。"""
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        bridge, _runner, _sched = _gui(self.root)
+        app = split.build_frame(root, bridge)._ewb_app
+        bridge.start(dry_run=False)
+        _drive_gui(bridge)
+        app.sync_buttons()
+        for name in ("Dry-run", "Submit"):
+            self.assertIn("disabled", app.btn[name].state())
+
+    def test_resume_needs_a_real_submit_not_a_dry_run(self) -> None:
+        """dry-run 之后 Resume 必须是灰的：它从磁盘上的 batch.json 恢复，而那个文件不存在。"""
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        bridge, _runner, _sched = _gui(self.root)
+        app = split.build_frame(root, bridge)._ewb_app
+        bridge.start(dry_run=True)
+        _drive_gui(bridge)  # 跑到终态：还在跑的时候按钮本来就该是灰的，那不是 bug
+        app.sync_buttons()
+        self.assertIn("disabled", app.btn["Resume"].state())
+
+
+class PreflightRefusesInsteadOfFailingSixTimes(_SmokeTest):
+    """★ 漏填官方 run 目录时，在按下去的那一刻就说清楚，而不是产出一表 failed。
+
+    用户当时看到的是 6 条一模一样的
+    `SiteFacts.ewave_bin is empty - no idea which ewave to execute` ——
+    面向实现者的报错，说的还是同一件事，而他真正要做的只是把顶上那一格填了。
+    """
+
+    def test_missing_official_run_dir_is_reported_up_front(self) -> None:
+        bridge = GuiState(batch_root=self.root, batch_name="b")
+        bridge.add_design("MY_LIB", "CELL_A", "layout")
+        problems = bridge.preflight()
+        self.assertTrue(problems)
+        joined = " ".join(problems)
+        self.assertIn("Official run dir", joined)
+        self.assertIn("Next:", joined, "只说坏了不说下一步 = 用户还是不知道要干什么")
+        self.assertTrue(all(ord(ch) < 128 for ch in joined), "红区 LANG 常是 C => 纯 ASCII")
+
+    def test_a_fully_configured_batch_is_silent_negative(self) -> None:
+        """反向：配好了就不许拦 —— 逢按必拦等于没拦。"""
+        bridge, _runner, _sched = _gui(self.root)
+        self.assertEqual(bridge.preflight(), [])
+
+    def test_no_design_is_reported(self) -> None:
+        self.assertTrue(any("No design" in p for p in GuiState(batch_root=self.root).preflight()))
+
+    def test_a_blocked_dry_run_creates_no_driver(self) -> None:
+        """★ 拦住的时候**不许起 driver**。
+
+        起了就会留下一批假的 failed —— 而那批假结果正是让人以为"程序坏了"的东西。
+        """
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        bridge = GuiState(batch_root=self.root, batch_name="b")
+        bridge.add_design("MY_LIB", "CELL_A", "layout")
+        app = split.build_frame(root, bridge)._ewb_app
+        app.do_dry_run()
+        self.assertFalse(bridge.has_started(), "被 preflight 拦下了却还是起了 driver")
+        self.assertEqual(bridge.summary()["failed"], 0, "不该留下一批假的 failed")
+        self.assertNotIn("disabled", app.btn["Dry-run"].state(), "拦下之后还得能再按")
 
 
 if __name__ == "__main__":

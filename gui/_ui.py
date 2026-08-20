@@ -210,6 +210,9 @@ CMD_TREE_FLOOR_ROWS = 3
 所以真正的上限不是一个常数，而是"表里还富余几行"。
 """
 
+_NL = chr(10)
+"""换行符。拼多行提示文案用它（`_preflight_blocks` 那几条要在对话框里分段）。"""
+
 _DASH = "-"
 """空值的占位符。**用 ASCII 的连字符**，不是 em dash —— 红区 `LANG` 常是 `C`，
 界面字符串走的又是 Tk 不是 stdout，一个非 ASCII 字符在那边多半渲染成方块。"""
@@ -599,6 +602,8 @@ class BaseApp:
         }
         self.temp = tk.StringVar(value=", ".join(selection.get("temperature", ())))
         self.sw_mode = tk.StringVar(value=sweep.get("mode", "adaptive"))
+        self.sw_spacing = tk.StringVar(value=sweep.get("spacing", "step"))
+        """step / points 二选一（`gui_state.SWEEP_SPACINGS`）。没选中的那格置灰且清空。"""
         self.f_start = tk.StringVar(value=sweep.get("start", ""))
         self.f_stop = tk.StringVar(value=sweep.get("stop", ""))
         self.f_step = tk.StringVar(value=sweep.get("step", ""))
@@ -1067,7 +1072,7 @@ class BaseApp:
         """
         if not self.groups_ok or name == self._active_group():
             return
-        if not self.bridge.is_running() and not self.bridge.has_started():
+        if not self.bridge.is_running() and not self.bridge.has_submitted():
             self._guard(self.push)
         try:
             self.bridge.set_active_group(name)
@@ -1103,7 +1108,7 @@ class BaseApp:
         """
         if not self.groups_ok:
             return
-        if not self.bridge.is_running() and not self.bridge.has_started():
+        if not self.bridge.is_running() and not self.bridge.has_submitted():
             self._guard(self.push)
         try:
             self.bridge.add_group()
@@ -1117,7 +1122,7 @@ class BaseApp:
         """复制选中的组（base 也能复制 —— 那会把当前勾选写成一份显式覆盖）。"""
         if not self.groups_ok:
             return
-        if not self.bridge.is_running() and not self.bridge.has_started():
+        if not self.bridge.is_running() and not self.bridge.has_submitted():
             self._guard(self.push)
         try:
             self.bridge.duplicate_group(self._selected_group())
@@ -1311,19 +1316,35 @@ class BaseApp:
         combo.pack(side=tk.LEFT)
         combo.bind("<<ComboboxSelected>>", lambda _e: self.recompute())
         self.sw_combo = combo
-        self.freq_entries: dict[str, tuple[ttk.Label, ttk.Entry]] = {}
+        # `step` 和 `points` 的标签是**单选钮**而不是 Label：eWave 那条 flag 只有两种
+        # 写法二选一（`adaptive,0:0.1:40` 或 `adaptive,0-41-40`），而原来两个格子同时
+        # 可编辑、同时有值，界面完全没说会用哪个（实际是 points 悄悄赢）。
+        # 用户 2026-08-20 指出的就是这个。单选钮把"二选一"这件事画了出来。
+        self.freq_entries: dict[str, tuple[object, ttk.Entry]] = {}
+        self.freq_vars: dict[str, tk.StringVar] = {}
         for key, var in (
             ("start", self.f_start),
             ("stop", self.f_stop),
             ("step", self.f_step),
             ("points", self.f_pts),
         ):
-            label = ttk.Label(box_f, text=key)
-            label.pack(side=tk.LEFT, padx=(8, 3))
+            label: object
+            if key in gui_state.SWEEP_SPACINGS:
+                label = ttk.Radiobutton(
+                    box_f,
+                    text=key,
+                    value=key,
+                    variable=self.sw_spacing,
+                    command=self.recompute,
+                )
+            else:
+                label = ttk.Label(box_f, text=key)
+            label.pack(side=tk.LEFT, padx=(8, 3))  # type: ignore[attr-defined]
             entry = ttk.Entry(box_f, textvariable=var, width=6, font=self.f_mono)
             entry.pack(side=tk.LEFT)
             entry.bind("<KeyRelease>", lambda _e: self.recompute())
             self.freq_entries[key] = (label, entry)
+            self.freq_vars[key] = var
         ttk.Label(box_f, text="GHz", style="Hint.TLabel").pack(side=tk.LEFT, padx=4)
 
         box_h, self.cnt_mesh = self._srow(grid, 4, "Mesh", lw, key="mesh")
@@ -1426,17 +1447,23 @@ class BaseApp:
         那一步走 `core.cmd.parse_resource_string`（`GuiState.parallel()`），
         本文件不再解析第二遍。
 
-        ⚠️ `compact` 现在**什么都不管**（D3：它曾经把 "Submit command" 那个标签整个藏掉）。
+        开局那一格里是 `gui.state.DEFAULT_SUBMIT_COMMAND` 那条模板，**不是空的**
+        （用户 2026-08-20：空输入框不告诉任何人它想要什么，于是「Donau 到底在哪里
+        设置」这个问题在界面上无解）。模板里的账号 / 队列是占位符，没换掉时
+        `dsub_warn` 那行红字一直在，真提交也会被 `GuiState._make_scheduler()` 拦下 ——
+        「给个默认值」和「不许拿默认值去提交」是同一条改动的两半，别只留一半。
+
+        ⚠️ `compact` 现在**什么都不管**（D3：它曾经把 "dsub command" 那个标签整个藏掉）。
         参数留着是因为 `gui/frames/split.py` 在传它，而"布局传了一个共用层不认识的
         hint"会被 `tests/test_gui_frames.py` 记成 `dropped_hints`（那是三版分岔的信号）。
         """
-        box = ttk.LabelFrame(parent, text=" Resources ", padding=7)  # type: ignore[arg-type]
+        box = ttk.LabelFrame(parent, text=" Donau submit ", padding=7)  # type: ignore[arg-type]
         top = ttk.Frame(box)
         top.pack(fill=tk.X)
-        # ⚠️ `compact` 曾经把这个标签整个藏掉，于是 split 版的 Resources 里只剩一个
+        # ⚠️ `compact` 曾经把这个标签整个藏掉，于是 split 版的 Donau submit 里只剩一个
         #    **没有任何标签的空输入框**（2026-08-19 实拍 D3）—— 一个空框不告诉任何人
         #    它想要什么，省下那 100px 换不到这个代价。标签一律显示。
-        ttk.Label(top, text="Submit command", width=15, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Label(top, text="dsub command", width=15, anchor=tk.W).pack(side=tk.LEFT)
         entry = ttk.Entry(top, textvariable=self.dsub, font=self.f_mono)
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         entry.bind("<KeyRelease>", lambda _e: self.recompute())
@@ -1653,6 +1680,7 @@ class BaseApp:
         # 编辑别的组时那几行是置灰的，格子里还是 base 的值 ⇒ 这一步是个 no-op。
         b.set_sweep(
             mode=self.sw_mode.get(),
+            spacing=self.sw_spacing.get(),
             start=self.f_start.get(),
             stop=self.f_stop.get(),
             step=self.f_step.get(),
@@ -1791,7 +1819,7 @@ class BaseApp:
             # ⚠️ 跑过之后**不再重新展开矩阵**。`plan()` 会造一份全新的、每个 run 都是
             # `ready` 的 state —— 表上那些 done / failed 会当场消失，而界面上看起来
             # 只是"刷新了一下"。要改设定就按 New batch（`bridge.reset()`）。
-            if not self.bridge.is_running() and not self.bridge.has_started():
+            if not self.bridge.is_running() and not self.bridge.has_submitted():
                 self._guard(self.push)
                 self._guard(self.bridge.plan)
             # 这四条也要各自过闸：用户把 Mesh 的某个格子清空、把温度写成一个词，
@@ -1835,8 +1863,19 @@ class BaseApp:
         editable = self._active_is_base()
         for key, (label, entry) in self.freq_entries.items():
             on = editable and key in live
+            # 没被选中的那一格**清空**，不只是置灰：留着一个灰掉但有值的 `points=41`
+            # 会让人以为它还算数，而命令行里根本没有它。
+            # 走 StringVar 而不是 `entry.delete()` —— 这一格上一轮多半已经是 disabled 的，
+            # 对 disabled 的 Entry 做 delete 会被静默吃掉。
+            if key in gui_state.SWEEP_SPACINGS and not on:
+                self.freq_vars[key].set("")
             entry.config(state="normal" if on else "disabled")
-            label.config(foreground="#101010" if on else "#9c9c9c")
+            if isinstance(label, ttk.Radiobutton):
+                # ttk.Radiobutton 没有 -foreground 选项（ttk 的前景色走 style），
+                # 灰不灰只能用 state；拿 config(foreground=...) 招呼它会 TclError。
+                label.state(["!disabled"] if editable else ["disabled"])
+            else:
+                label.config(foreground="#101010" if on else "#9c9c9c")
         if self.sw_combo is not None:
             self.sw_combo.config(state="readonly" if editable else "disabled")
 
@@ -2072,29 +2111,52 @@ class BaseApp:
         return "%s: %s" % (last.kind.value, last.message)
 
     def sync_buttons(self) -> None:
-        """按钮的可用性 —— 「跑过了」和「正在跑」是两回事，别合成一个布尔。
+        """按钮的可用性 —— 「正在跑」「真提交过」「没得跑」是**三件**事，别合成一个布尔。
 
-        跑过之后 Submit **保持禁用**：再按一次会把整批从头重跑（一个 run 可能
-        10 核 100 GB 跑 35 分钟）。补没成的那些走 Resume，重来一批走 New batch。
+        2026-08-20 用户报的坑就是把它们合成了一个：漏填官方 run 目录 -> dry-run 全
+        failed -> Dry-run / Submit / Cancel 一起变灰，只剩一个 Resume 亮着，
+        而 Resume 要读 dry-run 根本没写过的 batch.json。于是界面死在那儿，
+        填好目录也没用（`recompute()` 那道闸门同时把矩阵冻住了）。
+
+        现在的口径：
+
+        | 按钮 | 什么时候能按 | 为什么 |
+        |---|---|---|
+        | Dry-run | 不在跑 且 有 run 且 没**真提交**过 | dry-run 过不算跑过，随便按 |
+        | Submit  | 同上 | 真提交之后再按一次是整批从头重跑 |
+        | Cancel  | 正在跑 | — |
+        | Resume  | **真提交过** 且 不在跑 | 判据来自磁盘上的 batch.json，dry-run 没写过它 |
+
+        「真提交过」= `bridge.has_submitted()`。它和 `has_started()` 的分家写在
+        `gui.state.GuiState.has_submitted` 上。
         """
         running = self.bridge.is_running()
-        started = self.bridge.has_started()
+        submitted = self.bridge.has_submitted()
         # A7：一个 run 都没有时按下去会起一个**空批次**（建目录、写 batch.json、
         # 状态栏报 "0 runs"），而用户按它是因为以为自己配好了。没得跑就不许按。
         # `run_count()` 会因为设定不合法而抛 —— 那种时候同样不该能提交。
-        off = running or started
-        if not off:
-            # `run_count()` 每次都重算一遍笛卡尔积 —— 已经关掉的时候没必要再问一次。
+        empty = False
+        if not running:
+            # `run_count()` 每次都重算一遍笛卡尔积 —— 正在跑的时候没必要再问一次。
             # 设定不合法时 bridge 返回 0（它吞掉 `EwaveBatchError`），那种情况同样
             # 不该能提交，所以这里不需要区分"没配"和"配错了"。
             try:
-                off = self.bridge.run_count() == 0
+                empty = self.bridge.run_count() == 0
             except EwaveBatchError:
-                off = True
+                empty = True
+        # ★ 关键的一个字：判据是 `has_submitted()` 而不是 `has_started()`。
+        #   **dry-run 不算"跑过"** —— 它不提交 job、不建目录，重按一次代价是零。
+        #   2026-08-20 用户报的正是这个：漏填官方 run 目录 -> dry-run 全 failed ->
+        #   Dry-run 自己也变灰 -> 填好目录之后没有任何办法重新预览。
+        #   反过来，**真提交之后两个都得关**：那时表上是真批次的状态，再按 Dry-run
+        #   会拿同一份 state 重跑一遍预览、把真结果冲掉（补没成的走 Resume）。
+        off = running or submitted or empty
         for name in ("Dry-run", "Submit"):
             self.btn[name].state(["disabled"] if off else ["!disabled"])
         self.btn["Cancel"].state(["!disabled"] if running else ["disabled"])
-        self.btn["Resume"].state(["!disabled"] if (started and not running) else ["disabled"])
+        # Resume 只在**真提交过**之后才有意义：它是从磁盘上的 batch.json 恢复的，
+        # 而 dry-run 压根没写过那个文件（点下去只会得到一条读不到文件的报错）。
+        self.btn["Resume"].state(["!disabled"] if (submitted and not running) else ["disabled"])
 
     def popup(self, event: object) -> None:
         iid = self.tree.identify_row(event.y)  # type: ignore[attr-defined]
@@ -2128,8 +2190,26 @@ class BaseApp:
                 pass
             self._timer = None
 
+    def _preflight_blocks(self, what: str) -> bool:
+        """按下去之前先问一句"现在跑得成吗"。挡住了就弹框说清楚并返回 True。
+
+        为什么值得多这一步：2026-08-20 用户漏填了官方 run 目录就按 Dry-run，
+        结果是**一表 failed** 加一句面向实现者的报错
+        （`SiteFacts.ewave_bin is empty - no idea which ewave to execute`）——
+        6 个 run 报的是同一件事，而真正要做的只是把顶上那一格填了。
+        与其让他从 6 条一模一样的失败里反推，不如在按下去的那一刻就说清楚，
+        而且**不起 driver** —— 不起就不会留下一批假的 failed 结果。
+        """
+        problems = self.bridge.preflight()
+        if not problems:
+            return False
+        _error("Cannot %s yet" % what, (_NL + _NL).join(problems))
+        return True
+
     def do_submit(self) -> None:
         self.recompute()
+        if self._preflight_blocks("submit"):
+            return
         try:
             self.bridge.start(dry_run=False)
         except EwaveBatchError as exc:
@@ -2141,6 +2221,8 @@ class BaseApp:
     def do_dry_run(self) -> None:
         """只拼命令、不提交（D8）。走的是**同一个 driver**，只是 options.dry_run=True。"""
         self.recompute()
+        if self._preflight_blocks("dry-run"):
+            return
         try:
             self.bridge.start(dry_run=True)
         except EwaveBatchError as exc:
@@ -2324,6 +2406,7 @@ class BaseApp:
         sweep = self.bridge.sweep()
         self._apply_axis_selection(self.bridge.axis_selection())
         self.sw_mode.set(sweep.get("mode", "adaptive"))
+        self.sw_spacing.set(sweep.get("spacing", "step"))
         self.f_start.set(sweep.get("start", ""))
         self.f_stop.set(sweep.get("stop", ""))
         self.f_step.set(sweep.get("step", ""))

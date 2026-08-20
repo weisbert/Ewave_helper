@@ -18,11 +18,22 @@
   the gap unless .gitattributes export-ignores it, so new modules and new tests
   are packaged automatically and this script never needs touching.
 
-  Emits exactly two files, under <OutDir>:
+  Emits two files under <OutDir>:
     <Name>_<shorthash>.tar.gz              the whole package (code + tests + docs)
     <Name>_<shorthash>.tar.gz.sha256
   Upload both; that is the entire delivery. The sidecar is in GNU
   `sha256sum -c` format (LF, no BOM).
+
+  Plus a third file WHEN, and only when, this repo has a site.local.sh:
+    site.local.sh                          this site's Donau account/queue
+  It is NOT in the tarball and never can be -- it is gitignored, so `git archive`
+  cannot see it, which is exactly the point (CLAUDE.md hard constraint 1b: site
+  identity never enters the repo, hence never enters a package built from it).
+  It rides ALONGSIDE the tarball so a fresh box can be configured in the same
+  upload instead of retyping the account by hand. Upload it once -- deploy.sh
+  keeps it across every later upgrade.
+  It carries red-zone identifiers: it travels between your own machines only,
+  never to GitHub or a share.
 
   Requires only git + PowerShell (Get-FileHash). No Python, no external tar,
   no downloaded packages.
@@ -148,11 +159,30 @@ function Write-Sha256Sidecar([string]$FilePath) {
 }
 $hash = Write-Sha256Sidecar $tarPath
 
+# --- site.local.sh: copied BESIDE the tarball, never into it -----------------
+# The package is built by `git archive` from committed blobs, so a gitignored
+# file is structurally unable to end up inside it. That is the guarantee we
+# want; this copy only spares the operator retyping the Donau account on a fresh
+# box. deploy.sh preserves site.local.sh across upgrades, so it matters for the
+# first install (or a rebuilt box) and never again.
+$siteLocalSrc = Join-Path $RepoRoot 'site.local.sh'
+$siteLocalOut = $null
+if (Test-Path -LiteralPath $siteLocalSrc) {
+    $siteLocalOut = Join-Path $OutDir 'site.local.sh'
+    Copy-Item -LiteralPath $siteLocalSrc -Destination $siteLocalOut -Force
+}
+
 # --- report ------------------------------------------------------------------
 $size = '{0:N1} KB' -f ((Get-Item $tarPath).Length / 1KB)
 Write-Host ""
 Write-Host "OK  package : $tarPath  ($size)"
 Write-Host "    sha256  : $hash"
+if ($siteLocalOut) {
+    Write-Host "    site    : $siteLocalOut  (site coordinates -- NOT inside the tarball)"
+} else {
+    Write-Host "    site    : no site.local.sh here - the GUI opens with ACCOUNT / QUEUE placeholders"
+    Write-Host "              (cp site.example.sh site.local.sh and fill it in, or just set Official run dir over there)"
+}
 Write-Host ""
 Write-Host "commit info:"
 & git --no-pager show -s --format='    %h  %cI  %s' $Ref
@@ -166,3 +196,8 @@ Write-Host "       bash deploy.sh                    # picks up the tarball sitt
 Write-Host "       bash deploy/doctor.sh --test      # verify the box can run it"
 Write-Host ""
 Write-Host "     (first time only: tar -xzf $tarName  ->  ./$Prefix/ is the install)"
+if ($siteLocalOut) {
+    Write-Host ""
+    Write-Host "     first install on a box? upload site.local.sh into .../$Prefix/ too."
+    Write-Host "     Later upgrades keep it -- deploy.sh never overwrites it nor backs it away."
+}

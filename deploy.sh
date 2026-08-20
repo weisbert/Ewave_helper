@@ -15,6 +15,8 @@
 #   <install>/.deploy/tmp/                  scratch (doctor.sh)
 #   <install>/.deploy/preserve.list         optional: top-level names to KEEP
 #                                           across deploys (your batch results)
+#   <install>/site.local.sh                 this box's site coordinates -- kept
+#                                           across deploys without any list entry
 #
 # Usage -- upload the tarball INTO the install dir, then just run this:
 #   cd .../ewave_helper
@@ -129,9 +131,17 @@ fi
 mkdir -p "$INCOMING" "$STAGING" "$BACKUPS"
 
 # --- preserve list: top-level names that survive the swap --------------------
-# Always .deploy; plus anything the operator listed (batch result roots, their
-# own scratch dirs, ...). One name per line, '#' starts a comment.
-PRESERVE=(".deploy")
+# Always .deploy and site.local.sh; plus anything the operator listed (batch
+# result roots, their own scratch dirs, ...). One name per line, '#' starts a
+# comment.
+#
+# site.local.sh is built in rather than left to the list because it is the one
+# file that CANNOT come from a package: it holds this box's Donau account and
+# queue, which are site identity and therefore never enter the repo (CLAUDE.md
+# hard constraint 1b). Losing it on an upgrade means the operator has to dig
+# the values out again, and the symptom is silent -- the GUI just opens with
+# ACCOUNT / QUEUE placeholders as if the box had never been configured.
+PRESERVE=(".deploy" "site.local.sh")
 if [[ -f "$DEPLOY/preserve.list" ]]; then
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     _line="${_line%%#*}"

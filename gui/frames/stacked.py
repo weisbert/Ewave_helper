@@ -64,7 +64,7 @@ SECTION_TITLES: dict[str, str] = {
     "designs": "Designs",
     "groups": "Run groups",
     "settings": "Settings",
-    "resources": "Resources",
+    "resources": "Donau submit",
     "runs": "Runs",
     "detail": "Selected run",
     "actionbar": "Actions",
