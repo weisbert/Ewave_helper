@@ -38,7 +38,7 @@ import os
 import sys
 import tempfile
 import unittest
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ewave_batch.__main__ import check_protocol, normalize_signature
 from ewave_batch.core import layout
@@ -68,7 +68,14 @@ from ewave_batch.model import (
     ToolMissingError,
 )
 from ewave_batch.sched import driver as driver_mod
-from ewave_batch.sched.driver import Driver, SubprocessRunner, make_driver, resume_batch, run_batch
+from ewave_batch.sched.driver import (
+    Driver,
+    SubprocessRunner,
+    _facts_describe_design,
+    make_driver,
+    resume_batch,
+    run_batch,
+)
 from ewave_batch.sched.fake import FakeFailureMode, FakeRunner, FakeScheduler
 
 # --------------------------------------------------------------------------
@@ -164,10 +171,20 @@ EXPECTED_FAILED = 4
 # --------------------------------------------------------------------------
 
 
-def _facts(official_run_dir: str = "") -> SiteFacts:
-    """最小站点坐标。字段全是假路径（`SiteFacts` 里装的全是站点身份，硬约束 1b）。"""
+def _facts(official_run_dir: str = "", design: Design | None = None) -> SiteFacts:
+    """最小站点坐标。字段全是假路径（`SiteFacts` 里装的全是站点身份，硬约束 1b）。
+
+    给了 `design` 就把 library / top_cell / view 填成**这个 design 的三元组** ——
+    真实的官方 run 目录必然带着自己的身份（`gdsout_setup` 的存在就是"这是官方目录"
+    的判据，而它正是这三个字段的来源），所以留空的 facts 是个假造的形状。
+    这三个字段是 `sched.driver._facts_describe_design` 的判据：端口表能不能当期望值，
+    取决于这份 facts 到底描述的是不是这个 design。
+    """
     return SiteFacts(
         official_run_dir=official_run_dir,
+        library=design.library if design is not None else "",
+        top_cell=design.cell if design is not None else "",
+        view=design.view if design is not None else "",
         ewave_bin=FAKE_EWAVE_BIN,
         strmout_bin=FAKE_STRMOUT_BIN,
         layer_map=FAKE_LAYER_MAP,
@@ -292,7 +309,7 @@ def _build(
     contexts = {
         d.key: PlanContext(
             design=d,
-            facts=_facts(d.official_run_dir),
+            facts=_facts(d.official_run_dir, d),
             axes=tuple(axes),
             options=options,
             batch_dir=batch_dir,
@@ -1362,6 +1379,107 @@ class SubprocessRunnerRealProcess(unittest.TestCase):
         result = runner.run(self._python("import time; time.sleep(60)"), timeout=0.3)
         self.assertTrue(result.timed_out)
         self.assertLess(result.duration_seconds, 30, "超时了就该马上回来")
+
+
+# --------------------------------------------------------------------------
+# 端口数期望值的身份守卫
+# --------------------------------------------------------------------------
+
+
+class PortCountGuardNeedsTheSameDesign(_TempRootTest):
+    """★ 官方 run 目录属于**别的** design 时，它的端口表不许当这个 design 的期望值。
+
+    用户 2026-08-20 问出来的：本工具的主用例就是"跑官方 GUI 没跑过的东西"，
+    而一个全新的 design 根本没有自己的官方目录 —— 只能指同 PDK 里别人的那个
+    （ptxt / key / layerMap / 队列全都对，唯独端口表不是它的）。
+    不设防的话第一批 run 会全判 failed，报
+    `port count mismatch: output has N ports, expected M`，
+    而那个 M 跟这个设计毫无关系、`.sNp` 其实是好的。
+
+    第二级来源（批次内已验过的产物）救不了第一次：它要跑完一个 run 才有。
+    """
+
+    def test_matching_identity_is_accepted(self) -> None:
+        """正向：三元组对得上 ⇒ 官方端口表照旧当期望值（原有的那道防线不许丢）。"""
+        design = Design(library=FAKE_LIB, cell="cellA", view=FAKE_VIEW)
+        self.assertTrue(_facts_describe_design(design, _facts("/some/dir", design)))
+
+    def test_a_different_cell_is_refused(self) -> None:
+        design = Design(library=FAKE_LIB, cell="cellA", view=FAKE_VIEW)
+        other = Design(library=FAKE_LIB, cell="cellB", view=FAKE_VIEW)
+        self.assertFalse(_facts_describe_design(design, _facts("/some/dir", other)))
+
+    def test_a_different_view_is_refused(self) -> None:
+        """view 也要比：pin 长在 cellview 上，官方跑 layout、我们跑派生的 EM cellview，
+        端口集合可以不一样（BRIEF §5：view 不是常量）。"""
+        design = Design(library=FAKE_LIB, cell="cellA", view=FAKE_VIEW)
+        other = Design(library=FAKE_LIB, cell="cellA", view="emview")
+        self.assertFalse(_facts_describe_design(design, _facts("/some/dir", other)))
+
+    def test_an_unidentified_facts_is_refused(self) -> None:
+        """★ 解析不出身份 ⇒ 也不用。
+
+        两种错法的后果不对称：该拦没拦 = 一整批本来好的 run 被判 failed；
+        不该拦拦了 = 第一轮少一层交叉核对。所以确认不了的时候站在"不判人失败"那边。
+        """
+        design = Design(library=FAKE_LIB, cell="cellA", view=FAKE_VIEW)
+        self.assertFalse(_facts_describe_design(design, _facts("/some/dir")))
+
+    def test_case_matters_negative(self) -> None:
+        """反向：大小写敏感 —— 库名和端口名在 Cadence 里就是敏感的，
+        在这儿养成忽略大小写的手感迟早出事。"""
+        design = Design(library=FAKE_LIB, cell="cellA", view=FAKE_VIEW)
+        other = Design(library=FAKE_LIB.lower(), cell="cellA", view=FAKE_VIEW)
+        self.assertFalse(_facts_describe_design(design, _facts("/some/dir", other)))
+
+    def test_a_foreign_official_dir_does_not_fail_a_good_run(self) -> None:
+        """★ 端到端：facts 是别人的 ⇒ 产物端口数与官方不同，但 run 照样 done。
+
+        这就是用户那个场景的机器判据。改动之前它会是 failed。
+        """
+        root = self._root()
+        batch = _build(root)
+        # 把每个 context 的 facts 换成"别人的设计"：端口表还在（5 个，产物是 4 个），
+        # 但三元组指向另一个 cell。
+        stranger = Design(library=FAKE_LIB, cell="someoneElse", view=FAKE_VIEW)
+        for key, ctx in list(batch.contexts.items()):
+            foreign = replace(
+                _facts(ctx.design.official_run_dir, stranger),
+                official_port_spec=PortSpec(
+                    mode=PortMode.EXPLICIT,
+                    mapping=tuple(
+                        (f"P{i:03d}", f"OTHER_{i}") for i in range(PORT_COUNT + 1)
+                    ),
+                ),
+            )
+            batch.contexts[key] = replace(ctx, facts=foreign)
+        driver = batch.driver()
+        _drive(driver)
+        statuses = {run.run_id: run.status.value for run in driver.state.runs}
+        self.assertEqual(
+            sorted(set(statuses.values())), ["done"], "别人的端口表不该把好 run 判死"
+        )
+
+    def test_a_matching_official_dir_still_catches_a_wrong_count_negative(self) -> None:
+        """反向：三元组对得上的时候，端口数不符仍然要判 failed ——
+        否则这个守卫就是把整道防线拆了。"""
+        root = self._root()
+        stranger_free = _build(root)
+        for key, ctx in list(stranger_free.contexts.items()):
+            mine = replace(
+                _facts(ctx.design.official_run_dir, ctx.design),
+                official_port_spec=PortSpec(
+                    mode=PortMode.EXPLICIT,
+                    mapping=tuple(
+                        (f"P{i:03d}", f"PIN_{i}") for i in range(PORT_COUNT + 1)
+                    ),
+                ),
+            )
+            stranger_free.contexts[key] = replace(ctx, facts=mine)
+        driver = stranger_free.driver()
+        _drive(driver)
+        statuses = {run.run_id: run.status.value for run in driver.state.runs}
+        self.assertIn("failed", set(statuses.values()))
 
 
 if __name__ == "__main__":  # pragma: no cover

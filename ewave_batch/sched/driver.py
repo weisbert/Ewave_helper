@@ -76,6 +76,7 @@ from ..model import (
     RunResult,
     RunStatus,
     SchedulerProtocol,
+    SiteFacts,
     SpecError,
     StateError,
     StreamoutTask,
@@ -144,6 +145,43 @@ def _posix(path: str) -> str:
 def _utcnow() -> str:
     """UTC、秒精度（`model.TIMESTAMP_FORMAT`）。别往 `batch.json` 里写本地时间。"""
     return datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT)
+
+
+def _facts_describe_design(design: Design, facts: SiteFacts) -> bool:
+    """这份 `SiteFacts` 描述的**就是**这个 design 吗（library / cell / view 三段全中）。
+
+    **私有**（`_` 开头）是有意的：它只服务本模块的 `_expected_port_count`，
+    没有跨模块使用者。`docs/INTERFACES.md` 说"只加新符号也要更新 FROZEN，
+    否则没人替你盯着它别漂"—— 而给一个模块内 helper 走一次 `[interface-change]`
+    是把冻结面当垃圾桶用。测试直接 import 这个私有名（`gui._ui` 也是这么被测的）。
+
+    `SiteFacts` 里的 `library` / `top_cell` / `view` 一直被解析出来却没人用 ——
+    拼命令时一律走 `Design`（"facts 是官方那次跑的是谁，而我们要导的是用户点名的这个"）。
+    这里第一次用到它们，而且是当**守卫**用，不是当输入用。
+
+    为什么需要这道守卫（用户 2026-08-20 问出来的）：`_expected_port_count` 的第三级
+    回退拿官方那条命令的端口表当期望值，注释写着"官方跑的就是这个 design"——
+    **这个前提只在官方 run 目录属于同一个 design 时成立**。而本工具的主用例恰恰是
+    "跑官方 GUI 没跑过的东西"：一个全新的 design 根本没有自己的官方目录，
+    用户只能指同 PDK 里别人的那个（ptxt / key / layerMap / 队列全都对，唯独端口表不是）。
+    不设防的话，第一批 run 会全判 failed，报
+    `port count mismatch: output has 12 ports, expected 17`，而那个 17 跟这个设计毫无关系、
+    `.sNp` 其实是好的。第二级（批次内已验过的产物）要跑完一个 run 才有，救不了第一次。
+
+    **三段都要求非空且逐字相等**，尤其 view 不能放过：pin 长在 cellview 上，
+    官方跑 `layout`、我们跑一个为 EM 派生的 cellview，端口集合可以是不一样的
+    （BRIEF §5：view 不是常量）。大小写敏感 —— 端口名和库名在 Cadence 里就是敏感的，
+    别在这儿养成忽略大小写的手感。
+
+    对不上 ⇒ 调用方拿到 `None` = **没有期望值**，而不是一个错的期望值。
+    那是降级成"这一项不交叉核对"，不是降级成"判人失败"。
+    """
+    triples = (
+        (design.library, facts.library),
+        (design.cell, facts.top_cell),
+        (design.view, facts.view),
+    )
+    return all(mine.strip() and mine.strip() == theirs.strip() for mine, theirs in triples)
 
 
 def _parse_stamp(text: str) -> datetime | None:
@@ -256,6 +294,11 @@ class Driver:
         self._paths: dict[str, RunPaths] = {}
         self._unknown_polls: dict[str, int] = {}
         self._port_counts: dict[str, int] = {}
+        self._port_guard_skipped: set[str] = set()
+        """官方 run 目录不属于这个 design ⇒ 端口数**这一项**没得核对的那些 design。
+        每个 design 只播一次 warning（`_warn_port_guard_once`）——
+        静默跳过一道安全检查比没有这道检查更糟，但每个 run 播一次就成了噪声。"""
+        self._port_guard_warned: set[str] = set()
 
         self._designs: dict[str, Design] = {}
         for design in state.designs:
@@ -506,7 +549,7 @@ class Driver:
         job_id = run.job.job_id if run.job is not None else "?"
         if seen < _UNKNOWN_POLL_LIMIT:
             return False
-        verdict = self._verify(run)
+        verdict = self._verify(run, events)
         if verdict.ok:
             self._note(
                 events,
@@ -535,7 +578,7 @@ class Driver:
         🚨 这个方法里没有任何一行看 `Job.exit_code` 来判成败 —— 它只作诊断
         （BRIEF §10：eWave 崩了也 `exit=0`）。
         """
-        report = verdict if verdict is not None else self._verify(run)
+        report = verdict if verdict is not None else self._verify(run, events)
         job = run.job
         run.ended_at = (job.ended_at if job is not None else "") or run.ended_at or _utcnow()
         elapsed = _elapsed(run.started_at, run.ended_at)
@@ -998,11 +1041,35 @@ class Driver:
         self._plans[run.run_id] = plan
         return plan
 
-    def _verify(self, run: Run) -> VerifyReport:
-        return layout.verify_run_outputs(
+    def _verify(self, run: Run, events: list[DriverEvent] | None = None) -> VerifyReport:
+        report = layout.verify_run_outputs(
             self._paths_for(run),
             run,
             expected_port_count=self._expected_port_count(run.design_key),
+        )
+        if events is not None:
+            self._warn_port_guard_once(run.design_key, events)
+        return report
+
+    def _warn_port_guard_once(self, design_key: str, events: list[DriverEvent]) -> None:
+        """端口数这一项没核对 ⇒ 说一次。**说一次**，不是每个 run 说一次。
+
+        为什么必须出声：`--all` 的代价就是这道防线（pin 集合一变，端口编号全平移，
+        而且静默）。跳过它是对的（拿别人的端口表判人失败更糟），但用户得知道
+        这个批次的第一轮少了一层保护 —— 以及怎么把它拿回来。
+        """
+        if design_key in self._port_guard_warned or design_key not in self._port_guard_skipped:
+            return
+        self._port_guard_warned.add(design_key)
+        self._note(
+            events,
+            EventKind.WARNING,
+            "port count is not cross-checked for this design: the official run dir "
+            "describes a different (library, cell, view), so its port table says nothing "
+            "about this one. Next: point this design at its own official run dir, or set "
+            "port_spec explicitly. Once one run of this design passes, later runs in the "
+            "batch are checked against it.",
+            design_key=design_key,
         )
 
     def _expected_port_count(self, design_key: str) -> int | None:
@@ -1029,7 +1096,12 @@ class Driver:
             return learned
         ctx = self._contexts.get(design_key)
         if ctx is not None and ctx.facts.official_port_spec.mapping:
-            return len(ctx.facts.official_port_spec.mapping)
+            # ★ 守卫：这份 facts 得**真的是这个 design**，见 `_facts_describe_design`。
+            #   拿别人的端口表当期望值 = 一批本来是好的 run 被判 failed，
+            #   而报错里那个数字跟这个设计毫无关系。
+            if design is not None and _facts_describe_design(design, ctx.facts):
+                return len(ctx.facts.official_port_spec.mapping)
+            self._port_guard_skipped.add(design_key)
         return None
 
     def _finished(self) -> bool:
