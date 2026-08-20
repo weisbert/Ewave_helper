@@ -68,13 +68,48 @@ def _tk_or_skip(test: unittest.TestCase) -> object:
         import tkinter as tk
     except ImportError as exc:  # pragma: no cover - 本机装了 tkinter
         test.skipTest(f"平台跳过：这台机器没装 tkinter（{exc}）—— CLI 不受影响")
-    try:
-        root = tk.Tk()
-    except tk.TclError as exc:  # pragma: no cover - 本机有显示
-        test.skipTest(f"平台跳过：这台机器开不了显示（{exc}）—— CLI 不受影响")
-    root.withdraw()
-    test.addCleanup(root.destroy)
+    global _SHARED_ROOT
+    if _SHARED_ROOT is None:
+        try:
+            _SHARED_ROOT = tk.Tk()
+        except tk.TclError as exc:  # pragma: no cover - 本机有显示
+            test.skipTest(f"平台跳过：这台机器开不了显示（{exc}）—— CLI 不受影响")
+        _SHARED_ROOT.withdraw()
+    root = _SHARED_ROOT
+    test.addCleanup(_destroy_children, root)
     return root
+
+
+_SHARED_ROOT = None
+"""整个进程**共用一个** Tk 根窗口。
+
+原来是每条测试 `tk.Tk()` + `addCleanup(destroy)`。Windows 上开到几十个之后
+`Tk()` 会开始抛 `Can't find a usable tk.tcl` —— 而 `_tk_or_skip` 把任何 `TclError`
+都当成"这台机器没有显示"，于是**那条测试静默地跳过了**。2026-08-20 实测：同一条
+命令跑两遍，skip 数在 4/5/6 之间跳，跳掉的每次都不是同一条。
+
+一条 skip 掉的测试和一条不存在的测试，在闸门眼里长得一模一样 —— 这正是本项目
+已经吃过一次亏的那种假绿。共用一个根就没有"开太多"这回事；每条测试结束时
+销毁自己建的子控件，状态不带过去。
+"""
+
+
+def _destroy_children(root: object) -> None:
+    """把这条测试往共用根里建的东西全清掉（含 Toplevel）。
+
+    不销毁根本身 —— 它要给下一条测试用。顺手 `update()` 一次把队列里剩下的
+    虚拟事件（`<<TreeviewSelect>>` 是排进队列的）跑完，免得它们打到下一条测试的
+    控件上。
+    """
+    for child in list(root.winfo_children()):  # type: ignore[attr-defined]
+        try:
+            child.destroy()
+        except Exception:  # noqa: BLE001 - 已经销毁过的子件，收尾而已
+            pass
+    try:
+        root.update()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _base_snapshot(bridge: GuiState) -> tuple[dict, dict]:

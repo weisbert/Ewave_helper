@@ -176,7 +176,7 @@ csh/tcsh 里看退出码：`echo $status`（不是 `$?`）。
 --offdir DIR        官方跑过的那个 design 目录（必填，**只读**）
 --spec FILE         可选：批次 spec（YAML/JSON）。不给就用 OFFDIR 自己的
                     corner/temperature 造一个单点批次 = 把官方那次跑重放一遍
---batch-root DIR    落点的根，只用来算路径、**不会建目录**（默认 ./ewave_batches）
+--batch-root DIR    落点的根，只用来算路径、**不会建目录**（默认 ~/ewave_batches）
 --batch-name NAME   批次名（默认 dryrun）
 --limit N           只详细打印前 N 个 run（0 = 全部，默认）
 --show-gdsout       连渲染出来的 gdsout_setup 一起打印（仍然不写它）
@@ -198,7 +198,7 @@ python -c "import sys; from ewave_batch.core.spec import EXAMPLE_SPEC; sys.stdou
 2. 所有「真跑时会写这里」的落点都经过一道守卫：落点在 `ewave_simulation/` 里面
    （设计师的 spine）或者落在 `--offdir` 里面 → **当场拒绝、退 1**，而且是在打印
    任何命令**之前**拒绝的。
-3. 落点默认是 `./ewave_batches`，而且**连这个目录都不会建**。
+3. 落点默认是 `~/ewave_batches`（**不是**相对当前目录 —— 落在安装目录里会被部署搬走，2026-08-20 真丢过一次数据），而且**连这个目录都不会建**。
 4. 有一条测试专门盯这件事：把合成的官方目录放进一个真叫 `ewave_simulation` 的目录里，
    跑之前记下整棵树的文件集 + 大小 + mtime，跑之后逐个比对相同
    （`tests/test_redzone_dryrun.py::ReadOnlyGuard`）。

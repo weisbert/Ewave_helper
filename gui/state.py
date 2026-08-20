@@ -70,13 +70,56 @@ from ewave_batch.tools import ewave as ewave_tool
 # 界面默认值 —— **全是工具语义或占位符，一个站点坐标都没有**
 # --------------------------------------------------------------------------
 
-DEFAULT_BATCH_ROOT = "./ewave_batches"
-"""批次落在哪的兜底值。相对路径 ⇒ 相对当前工作目录，**绝不会指进设计师的 spine**
+DEFAULT_BATCH_ROOT = "~/ewave_batches"
+"""批次落在哪的兜底值。**必须是与 cwd 无关的绝对位置。**
+
+2026-08-20 之前这里是 `./ewave_batches`（相对**启动 GUI 时的当前目录**），
+用户丢过一次真实结果，链条是：人自然会 `cd <安装目录>` 再起界面 ⇒ 批次落在安装目录
+里面 ⇒ 下一次 `deploy.sh` 把它 `mv` 进 `.deploy/backups/<TS>/` ⇒ 再 3 次部署之后
+轮转静默删掉。**这个风险当时是已知的**（`deploy/README.md` 写了、部署完还会打一段
+警告），但"文档 + 一行会滚过去的警告"没拦住任何人 —— 所以现在改成结构上拦：
+
+1. 默认落点挪出安装目录（这里）；
+2. `deploy.sh` 的 `PRESERVE` 里写死 `ewave_batches`，并且**任何含 `batch.json` 的
+   顶层目录一律不搬**（`looks_like_batch_data`）；
+3. 界面上把 batch root 显示出来、可改，指进程序目录时**标红**
+   （`batch_root_warning()`）。
+
+`~` 由 `os.path.expanduser` 在 `batch_dir()` / `core.spec.spec_to_batch` 里展开
+（两处本来就在做，没有新的展开点）。**绝不会指进设计师的 spine**
 （硬约束 4；真落盘前还有 `core.layout` 的 `_assert_outside_spine` 兜底）。"""
 
 CORNER_VALUES: tuple[str, ...] = ("cbest", "cworst", "rcbest", "rcworst", "typical")
 """5 个工艺角的通用名字（BRIEF §10 用户给的轴清单）。**不是站点身份** ——
 它们是 PDK 通用词汇，真正的站点坐标是 ptxt 的路径，那个由 `core.discover` 现场解析。"""
+
+MAX_PARALLEL_CAP = 64
+"""界面允许的「同时在飞」上限。**不是工具的限制，是防手滑的**：一个 run 是
+10 核 / 100 GB / 35 分钟（BRIEF §12），手滑多打一个 0 就是拿整个队列去换一次输入错误。
+真要更高就改 spec 文件里的 `options.max_parallel` —— 那条路没有这道夹子。"""
+
+GROUP_OVERRIDABLE_AXES: tuple[str, ...] = (
+    "corner",
+    "temperature",
+    "mesh",
+    "fullWave",
+    "equalCurrent",
+)
+"""一个 run group **可以**自己定的轴。界面上就是 Settings 里带覆盖勾选框的那五行。
+
+⚠️ 三根轴故意不在这里，**它们只属于 base**（口径与 `gui/_ui.py` 的 `GROUP_ROW_AXES`
+逐字一致，`tests/test_gui_groups.py` 拿一条测试钉住这一点，防止两处漂）：
+
+* `freq` —— 界面上它不是一个取值列表而是一整排格子（模式 + start/stop/step/points），
+  「勾一下就覆盖」表达不了它；
+* `relativeTolerance` / `relativeCurrentTolerance` —— 收敛容差是整批的性质而不是
+  变体的轴。给组钉一份就会出现"用户改了 base 的容差，这个组**静默**留在老值上"。
+
+★ 这个常量的第一个用户是 `duplicate_group`（2026-08-20 的 bug）：复制 base 时它原来
+把 `_base_axes()` 的**每一根**轴都写成显式覆盖，于是复制出来的组带着一份钉死的
+freq + 两个 tolerance —— 界面上看不见、点不到、撤不掉，而它们照样进笛卡尔积、
+照样把 `freq` 变成"全批次在变的轴"从而改掉每一个 run 的目录名。
+"""
 
 SWEEP_MODES: tuple[str, ...] = ("adaptive", "linear", "logarithmic", "discrete")
 """频率扫描的四种模式。前两种走 `--multiSweep=`，后两种各走自己的 flag。"""
@@ -886,6 +929,31 @@ class GuiState:
         self.batch_root = str(root).strip() or DEFAULT_BATCH_ROOT
         self._invalidate()
 
+    def batch_root_warning(self) -> str:
+        """batch root 指进了**程序自己所在的目录** -> 一句红字。没问题 -> 空串。
+
+        这是 2026-08-20 那次数据丢失的结构性防线。`deploy.sh` 升级时会把安装目录里
+        每一个"不认识的"顶层条目 `mv` 进 `.deploy/backups/<TS>/`，3 次部署之后轮转
+        把它删掉。批次落在安装目录里面 = 把结果放在一个会被自动清理的地方。
+
+        判据是"解析后的绝对路径落在本工具的包目录里"，不是字符串前缀比较 ——
+        `./ewave_batches` 是相对 cwd 的，只有解析成绝对路径之后才知道它到底在哪，
+        而"从安装目录启动 GUI"正是最常见的用法。
+        """
+        try:
+            root = os.path.abspath(os.path.expanduser(self.batch_root or DEFAULT_BATCH_ROOT))
+            tool = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+            if os.path.commonpath([root, tool]) != tool:
+                return ""
+        except (OSError, ValueError):  # pragma: no cover - 不同盘符 / 怪路径
+            return ""
+        return (
+            "Batch root is inside the tool's own directory (%s).\n"
+            "  A deploy moves anything it does not recognise into .deploy/backups/ and "
+            "rotation deletes it a few deploys later - results kept here can disappear.\n"
+            "  Next: point it somewhere outside, e.g. %s" % (tool, DEFAULT_BATCH_ROOT)
+        )
+
     def set_official_run_dir(self, path: str) -> None:
         """批次级的官方 run 目录（design 没写自己的就用它）。坐标从这里现场解析。
 
@@ -1032,19 +1100,36 @@ class GuiState:
         self._reject_reserved(new_name)
         source = str(name).strip() or BASE_GROUP
         if source == BASE_GROUP:
-            overrides = {
-                axis.name: tuple(av.value for av in axis.values) for axis in self._base_axes()
-            }
+            overrides = self._materialised_base_overrides()
             label = ""
         else:
             group = self._require_group(source)
             overrides = {k: tuple(v) for k, v in group.axis_overrides.items()}
             label = group.label
+            if not overrides:
+                # 源组自己一根轴都没覆盖（`add_group` 出来的空组就是这样）⇒ 照抄等于
+                # 又造一个空组：界面上**整块 Settings 是灰的**，看起来像坏了，而
+                # 用户刚按的是"复制"，他要的是"一份能改的东西"。理由与复制 base
+                # 那条逐字相同 —— 空覆盖的副本没有意义。
+                overrides = self._materialised_base_overrides()
         actual = self._unique_group_name(str(new_name).strip() or f"{source}-copy")
         self._groups.append(RunGroup(name=actual, axis_overrides=overrides, label=label))
         self._active_group = actual
         self._invalidate()
         return actual
+
+    def _materialised_base_overrides(self) -> dict[str, tuple[str, ...]]:
+        """把 base 现在的勾选写成一份**显式覆盖** —— 只写组管得着的那几根轴。
+
+        `GROUP_OVERRIDABLE_AXES` 那道筛子是这个方法的**全部**要点：没有它，
+        复制出来的组会带着 freq 和两个 tolerance 的显式覆盖，而界面上那三样
+        在非 base 组里是置灰的 —— 看不见、点不到、撤不掉，却照样进笛卡尔积。
+        """
+        return {
+            axis.name: tuple(av.value for av in axis.values)
+            for axis in self._base_axes()
+            if axis.name in GROUP_OVERRIDABLE_AXES
+        }
 
     def remove_group(self, name: str) -> None:
         """删一个组。删 base -> `SpecError`（base 就是顶层的轴，删不掉）。
@@ -1369,6 +1454,25 @@ class GuiState:
     def options(self) -> BatchOptions:
         """批次级开关（**同一个对象**，界面改它即时生效）。"""
         return self._options
+
+    def set_max_parallel(self, value: int) -> int:
+        """同时在飞的 job 数上限。返回**实际生效**的值（越界会被夹）。
+
+        ★ 为什么它不走 `set_axis_values` 那条路、也不 `_invalidate()`：
+        它**不是矩阵的一部分**。改一根轴会让上一次 plan 作废（run 的集合变了），
+        而改这个只改"一次放几个出去"—— run 还是那些 run。所以它在批次**跑起来之后**
+        照样能改，而那正是最想改它的时刻（4 个在跑、第 5 个在等，用户想让它也走）。
+        driver 每一拍都重新读 `options.max_parallel`（`_submit_step`），所以下一拍就生效。
+        """
+        try:
+            wanted = int(str(value).strip())
+        except (TypeError, ValueError):
+            raise SpecError(
+                "Max in flight must be a whole number (how many jobs may be in the "
+                "scheduler at once).\n  Next: e.g. 4"
+            ) from None
+        self._options.max_parallel = max(1, min(MAX_PARALLEL_CAP, wanted))
+        return self._options.max_parallel
 
     def defaults_table(self) -> list[tuple[str, str, str]]:
         """`Tools → Extraction defaults…` 那张表：(flag, 值, 值是哪来的)。
@@ -1753,10 +1857,21 @@ class GuiState:
             # 屏幕上摆的都是"还没跑的预览"，说成 Finished 就是在说谎。
             return f"Preview up to date - {total} runs ready to submit"
         if self._running:
-            return (
+            # 🚨 `ready` 那些**必须**出现在这一行里。它们是"还没提交"（在等一个并发
+            #    名额），而不是"没有"—— 漏掉它们时这句话加起来比表里的行数少，
+            #    用户看到的就是"最后一个根本就没跑"（2026-08-20 实报）。
+            waiting = counts["ready"]
+            line = (
                 f"Running - {counts['done']} done, {counts['running']} running, "
                 f"{counts['pending']} pending, {counts['failed']} failed"
             )
+            if waiting:
+                line += (
+                    f", {waiting} waiting for a free slot "
+                    f"(max {self._options.max_parallel} in flight - raise it next to the "
+                    "dsub command)"
+                )
+            return line
         result = self.dry_run_result()
         if result is not None:
             built, failed = result

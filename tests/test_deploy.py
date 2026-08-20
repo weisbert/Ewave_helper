@@ -700,5 +700,166 @@ class ShellSyntax(unittest.TestCase):
         )
 
 
+class DeployMustNotEatBatchResults(unittest.TestCase):
+    """★ 2026-08-20 真丢过一次数据的回归守卫。**这一条是端到端的：真跑 `deploy.sh`。**
+
+    当时的链条（三段，每一段单独看都不算错）：
+
+    1. `gui.state.DEFAULT_BATCH_ROOT` 是 `./ewave_batches` —— 相对**启动 GUI 时的
+       当前目录**。而人自然会 `cd <安装目录>` 再起界面 ⇒ 批次落在安装目录里面。
+    2. `deploy.sh` 升级时把安装目录里每一个"不认识的"顶层条目 `mv` 进
+       `.deploy/backups/<TS>/`，`PRESERVE` 当时只有 `.deploy` 和 `site.local.sh`。
+    3. 备份只留最新 `KEEP_BACKUPS` 份，再部署几次就静默删掉。
+
+    这个风险**当时是已知的**：`deploy/README.md` 写了一段、换装完还会打一段
+    "these were NOT part of the new package" 的提醒。都没拦住 —— 提醒混在一大段
+    部署输出里滚过去了。**所以判据不能是"有没有那句话"，只能是"数据还在不在"。**
+
+    ⚠️ 一并盯 `.sha256` 那条路：本测试不给 sidecar，deploy 会 WARN 然后继续，
+    这是有意的（真实用法里 sidecar 常常在，但它不该是本条判据的前提）。
+    """
+
+    SENTINEL_REL = "ewave_batch/model.py"
+
+    def _bash(self):
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("平台性 skip：本机没有 bash（Git Bash 未安装）")
+        if shutil.which("tar") is None:
+            self.skipTest("平台性 skip：本机没有 tar")
+        return bash
+
+    def _install(self, box: Path, batch_dirname: str = "ewave_batches") -> Path:
+        """造一个最小但**真实**的安装目录：sentinel + 一批"跑完的结果"。"""
+        sentinel = box / self.SENTINEL_REL
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text("# old version\n", encoding="utf-8")
+        shutil.copy2(DEPLOY_SH, box / "deploy.sh")
+
+        batch = box / batch_dirname / "batch_20260820_010203"
+        batch.mkdir(parents=True)
+        # `batch.json` 是判据的锚：`looks_like_batch_data()` 认的就是它。
+        (batch / "batch.json").write_text('{"runs": []}\n', encoding="utf-8")
+        (batch / "runs.csv").write_text("run_id\n", encoding="utf-8")
+        sparam = batch / "sparam"
+        sparam.mkdir()
+        (sparam / "CELL_A__base__typical_55_0.s4p").write_text("! fake\n", encoding="utf-8")
+        return box / batch_dirname
+
+    def _package(self, box: Path) -> Path:
+        """造一个最小合法的新包：单个顶层目录 + sentinel。"""
+        stage = box / "_pkgsrc" / "Ewave_helper"
+        (stage / "ewave_batch").mkdir(parents=True)
+        (stage / self.SENTINEL_REL).write_text("# new version\n", encoding="utf-8")
+        (stage / "VERSION").write_text("9.9.9\n", encoding="utf-8")
+        tarball = box / "ewave_helper_new.tar.gz"
+        with tarfile.open(tarball, "w:gz") as tar:
+            tar.add(stage, arcname="Ewave_helper")
+        shutil.rmtree(box / "_pkgsrc")
+        return tarball
+
+    def _deploy(self, bash: str, box: Path) -> str:
+        proc = subprocess.run(
+            [bash, "deploy.sh"],
+            cwd=str(box),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=300,
+        )
+        out = proc.stdout.decode("utf-8", "replace")
+        self.assertEqual(proc.returncode, 0, "部署本身失败了，这条测的就不是它了：\n" + out)
+        return out
+
+    def test_a_deploy_leaves_batch_results_where_they_are(self) -> None:
+        """★ 承重的一条：升级之后，那批结果必须**原地**还在。
+
+        判据是文件本身，不是任何一句提示 —— 提示已经证明过拦不住人了。
+        """
+        bash = self._bash()
+        with tempfile.TemporaryDirectory(prefix="ewb_deploy_keep_") as tmp:
+            box = Path(tmp)
+            batches = self._install(box)
+            self._package(box)
+            out = self._deploy(bash, box)
+
+            sparam = batches / "batch_20260820_010203" / "sparam"
+            self.assertTrue(batches.is_dir(), "整个 ewave_batches 都不在了：\n" + out)
+            self.assertTrue(
+                (batches / "batch_20260820_010203" / "batch.json").is_file(),
+                "batch.json 没了：\n" + out,
+            )
+            self.assertTrue(
+                (sparam / "CELL_A__base__typical_55_0.s4p").is_file(),
+                "产物没了 —— 这正是 2026-08-20 那次：\n" + out,
+            )
+            # 而且**不许**是"搬进备份里了"那种还在。
+            moved = list(box.glob(".deploy/backups/*/ewave_batches"))
+            self.assertEqual(moved, [], "被搬进备份了（轮转几次就会删掉）：\n" + out)
+            # 升级本身得真发生过，否则上面全是空过的。
+            self.assertIn(
+                "new version", (box / self.SENTINEL_REL).read_text(encoding="utf-8"),
+                "包根本没装上，这条测试什么都没证明"
+            )
+
+    def test_a_batch_dir_under_any_other_name_is_kept_too(self) -> None:
+        """名字不叫 `ewave_batches` 也得保住 —— 判据是 `batch.json`，不是名字。
+
+        `PRESERVE` 那张名单只认默认名；把 batch_root 指到别处的人恰恰是最可能
+        丢数据的那个（他的名字没人替他写进名单）。
+        """
+        bash = self._bash()
+        with tempfile.TemporaryDirectory(prefix="ewb_deploy_alias_") as tmp:
+            box = Path(tmp)
+            batches = self._install(box, batch_dirname="my_results")
+            self._package(box)
+            out = self._deploy(bash, box)
+            self.assertTrue(
+                (batches / "batch_20260820_010203" / "batch.json").is_file(),
+                "换个名字就保不住了：\n" + out,
+            )
+
+    def test_an_unrelated_directory_is_still_swept_negative(self) -> None:
+        """反向：不含 `batch.json` 的陌生目录**照旧**搬进备份。
+
+        否则上一条就成了"什么都不搬"—— 那样换装会把旧版本的残留文件永远留在安装
+        目录里，而清干净正是 `deploy.sh` 存在的一半理由。
+        """
+        bash = self._bash()
+        with tempfile.TemporaryDirectory(prefix="ewb_deploy_sweep_") as tmp:
+            box = Path(tmp)
+            self._install(box)
+            junk = box / "leftover_from_v1"
+            junk.mkdir()
+            (junk / "stale.py").write_text("# old\n", encoding="utf-8")
+            self._package(box)
+            out = self._deploy(bash, box)
+            self.assertFalse(junk.exists(), "陌生目录没被清走 —— 换装等于没换：\n" + out)
+            self.assertTrue(
+                list(box.glob(".deploy/backups/*/leftover_from_v1/stale.py")),
+                "清走了却没进备份 —— 那是删，不是搬：\n" + out,
+            )
+
+    def test_the_warning_about_moved_files_is_the_last_thing_printed(self) -> None:
+        """那句"你的东西被搬走了"必须是**最后**一段。
+
+        它原来印在成功报告中间，被后面十几行 NEXT 提示顶得滚出屏幕 ——
+        用户就是这么错过它的。判据是位置，不是存在。
+        """
+        bash = self._bash()
+        with tempfile.TemporaryDirectory(prefix="ewb_deploy_warn_") as tmp:
+            box = Path(tmp)
+            self._install(box)
+            (box / "leftover_from_v1").mkdir()
+            (box / "leftover_from_v1" / "x.txt").write_text("x\n", encoding="utf-8")
+            self._package(box)
+            out = self._deploy(bash, box)
+            self.assertIn("YOUR OWN FILES WERE MOVED", out)
+            tail = [line for line in out.strip().splitlines() if line.strip()][-12:]
+            self.assertTrue(
+                any("YOUR OWN FILES WERE MOVED" in line for line in tail),
+                "那段警告又跑到中间去了，会被滚过去：\n" + out,
+            )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

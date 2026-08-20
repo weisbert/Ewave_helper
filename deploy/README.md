@@ -199,20 +199,32 @@ cp site.example.sh site.local.sh     # 然后按里面的说明改那一行
 
 ## 保住你自己的数据
 
-一次部署会替换掉除 `.deploy/` 之外的每一个顶层条目。
-**如果你把批次结果落在安装目录里面**（例如默认的 `ewave_batches/`），
-把那个顶层名字写进 `.deploy/preserve.list`（一行一个，`#` 是注释）：
+一次部署会替换掉除下面这些之外的每一个顶层条目：
 
-```
-ewave_batches
-```
+| 保住的东西 | 靠什么认出来 |
+|---|---|
+| `.deploy/` `site.local.sh` `ewave_batches/` | 写死在 `deploy.sh` 的 `PRESERVE` 里 |
+| **任何含 `batch.json` 的目录**（`<它>/batch.json` 或 `<它>/*/batch.json`） | `looks_like_batch_data()` 现场探测 —— 名字叫什么都行 |
+| `*.tar.gz` / `*.sha256` | 那是你刚上传的交付包，不是安装内容 |
+| `.deploy/preserve.list` 里列的名字 | 一行一个，`#` 是注释 |
 
-写了就不会被换装碰。包自己也带的名字（例如 `docs`）会被明确报错拒绝，
-而不是被静默地套一层。
+**批次结果不需要你做任何事**：不管落点叫什么，只要里面有 `batch.json`，换装就不碰它。
 
-没写会怎样：那个目录**不会被删**，它会被 `mv` 进 `.deploy/backups/<ts>/`
-—— 换装完 `deploy.sh` 会专门列出「这些东西现在只存在于备份里」并提醒你补
-`preserve.list`。但再部署 3 次之后备份轮换就会把它删掉，**而且是静默的**。
+> 2026-08-20 之前不是这样的：`PRESERVE` 只有 `.deploy` 和 `site.local.sh`，
+> 而默认 `batch_root` 是 `./ewave_batches`（相对**启动 GUI 时的当前目录**）——
+> 于是"`cd <安装目录>` 再起界面"这个最自然的用法会让批次落在安装目录里，
+> 下一次部署把它 `mv` 进 `.deploy/backups/`，再 3 次部署之后轮转静默删掉。
+> 用户真丢过一次。当时这个风险是**已知**的，靠的是这份文档 + 换装完打一段提醒 ——
+> 两样都没拦住。现在改成结构上拦：默认落点挪出安装目录（`~/ewave_batches`）、
+> 探测 `batch.json`、界面上把落点显示出来并在指进程序目录时标红。
+> 守它的是 `tests/test_deploy.py::DeployMustNotEatBatchResults`（真跑一次 deploy）。
+
+包自己也带的名字（例如 `docs`）会被明确报错拒绝，而不是被静默地套一层。
+
+**万一还是有东西被搬走了**：它不会被删，而是 `mv` 进 `.deploy/backups/<ts>/`。
+换装完 `deploy.sh` 会在**输出的最末尾、单独一段**把那些名字列出来
+（`!! YOUR OWN FILES WERE MOVED OUT OF THE INSTALL DIRECTORY`）。
+再部署 `KEEP_BACKUPS`（3）次之后备份轮换会把它删掉，所以看到那段就当场处理。
 所以看到那条提醒就动手。
 
 上传的 `*.tar.gz` 留在原地（`.deploy/incoming/` 里另有一份）。

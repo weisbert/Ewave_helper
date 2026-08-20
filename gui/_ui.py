@@ -36,6 +36,7 @@ from ewave_batch.model import BASE_GROUP, EwaveBatchError, Run
 
 from . import state as gui_state
 from .app import SMOKE_ENV, smoke_enabled
+from .trace import ActionTrace, _clip as _trace_clip, wrap as _trace_wrap
 
 SMOKE = os.environ.get(SMOKE_ENV) == "1"
 """import 时的快照。**判定一律走 `smoke_enabled()`** —— 测试要能在 import 之后打开它。"""
@@ -219,6 +220,15 @@ RUNS_STALE_WARNING = (
 是"这张表现在是旧的"这句话。
 """
 
+MAX_PARALLEL_TIP = (
+    "How many jobs may sit in the scheduler at once.\n"
+    "The rest wait at 'ready' and go in as slots free up - that is why a 5th run can "
+    "stay 'ready' while 4 are running.\n"
+    "Changing this works while the batch is running: the next poll uses the new value."
+)
+"""「同时在飞」那一格的悬停提示。**第二句是全部要点** ——
+`ready` 在这个工具里是"还没提交"，不是"没跑成"，而这一点在界面上没有别的地方讲。"""
+
 OVERRIDE_TIP = (
     "%s\n"
     "  ticked  : this run group sets it itself\n"
@@ -252,6 +262,18 @@ LOG_EMPTY = (
     "(nothing yet - press Dry-run to build every command without submitting anything, "
     "or Submit to actually run them)"
 )
+
+TRACE_HINT = (
+    "Developer log - every click, every dialog, every swallowed error, plus a state line "
+    "after each redraw.  Reading a state line: active=<group being edited>  "
+    "sel=<row selected in the group table>  groups=[name{overridden axes}]  "
+    "axes[corner=1N ...] where 1/0 = the override box and N/D = the row is editable/greyed.  "
+    "1N and 0D are normal; 1D or 0N means the widgets and the model disagree - that is the bug.  "
+    "Press Clear, reproduce the problem, then Copy all."
+)
+"""Developer log 窗口底下那行灰字。**必须解释怎么读那一行快照** ——
+一行 `active=... axes[corner=1N ...]` 不自带图例的话，它对任何人（包括三个月后的
+我们自己）都只是一串噪声。"""
 
 LOG_HINT = (
     "Read-only. Select with the mouse, Ctrl-A selects all, Ctrl-C copies. "
@@ -723,6 +745,11 @@ class _LogWindow:
             bar, text="Copy for sharing", width=17, command=lambda: self._copy(True)
         ).pack(side=tk.LEFT, padx=4)
         ttk.Button(bar, text="Save as...", width=11, command=self._save).pack(side=tk.LEFT)
+        # 从这扇窗过得去 Developer log：用户找日志时找的是"Log"，而他要的东西
+        # （点了什么、报了什么）在**另一扇**窗里 —— 菜单里那一条不够，这里也给一条。
+        ttk.Button(
+            bar, text="Developer log", width=15, command=self.app.show_trace
+        ).pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(bar, text="Follow", variable=self.follow).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Button(bar, text="Close", width=8, command=self.close).pack(side=tk.RIGHT)
         self.count_lbl = ttk.Label(bar, text="", style="Hint.TLabel")
@@ -908,6 +935,220 @@ class _LogWindow:
         self.count_lbl.config(text="saved to %s" % os.path.basename(path))
 
 
+class _TraceWindow:
+    """**Developer log** —— 用户点了什么 → 界面做了什么 → 报了什么错，一条一行。
+
+    ★ 与 `_LogWindow` 的分工（两扇窗，不是一扇窗两个 tab）：
+
+    | | 讲什么 | 谁看 |
+    |---|---|---|
+    | Log | driver 事件：提交 / 完成 / 失败 / 拼出来的命令 | 用户，回答"能不能跑" |
+    | Developer log | 界面事件：点击 / 弹框 / 被吞掉的异常 / 界面-模型快照 | 写代码的人，回答"刚才为什么怪" |
+
+    分成两扇的理由是**受众不同**：Log 那扇是给"我要跑一批仿真"的人看的，混进
+    `on_group_select swallowed` 只会让它更难读；而 Developer log 里一行 200 字符、
+    每敲一个键就多一条，塞进 Log 会把那 6 条真正重要的事件冲走。
+
+    用户 2026-08-20 明说这一份「不要管什么违规问题」⇒ `Copy all` 拷**原文**。
+    `Copy for sharing` 照旧留着（同 `_LogWindow`），多一个按钮不增加任何摩擦。
+    """
+
+    def __init__(self, app: "BaseApp") -> None:
+        self.app = app
+        self._doc = ""
+        self.top = tk.Toplevel(app.top)
+        self.top.title("eWave Batch - Developer log")
+        try:
+            self.top.geometry(LOG_GEOMETRY)
+        except tk.TclError:  # pragma: no cover - 嵌进别人的窗口时
+            pass
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
+        self.follow = tk.BooleanVar(value=True)
+
+        bar = ttk.Frame(self.top, padding=(8, 6))
+        bar.pack(side=tk.TOP, fill=tk.X)
+        ttk.Button(bar, text="Copy all", width=10, command=lambda: self._copy(False)).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(
+            bar, text="Copy for sharing", width=17, command=lambda: self._copy(True)
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bar, text="Save as...", width=11, command=self._save).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Clear", width=8, command=self._clear).pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(bar, text="Follow", variable=self.follow).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(bar, text="Close", width=8, command=self.close).pack(side=tk.RIGHT)
+        self.count_lbl = ttk.Label(bar, text="", style="Hint.TLabel")
+        self.count_lbl.pack(side=tk.RIGHT, padx=8)
+
+        self.hint = ttk.Label(self.top, text=TRACE_HINT, style="Hint.TLabel", wraplength=1000)
+        self.hint.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(2, 6))
+        self.top.bind("<Configure>", self._refit_wraps, add="+")
+
+        wrap = ttk.Frame(self.top, padding=(8, 0))
+        wrap.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.text = tk.Text(
+            wrap,
+            height=LOG_ROWS,
+            wrap="none",
+            font=app.f_mono,
+            relief=tk.SOLID,
+            bd=1,
+            background="#fbfbfb",
+            foreground="#222222",
+        )
+        yscroll = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.text.yview)
+        xscroll = ttk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=self.text.xview)
+        self.text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.text.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        _make_readonly(self.text)
+        # 出事的那几行要**一眼看得见**：轨迹一屏 40 行，全黑的话 ERR / CRASH
+        # 跟"一切正常"长得一模一样。
+        self.text.tag_configure("err", foreground=RED)
+        self.text.tag_configure("note", foreground=BLUE)
+        self.text.tag_configure("state", foreground="#5a5a5a")
+
+        # ★ 实时刷新：轨迹自己记一条就叫一声，不靠轮询。
+        #   （轮询要么慢半拍，要么在没跑批次的时候根本没有拍 —— 而这些 bug
+        #   恰好全发生在"还没开跑"的配置阶段。）
+        self.app.trace.on_record = self._on_record
+        if smoke_enabled():
+            self.top.withdraw()
+
+    # ------------------------------------------------------------- 生命周期
+    def _on_record(self) -> None:
+        """轨迹多了一条。窗口已经关掉时**摘掉自己**，别让回调吊着一扇死窗。"""
+        if not self.alive():
+            if self.app.trace.on_record is self._on_record:
+                self.app.trace.on_record = None
+            return
+        self.refresh()
+
+    def alive(self) -> bool:
+        try:
+            return bool(self.top.winfo_exists())
+        except tk.TclError:  # pragma: no cover - 解释器收尾时
+            return False
+
+    def close(self) -> None:
+        if self.app.trace.on_record is self._on_record:
+            self.app.trace.on_record = None
+        try:
+            self.top.destroy()
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    def present(self) -> None:
+        if not self.alive() or smoke_enabled():
+            return
+        try:
+            self.top.deiconify()
+            self.top.lift()
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    def _refit_wraps(self, _event: object = None) -> None:
+        try:
+            width = max(200, self.top.winfo_width() - 24)
+        except tk.TclError:  # pragma: no cover - 窗口已经关掉
+            return
+        self.hint.config(wraplength=width)
+
+    # --------------------------------------------------------------- 内容
+    def document(self) -> str:
+        """整份轨迹。抬头带环境 —— 报 bug 时"哪台机器上的哪个批次"总要问一遍。"""
+        bridge = self.app.bridge
+        header = [
+            "# eWave Batch - developer log (what the user clicked -> what came back)",
+            "# batch      %s" % (getattr(bridge, "batch_name", "") or _DASH),
+            "# layout     %s" % self.app.__class__.__name__,
+            "# python     %s on %s" % (sys.version.split()[0], sys.platform),
+            "# tk         %s" % self._tk_version(),
+            "# state      %s" % bridge.status_line(),
+            LOG_RULE,
+        ]
+        return self.app.trace.document(header)
+
+    def _tk_version(self) -> str:
+        try:
+            return str(self.top.tk.call("info", "patchlevel"))
+        except tk.TclError:  # pragma: no cover
+            return "?"
+
+    def refresh(self, force: bool = False) -> None:
+        if not self.alive():
+            return
+        doc = self.document()
+        self.count_lbl.config(text="%d entries" % len(self.app.trace))
+        if doc == self._doc and not force:
+            return
+        self._doc = doc
+        first, _last = self.text.yview()
+        self.text.delete("1.0", tk.END)
+        self.text.insert("1.0", doc)
+        self._colourise()
+        self.text.yview_moveto(1.0 if self.follow.get() else first)
+
+    def _colourise(self) -> None:
+        """按 kind 那一列上色。**只碰屏幕上这一份**，不改轨迹本身。"""
+        for tag, needle in (("note", "note "), ("state", "state"),
+                            ("err", "ERR  "), ("err", "CRASH")):
+            index = "1.0"
+            while True:
+                hit = self.text.search("  %s" % needle, index, tk.END, nocase=False)
+                if not hit:
+                    break
+                line = hit.split(".")[0]
+                self.text.tag_add(tag, "%s.0" % line, "%s.end" % line)
+                index = "%s.end" % line
+
+    # --------------------------------------------------------------- 动作
+    def _copy(self, masked: bool) -> None:
+        doc = self._doc or self.document()
+        note = "copied %d lines" % doc.count(_NL)
+        if masked:
+            table = self.app.bridge.redaction_map()
+            doc = gui_state.redact(doc, table)
+            note = "copied %d lines, %d site names masked" % (doc.count(_NL), len(table))
+        try:
+            self.top.clipboard_clear()
+            self.top.clipboard_append(doc)
+            self.top.update()
+        except tk.TclError as exc:  # pragma: no cover - 没有剪贴板的环境
+            note = "could not copy: %s" % exc
+        self.count_lbl.config(text=note)
+
+    def _clear(self) -> None:
+        """从这里重新开始记 —— 「我现在按一遍给你看」之前按它，噪声就没了。"""
+        self.app.trace.clear()
+        self.app.trace.note("trace cleared by the user")
+        self.refresh(force=True)
+
+    def _save(self) -> None:
+        if smoke_enabled():
+            return
+        name = (getattr(self.app.bridge, "batch_name", "") or "ewave-batch").strip() or "trace"
+        path = filedialog.asksaveasfilename(
+            parent=self.top,
+            title="Save developer log",
+            defaultextension=".log",
+            initialfile="%s-dev.log" % name,
+            filetypes=[("Log file", "*.log"), ("Text file", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline=_NL) as handle:
+                handle.write(self.document())
+        except OSError as exc:
+            _error("Cannot save the developer log", str(exc))
+            return
+        self.count_lbl.config(text="saved to %s" % os.path.basename(path))
+
+
 class BaseApp:
     """三版布局共用的状态 + section builder。子类只实现 `layout()`。
 
@@ -943,6 +1184,8 @@ class BaseApp:
         self.groups_hint: ttk.Label | None = None
         self.groups_warn: tk.Label | None = None
         self.runs_stale: tk.Label | None = None
+        self.broot_warn: tk.Label | None = None
+        self.broot_lbl: object | None = None
         self._runs_stale_anchor: object | None = None
         self.group_hint: tk.Label | None = None
         self.settings_grid: ttk.Frame | None = None
@@ -951,6 +1194,11 @@ class BaseApp:
         self._log: _LogWindow | None = None
         """Log 窗口。**最多一扇** —— 用户按第二次 Log 是"我要看日志"，
         不是"我要两份日志"，而两扇窗只有一扇会被 `_pump()` 刷新。"""
+        self._trace_win: "_TraceWindow | None" = None
+        """Developer log 窗口（`gui/trace.py`）。同样最多一扇。"""
+        self.trace = ActionTrace()
+        """动作轨迹。`_install_trace()` 会**换掉**这一个 —— 这里先摆一个空的，
+        好让"控件还没建完就有人记一条"不至于 `AttributeError`。"""
         self._runs: tuple[Run, ...] = ()
 
         # bridge 喂不喂得饱 run group 面板 —— **当判据用，不当假设用**。
@@ -969,9 +1217,137 @@ class BaseApp:
 
         self._init_vars()
         self._init_style()
+        # ★ 轨迹必须在 `build_*` **之前**装好：按钮是 `command=self.do_x` 绑的，
+        #   绑的是**那一刻**的方法对象，装晚了按钮上挂的就是没被包过的原件。
+        self._install_trace()
         self.build_menubar()
         self.layout()
         self.recompute()
+
+    # --------------------------------------------------------------- 轨迹
+    # 用户 2026-08-20：「做一个开发者用的 log 页面，记录用户点了什么、返回了什么报错」。
+    # 模型与取舍写在 `gui/trace.py` 的模块 docstring 上，这里只做接线。
+
+    TRACED = (
+        # 组这一块是这一轮 bug 的现场，记得最细。
+        "do_add_group", "do_duplicate_group", "do_remove_group",
+        "on_group_rename", "on_override_toggle",
+        # ⚠️ `switch_group` 也不在名单里，理由同下：它是 `on_group_select` 的下一跳，
+        #    每一拍重画都会走一遍并在开头早返回。真正切了组的那一次自己记一条 `note`。
+        # ⚠️ `on_group_select` **故意不在名单里**：`refresh_groups()` 每次都
+        #    `selection_set(active)`，而 Tk 的 `<<TreeviewSelect>>` 是排队送达的 ⇒
+        #    每一拍重画都会叫它一次。它自己那两条 `note`（被吞掉的点击 / 空选中）
+        #    才是有信息量的部分，click/ok 那两条只是噪声。
+        # design 表
+        "add_design", "del_design", "dup_design", "on_design_edit",
+        # 批次 / 运行
+        "do_submit", "do_dry_run", "do_cancel", "do_resume", "do_new_batch",
+        "do_rename_batch", "do_duplicate_batch", "do_open_spec", "do_save_spec",
+        "do_pick_batch_root", "do_pick_offdir", "do_open_batch_dir", "do_exit",
+        "on_row_action", "show_log", "show_trace", "show_defaults", "show_about",
+        "on_max_parallel",
+    )
+    """哪些方法进轨迹。**手写一张名单**而不是 `dir()` 扫 `do_*`：
+
+    扫出来的名单会随着新方法悄悄变大，某天有人加一个每秒跑一次的 `do_poll`，
+    轨迹就废了 —— 而废掉的那一刻没有任何信号。名单在这里，加方法的人自己决定要不要记。
+
+    `recompute` / `push` **故意不在名单里**：它们每敲一个键跑一次，包进 click/ok
+    会把真正的动作淹掉。它们出事时留下的痕迹是 `_guard` 那条 `ERR` 和快照那一行。
+    """
+
+    def _install_trace(self) -> None:
+        """把名单里的方法逐个换成"进去记一条、出来记一条"的包装。
+
+        `setattr(self, ...)` 写的是**实例**字典，盖住类上的同名方法 —— 于是三版
+        frame、子类覆写、`command=self.do_x` 三条路拿到的都是同一个包装。
+        """
+        global _DIALOG_TRACE
+        self.trace = ActionTrace()
+        _DIALOG_TRACE = self.trace
+        self.trace.note(
+            "session start",
+            "python %s on %s, layout=%s" % (sys.version.split()[0], sys.platform,
+                                            self.__class__.__name__),
+        )
+        for name in self.TRACED:
+            original = getattr(self, name, None)
+            if callable(original):
+                setattr(self, name, _trace_wrap(self.trace, name, original))
+        self._install_tk_excepthook()
+
+    def _install_tk_excepthook(self) -> None:
+        """Tk 回调里抛出来的异常 -> 轨迹。
+
+        🚨 这是本轮"太诡异了"的**主要来源**：Tk 的默认处理是把 traceback 打到
+        stderr 然后**若无其事地继续**。红区那边 GUI 是双击起来的，没有人在看 stderr ——
+        于是一个真异常在用户眼里就是"点了没反应"，而下一次点击又好了（状态已经被
+        改了一半）。接住它才有得查。接住之后**照旧弹默认框**，不改变行为。
+        """
+        top = self.top
+        previous = getattr(top, "report_callback_exception", None)
+
+        def hook(exc_type: object, exc: BaseException, tb: object) -> None:
+            self.trace.error("unhandled exception in a Tk callback", exc, tb=True)
+            if callable(previous):
+                previous(exc_type, exc, tb)
+
+        try:
+            top.report_callback_exception = hook  # type: ignore[attr-defined]
+        except (AttributeError, tk.TclError):  # pragma: no cover - 嵌进别人的窗口时
+            pass
+
+    def _trace_state(self) -> None:
+        """一行快照：**界面**和**模型**在这一拍是不是同一件事。
+
+        四样东西必须在同一行上，因为这一轮三个 bug 的判据全是"它们互相对不上"：
+
+        | 字段 | 对不上时是什么症状 |
+        |---|---|
+        | `active` vs `sel` | 点了 A 组、改的却是 B 组（组表选中被我们自己的重画抢回去了） |
+        | `groups` | 复制出来的组和源组的覆盖是不是真的两份 |
+        | `ovr` | 五个覆盖勾选框 —— 全 0 就是"整块灰"的直接原因 |
+        | `rows` | 五行控件的真实 `state`，**从控件上读**而不是从我们的意图上读 |
+
+        读控件用 `cget("state")`：意图和事实分家的时候，只有事实有用。
+        """
+        trace = getattr(self, "trace", None)
+        if trace is None:
+            return
+        try:
+            groups = []
+            for group in self._groups():
+                overrides = getattr(group, "axis_overrides", {}) or {}
+                groups.append(
+                    "%s{%s}" % (group.name, ",".join(sorted(overrides)) if overrides else "-")
+                )
+            selection = self.gtree.selection() if self.gtree is not None else ()
+            axes = []
+            for key in sorted(self.ovr_vars):
+                box = self.srow_boxes.get(key)
+                kids = box.winfo_children() if box is not None else []
+                live = str(kids[0].cget("state")) if kids else "?"
+                axes.append(
+                    "%s=%s%s"
+                    % (
+                        key,
+                        "1" if self.ovr_vars[key].get() else "0",
+                        "N" if live in ("normal", "readonly") else "D",
+                    )
+                )
+            snapshot = "active=%s sel=%s groups=[%s] axes[%s]%s" % (
+                self._active_group(),
+                ",".join(selection) or "-",
+                " ".join(groups),
+                # `1N` = 勾着且能编辑（正常）；`0D` = 没勾且置灰（正常，"继承 base"）；
+                # `1D` / `0N` = **界面和模型分家**，这一行就是 bug 的现场。
+                " ".join(axes),
+                (" err=%s" % _trace_clip(self._error, 200)) if self._error else "",
+            )
+        except Exception as exc:  # noqa: BLE001 - 快照失败绝不许影响界面
+            trace.record("state", "(snapshot failed: %s)" % exc.__class__.__name__)
+            return
+        trace.state(snapshot)
 
     # ------------------------------------------------------------ variables
     def _init_vars(self) -> None:
@@ -1013,9 +1389,12 @@ class BaseApp:
         self.ovr_vars: dict[str, tk.BooleanVar] = {}
         self.ovr_boxes: dict[str, ttk.Checkbutton] = {}
         self.srow_boxes: dict[str, ttk.Frame] = {}
+        self.maxpar = tk.StringVar(value=str(self.bridge.options().max_parallel))
+        """同时在飞的 job 数上限。**跑起来之后照样能改**（见 `on_max_parallel`）。"""
         self.dsub = tk.StringVar(value=self.bridge.submit_command)
         self.extra = tk.StringVar(value=self.bridge.extra_flags_text())
         self.batch = tk.StringVar(value=self.bridge.batch_name)
+        self.broot = tk.StringVar(value=getattr(self.bridge, "batch_root", ""))
         self.offdir = tk.StringVar(value=self.bridge.official_run_dir)
 
     def _init_style(self) -> None:
@@ -1083,13 +1462,22 @@ class BaseApp:
             "Re-run failed only": self.do_resume,
             "Extraction defaults...": self.show_defaults,
             "Show log...": self.show_log,
+            "Developer log...": self.show_trace,
             "About": self.show_about,
         }
         for name, items in (
             ("File", ("New batch", "Open spec...", "Save spec as...", "-", "Exit")),
             ("Batch", ("Duplicate batch...", "Rename...", "-", "Open batch dir")),
             ("Runs", ("Dry-run", "Submit", "Cancel", "Resume", "-", "Re-run failed only")),
-            ("Tools", ("Show log...", "Extraction defaults...", "Check environment (doctor)")),
+            (
+                "Tools",
+                (
+                    "Show log...",
+                    "Developer log...",
+                    "Extraction defaults...",
+                    "Check environment (doctor)",
+                ),
+            ),
             ("Help", ("About",)),
         ):
             menu = tk.Menu(bar, tearoff=0)
@@ -1106,7 +1494,17 @@ class BaseApp:
 
     # ------------------------------------------------------------ batch bar
     def build_batchbar(self, parent: object, show_dir: bool = False) -> ttk.Frame:
-        f = ttk.Frame(parent, padding=(8, 6))  # type: ignore[arg-type]
+        """顶上那条。**两行**：第一行批次名 + 官方 run 目录，第二行落点。
+
+        第二行是 2026-08-20 那次数据丢失之后加的。在那之前"我的结果落在哪"这个问题
+        在界面上**无解**：`batch_root` 是 `./ewave_batches`（相对启动 GUI 时的 cwd），
+        既不显示也不能改，唯一的线索是动作栏里那行拼好的 Batch dir。于是从安装目录
+        起界面 = 结果落在安装目录里 = 下一次部署把它搬进 `.deploy/backups/` 再轮转删掉，
+        而用户全程看不到任何提示。落点必须是**看得见、改得动、指错了会红**的东西。
+        """
+        outer = ttk.Frame(parent)  # type: ignore[arg-type]
+        f = ttk.Frame(outer, padding=(8, 6, 8, 2))
+        f.pack(fill=tk.X)
         ttk.Label(f, text="Batch name:").pack(side=tk.LEFT)
         entry = ttk.Entry(f, textvariable=self.batch, width=26, font=self.f_mono)
         entry.pack(side=tk.LEFT, padx=(6, 4))
@@ -1135,7 +1533,27 @@ class BaseApp:
             self.dir_lbl = _ElideLabel(f, font=self.f_mono, chars=12, style="Mono.TLabel")
             self.dir_lbl.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(8, 0))
             _Tooltip(self.dir_lbl, self.dir_lbl.full_text)
-        return f
+
+        second = ttk.Frame(outer, padding=(8, 0, 8, 4))
+        second.pack(fill=tk.X)
+        ttk.Label(second, text="Batch root:").pack(side=tk.LEFT)
+        root_entry = ttk.Entry(second, textvariable=self.broot, width=26, font=self.f_mono)
+        root_entry.pack(side=tk.LEFT, padx=(6, 4))
+        root_entry.bind("<KeyRelease>", lambda _e: self.recompute())
+        ttk.Button(second, text="Browse...", width=9, command=self.do_pick_batch_root).pack(
+            side=tk.LEFT
+        )
+        # 落点算出来的绝对路径就摆在旁边：批次名 + root 拼出来的东西不该要人心算。
+        self.broot_lbl = _ElideLabel(second, font=self.f_mono, chars=12, style="Mono.TLabel")
+        self.broot_lbl.pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
+        _Tooltip(self.broot_lbl, self.broot_lbl.full_text)
+
+        # 指进程序目录时的红字（`GuiState.batch_root_warning`）。用 tk.Label 不用 ttk：
+        # 前景色走 style 会污染别的标签（同 `extra_warn` / `groups_warn`）。
+        self.broot_warn = tk.Label(
+            outer, font=self.f_ui, fg=RED, anchor=tk.W, justify=tk.LEFT, wraplength=900
+        )
+        return outer
 
     # -------------------------------------------------------------- designs
     def build_designs(
@@ -1438,6 +1856,8 @@ class BaseApp:
             countable = True
         except EwaveBatchError:
             counts, merged, countable = {}, 0, False
+            self.trace.note("refresh_groups: run counts unavailable", "showing -> ?")
+        before = self.gtree.selection()
         self.gtree.delete(*self.gtree.get_children())
         for group in self._groups():
             name = group.name
@@ -1451,6 +1871,11 @@ class BaseApp:
                     ("-> %d" % counts.get(name, 0)) if countable else "-> ?",
                 ),
             )
+        if self.gtree.exists(active) and before and before[0] != active:
+            # 选中被搬到 active 那一行。**加组 / 复制 / 删除之后这是正常的**，
+            # 但它同时也是"我点了 A，它自己跳回 B"的唯一现场 —— 判据是上一条
+            # `on_group_select swallowed`：那两条挨在一起时，就是一次点击被吃了。
+            self.trace.note("selection moved to the active group", "%s -> %s" % (before[0], active))
         if self.gtree.exists(active):
             # ⚠️ 这一行会触发 `<<TreeviewSelect>>`，而**挡住它的不是 `_syncing`**。
             #    2026-08-20 实测（`tests/test_gui_invariants.py::
@@ -1482,9 +1907,23 @@ class BaseApp:
     def on_group_select(self) -> None:
         """用户点了组表的一行。`_syncing` 时是我们自己在重画，不当成用户操作。"""
         if self._syncing or self.gtree is None:
+            # 🚨 这条早返回**吃掉一次真实点击**：`_syncing` 期间用户点的那一行，
+            #    选中已经变了、active 却没跟着变，下一次 `refresh_groups()` 又把
+            #    选中拽回 active —— 在用户眼里就是"点了别的组，它自己跳回来了"。
+            #    记一条才看得见它到底发不发生（本轮"删不掉原来那个组"的头号嫌疑）。
+            self.trace.note(
+                "on_group_select swallowed",
+                "syncing=%s sel=%s active=%s"
+                % (
+                    self._syncing,
+                    ",".join(self.gtree.selection()) if self.gtree is not None else "-",
+                    self._active_group(),
+                ),
+            )
             return
         selection = self.gtree.selection()
         if not selection:
+            self.trace.note("on_group_select: empty selection")
             return
         self.switch_group(selection[0])
 
@@ -1497,12 +1936,18 @@ class BaseApp:
         直到跑出一批莫名其妙的 run 才会发现。
         """
         if not self.groups_ok or name == self._active_group():
+            if name != self._active_group():
+                # 只有"组面板整个没接上"才值得记。`name == active` 是我们自己
+                # 重画选中之后 Tk 回送的那一下，每一拍都有，记了等于没记。
+                self.trace.note("switch_group blocked", "groups_ok=False, want=%s" % name)
             return
+        self.trace.note("switch_group", "%s -> %s" % (self._active_group(), name))
         if name not in {group.name for group in self._groups()}:
             # 表上这一行是**旧的**（那个组已经不在了，只是上一次重画被别的错误挡住了）。
             # 这不是"用户点错了"，弹框只会让人一点一个框；重画一次让那一行消失就行。
             # `set_active_group` 那边照旧对不认识的名字抛错 —— 它面向的是写代码的人，
             # 「静默退回 base」在那一层仍然是禁止的。
+            self.trace.note("switch_group: stale row", "%s is not in the model" % name)
             self.refresh_groups()
             return
         if not self.bridge.is_running() and not self.bridge.has_submitted():
@@ -1556,6 +2001,7 @@ class BaseApp:
         except EwaveBatchError as exc:
             _error("Cannot add run group", str(exc))
             return
+        self.trace.note("added", "%s (a new group overrides nothing => every row is grey)" % actual)
         self._warn_if_renamed(name, actual)
         self._reload_group_vars()
         self.recompute()
@@ -1563,12 +2009,19 @@ class BaseApp:
     def do_duplicate_group(self) -> None:
         """复制选中的组（base 也能复制 —— 那会把当前勾选写成一份显式覆盖），**先问名字**。"""
         if not self.groups_ok:
+            self.trace.note("duplicate: groups_ok=False")
             return
         source = self._selected_group()
+        self.trace.note(
+            "duplicate source", "selected=%s active=%s treesel=%s"
+            % (source, self._active_group(),
+               ",".join(self.gtree.selection()) if self.gtree is not None else "-")
+        )
         name = self._ask_group_name(
             "Duplicate run group", self._suggest_group_name("%s-copy" % source), source=source
         )
         if name is None:  # 取消
+            self.trace.note("duplicate cancelled")
             return
         if not self.bridge.is_running() and not self.bridge.has_submitted():
             self._guard(self.push)
@@ -1577,6 +2030,11 @@ class BaseApp:
         except EwaveBatchError as exc:
             _error("Cannot duplicate run group", str(exc))
             return
+        self.trace.note(
+            "duplicated", "%s -> %s  copy overrides=%s  source overrides=%s"
+            % (source, actual, sorted(self._overrides_of(actual)),
+               sorted(self._overrides_of(source)))
+        )
         self._warn_if_renamed(name, actual)
         self._reload_group_vars()
         self.recompute()
@@ -1598,9 +2056,13 @@ class BaseApp:
         hint = GROUP_NAME_HINT
         if source:
             hint = "Copy of %r. " % source + hint
-        return self._ask_text(
+        answer = self._ask_text(
             title, "Group name", initial, hint=hint, on_empty=initial, on_smoke=initial
         )
+        self.trace.note(
+            "%s dialog" % title, "suggested=%r answered=%r" % (initial, answer)
+        )
+        return answer
 
     def _warn_if_renamed(self, wanted: str, actual: str) -> None:
         """要的名字被占了、自动加了后缀 —— **说一声**。
@@ -1625,6 +2087,11 @@ class BaseApp:
         if not self.bridge.is_running() and not self.bridge.has_submitted():
             self._guard(self.push)
         name = self._selected_group()
+        self.trace.note(
+            "remove target", "selected=%s active=%s treesel=%s"
+            % (name, self._active_group(),
+               ",".join(self.gtree.selection()) if self.gtree is not None else "-")
+        )
         if name == BASE_GROUP:
             _info(
                 "Cannot remove the base group",
@@ -1637,6 +2104,11 @@ class BaseApp:
         except EwaveBatchError as exc:
             _error("Cannot remove run group", str(exc))
             return
+        still = [group.name for group in self._groups()]
+        self.trace.note(
+            "removed" if name not in still else "REMOVE DID NOTHING",
+            "%s; groups now %s" % (name, still),
+        )
         self._reload_group_vars()
         self.recompute()
 
@@ -1698,6 +2170,17 @@ class BaseApp:
             return self.bridge.group_summary(name)
         except (AttributeError, EwaveBatchError):
             return ""
+
+    def _overrides_of(self, name: str) -> tuple[str, ...]:
+        """某个组覆盖了哪几根轴（**只给轨迹用**）。问不出来 -> 空。
+
+        复制出来的组和源组是不是"两份"，看的就是这个：两边各自的键集合互不影响
+        才算独立（值本身相同是正常的 —— 复制嘛）。
+        """
+        for group in self._groups():
+            if group.name == name:
+                return tuple(sorted(getattr(group, "axis_overrides", {}) or {}))
+        return ()
 
     def _selected_group(self) -> str:
         """组表里选中的那一行；没选中就用 active group（表可能没焦点）。"""
@@ -1972,6 +2455,23 @@ class BaseApp:
         bottom.pack(fill=tk.X, pady=(4, 0))
         self.par_lbl = ttk.Label(bottom, text="", style="Green.TLabel")
         self.par_lbl.pack(side=tk.LEFT)
+        # ★ 「同时在飞几个」必须在界面上（用户 2026-08-20：提交 5 个、4 个 running、
+        #   第 5 个停在 ready，「很奇怪」）。那个 4 是 `BatchOptions.max_parallel` 的
+        #   默认值，在这之前既不显示也改不了 —— 一个看不见的上限，等于一个没有理由
+        #   的行为。摆在 dsub 命令旁边：它和"提交"是同一件事的两半。
+        ttk.Label(bottom, text="Max in flight", anchor=tk.E).pack(side=tk.RIGHT, padx=(0, 4))
+        spin = tk.Spinbox(
+            bottom,
+            from_=1,
+            to=gui_state.MAX_PARALLEL_CAP,
+            width=4,
+            textvariable=self.maxpar,
+            font=self.f_mono,
+            command=self.on_max_parallel,
+        )
+        spin.pack(side=tk.RIGHT)
+        spin.bind("<KeyRelease>", lambda _e: self.on_max_parallel())
+        _Tooltip(spin, MAX_PARALLEL_TIP)
         self.dsub_warn = ttk.Label(box, text="", style="Warn.TLabel", wraplength=520, justify=tk.LEFT)
         return box
 
@@ -2160,6 +2660,9 @@ class BaseApp:
         """
         b = self.bridge
         b.set_batch_name(self.batch.get())
+        setter = getattr(b, "set_batch_root", None)
+        if callable(setter) and self.broot.get().strip() != getattr(b, "batch_root", ""):
+            setter(self.broot.get())
         if self.offdir.get().strip() != b.official_run_dir:
             b.set_official_run_dir(self.offdir.get())
         self._push_axis(
@@ -2378,6 +2881,10 @@ class BaseApp:
             self.sync_buttons()
         finally:
             self._syncing = False
+        # 快照在 `_syncing` 放下**之后**：这一拍的界面到这里才算画完，
+        # 而快照要问的正是"画完之后界面和模型是不是同一件事"。
+        # 与上一拍完全相同的快照会被 `ActionTrace.state()` 折叠掉。
+        self._trace_state()
 
     def _guard(self, step: object) -> None:
         """跑一步刷新，把 `EwaveBatchError` 转成状态栏上的一行字。
@@ -2393,6 +2900,12 @@ class BaseApp:
             step()  # type: ignore[operator]
         except EwaveBatchError as exc:
             message = f"{exc.__class__.__name__}: {exc}"
+            # 🚨 进轨迹（`gui/trace.py`）：状态栏只留**最后一条**，而 `recompute()`
+            #    一拍里过 8 道闸 —— 第一条错常常是真正的原因，而它在屏幕上活不过
+            #    同一拍。用户报的"点了没反应"多半就是它。
+            trace = getattr(self, "trace", None)
+            if trace is not None:
+                trace.error("_guard(%s)" % getattr(step, "__name__", step), exc)
             self._error = message if not self._error else self._error
 
     def _runs_are_stale(self) -> bool:
@@ -2403,6 +2916,26 @@ class BaseApp:
         展开矩阵，但那条路上 `plan()` 根本没被调用 ⇒ `_error` 是空的 ⇒ 不会误报。
         """
         return bool(self._error) and bool(self.tree.get_children())
+
+    def _sync_batch_root(self) -> None:
+        """落点那一行：把 root 灌回输入框、显示算出来的绝对路径、指错了标红。"""
+        root = getattr(self.bridge, "batch_root", "")
+        if root and self.broot.get().strip() != root:
+            # 与批次名同一条规矩：bridge 会把空值补成默认值，不灌回去的话输入框
+            # 和真正用的落点会长期不一致，而"我的东西落在哪"正是这一行要回答的问题。
+            self.broot.set(root)
+        if self.broot_lbl is not None:
+            self.broot_lbl.set_text("-> " + self.bridge.batch_dir())
+        if self.broot_warn is None:
+            return
+        warn = getattr(self.bridge, "batch_root_warning", None)
+        message = warn() if callable(warn) else ""
+        if message:
+            self.broot_warn.config(text="!  " + message)
+            if not self.broot_warn.winfo_manager():
+                self.broot_warn.pack(fill=tk.X, padx=8, pady=(0, 4))
+        elif self.broot_warn.winfo_manager():
+            self.broot_warn.pack_forget()
 
     def _sync_runs_stale(self) -> None:
         """Runs 表现在是不是旧的 —— 是就在表上面写明白（`RUNS_STALE_WARNING`）。
@@ -2474,6 +3007,7 @@ class BaseApp:
         #   而界面上那行 Batch dir 就跟着跳，谁也不知道产物到底会落在哪。
         if self.bridge.batch_name and self.batch.get() != self.bridge.batch_name:
             self.batch.set(self.bridge.batch_name)
+        self._sync_batch_root()
         counts = self.bridge.axis_counts()
         self.design_count.config(text="-> %d" % counts.get("design", 0))
         for label, key in (
@@ -2518,12 +3052,38 @@ class BaseApp:
             if label is not None:
                 label.set_text(batch_dir)
 
+    def on_max_parallel(self) -> None:
+        """「同时在飞」改了。**不走 `push()`** —— 那条路在批次跑起来之后是关着的。
+
+        而这一格恰恰在跑起来之后最有用：4 个在跑、第 5 个在等名额，用户想让它也走。
+        它不属于矩阵（run 的集合没变），所以不作废 plan、不动 driver、下一拍就生效。
+        """
+        raw = self.maxpar.get().strip()
+        if not raw:
+            return  # 正在删着打，别在半截上判他错
+        try:
+            actual = self.bridge.set_max_parallel(raw)
+        except EwaveBatchError as exc:
+            self.trace.error("set_max_parallel(%r)" % raw, exc)
+            self._error = "%s: %s" % (exc.__class__.__name__, exc)
+            self.update_status()
+            return
+        self.trace.note("max in flight", "%s -> %d" % (raw, actual))
+        if str(actual) != raw:
+            self.maxpar.set(str(actual))
+        self.update_status()
+
     def _sync_resources(self) -> None:
         # ★ 第一次 plan 时 bridge 会从 `SiteFacts` 里学出整条 dsub 提交前缀 ——
         #   把它灌回输入框，用户才看得见"我们打算怎么提交"，也才改得动它
         #   （用户 2026-08-18 要求：整条命令原样暴露，不是只让改 `-R`）。
         if self.bridge.submit_command and self.dsub.get() != self.bridge.submit_command:
             self.dsub.set(self.bridge.submit_command)
+        # 从 spec 里读进来的批次会带自己的 max_parallel —— 灌回输入框，
+        # 否则界面显示 4 而真正放行的是别的数（同 `batch_root` 那条规矩）。
+        current = str(self.bridge.options().max_parallel)
+        if self.maxpar.get().strip() != current:
+            self.maxpar.set(current)
         parallel = self.bridge.parallel()
         if parallel is None:
             self.par_lbl.config(
@@ -2853,6 +3413,14 @@ class BaseApp:
         if self._log is not None and self._log.alive():
             self._log.refresh()
 
+    def show_trace(self) -> object:
+        """打开（或前置）Developer log 窗口。同 `show_log`：**最多一扇**。"""
+        if self._trace_win is None or not self._trace_win.alive():
+            self._trace_win = _TraceWindow(self)
+        self._trace_win.refresh(force=True)
+        self._trace_win.present()
+        return self._trace_win
+
     def _stop_timer(self) -> None:
         if self._timer is not None:
             try:
@@ -3138,6 +3706,13 @@ class BaseApp:
         # 否则用户会拿着一个自己打不开的文件（load_spec 按扩展名选解析器）。
         self.status_lbl.config(text="Saved spec: %s" % written)
 
+    def do_pick_batch_root(self) -> None:
+        """选落点。**不建目录** —— 真正建它的是第一次 plan/提交。"""
+        path = filedialog.askdirectory(title="Pick where batches should be written")
+        if path:
+            self.broot.set(path)
+            self.recompute()
+
     def do_pick_offdir(self) -> None:
         path = filedialog.askdirectory(title="Pick an official run dir (contains gdsout_setup)")
         if path:
@@ -3383,13 +3958,30 @@ def _wall_text(run: Run) -> str:
     return "%d:%02d" % (seconds // 60, seconds % 60)
 
 
+_DIALOG_TRACE: ActionTrace | None = None
+"""当前那扇窗的轨迹（`_error` / `_info` 是模块级函数，拿不到 `self`）。
+
+为什么弹框必须进轨迹：用户报 bug 时说的就是弹框上那句话，而弹框是**模态**的 ——
+它一关就什么都不剩。`EWB_SMOKE=1` 下弹框根本不建，那时轨迹是**唯一**的痕迹，
+`tests/test_gui_trace.py` 靠它验"这一步确实拦下来了"。
+"""
+
+
+def _dialog(kind: str, title: str, message: str) -> None:
+    """记一条弹框。窗口还没建 / 已经拆了 -> 什么都不做。"""
+    if _DIALOG_TRACE is not None:
+        _DIALOG_TRACE.note("dialog[%s] %s" % (kind, title), message)
+
+
 def _info(title: str, message: str) -> None:
+    _dialog("info", title, message)
     if smoke_enabled():
         return
     messagebox.showinfo(title, message)
 
 
 def _error(title: str, message: str) -> None:
+    _dialog("error", title, message)
     if smoke_enabled():
         return
     messagebox.showerror(title, message)

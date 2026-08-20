@@ -141,7 +141,15 @@ mkdir -p "$INCOMING" "$STAGING" "$BACKUPS"
 # hard constraint 1b). Losing it on an upgrade means the operator has to dig
 # the values out again, and the symptom is silent -- the GUI just opens with
 # ACCOUNT / QUEUE placeholders as if the box had never been configured.
-PRESERVE=(".deploy" "site.local.sh")
+#
+# `ewave_batches` 是 2026-08-20 用户真丢过一次数据之后加进来的。当时的链条：
+# `gui.state.DEFAULT_BATCH_ROOT` 是 `./ewave_batches`（相对**启动 GUI 时的 cwd**），
+# 而人自然会 `cd <install>` 再起界面 => 跑出来的批次落在安装目录里面 => 下一次
+# 部署把它 `mv` 进 `.deploy/backups/<TS>/`，再 3 次部署之后轮转把它删掉。
+# 症状是"我的批次目录还在，但里面只剩新跑的那一批"。
+# 默认 batch_root 已经挪出安装目录（改成 `~/ewave_batches`），但**这一条不能撤**：
+# 老的安装里那个目录还在原地，而且谁都可以把 batch_root 指回来。
+PRESERVE=(".deploy" "site.local.sh" "ewave_batches")
 if [[ -f "$DEPLOY/preserve.list" ]]; then
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     _line="${_line%%#*}"
@@ -170,10 +178,32 @@ is_payload() {
   esac
 }
 
+# A directory that holds batch results, whatever it is called. The name list
+# above only catches the default (`ewave_batches`); this catches the operator
+# who pointed batch_root somewhere else -- and it is exactly that person whose
+# data the swap would otherwise move into a backup that rotation deletes.
+#
+# The probe is `batch.json`, which is the tool's own state file: it sits at
+# `<batch_root>/<batch name>/batch.json`, so look one level down as well as at
+# the top. Deliberately NOT a deep `find`: an install has a few dozen top-level
+# entries and this runs for each of them, and anything deeper than
+# `<root>/<batch>/batch.json` is not a batch root we created.
+looks_like_batch_data() {
+  local _p="$TARGET/$1"
+  [[ -d "$_p" ]] || return 1
+  [[ -f "$_p/batch.json" ]] && return 0
+  local _c
+  for _c in "$_p"/*/batch.json; do
+    [[ -f "$_c" ]] && return 0
+  done
+  return 1
+}
+
 # Anything the swap must leave exactly where it is.
 is_untouchable() {
   if is_preserved "$1"; then return 0; fi
   if is_payload   "$1"; then return 0; fi
+  if looks_like_batch_data "$1"; then return 0; fi
   return 1
 }
 
@@ -247,6 +277,10 @@ for _it in "$NEW"/*; do
   if is_preserved "$_n"; then
     shopt -u dotglob nullglob
     die "'$_n' is in .deploy/preserve.list but the package also ships it. Remove it from preserve.list, or rename your local copy."
+  fi
+  if looks_like_batch_data "$_n"; then
+    shopt -u dotglob nullglob
+    die "'$_n' holds batch results (found batch.json) but the package also ships that name -- refusing to nest the new copy inside your data. Rename or move '$_n' first."
   fi
 done
 shopt -u dotglob nullglob
@@ -388,13 +422,12 @@ if (( ${#PRESERVE[@]} > 1 )); then
   echo "    preserved across swap: ${PRESERVE[*]}"
 fi
 if (( ${#_orphans[@]} > 0 )); then
-  echo
-  echo "    NOTE: these were NOT part of the new package, so they now live only"
-  echo "          in the backup above: ${_orphans[*]}"
-  echo "          If that is your own data (batch results, notes), move it back"
-  echo "          and add the name to .deploy/preserve.list so future deploys"
-  echo "          leave it alone -- otherwise backup rotation deletes it after"
-  echo "          $KEEP_BACKUPS more deploys."
+  # This block used to sit in the middle of the success report and scrolled past.
+  # 2026-08-20: an operator lost a day of batch results exactly that way, so it
+  # is now the LAST thing printed (see the tail of this script) -- here we only
+  # remember it. Anything that looks like batch data is untouchable now, so
+  # reaching this list at all means "something we could not classify".
+  ORPHAN_NOTE=1
 fi
 if (( KEEP_PACKAGES > 0 )); then
   echo "    $(basename "$TARBALL_SRC") left in place; the newest $KEEP_PACKAGES deliveries are"
@@ -407,3 +440,21 @@ fi
 echo
 echo "    NEXT -- check this box can actually run it (no network / no venv needed):"
 echo "       cd $TARGET && bash deploy/doctor.sh --test"
+
+# --- the one warning that must never scroll past ----------------------------
+# Printed last, on its own, with a blank line around it. Everything above is
+# routine; this is the only line that can mean "your data moved".
+if (( ${ORPHAN_NOTE:-0} )); then
+  echo
+  echo "  ==================================================================="
+  echo "  !! YOUR OWN FILES WERE MOVED OUT OF THE INSTALL DIRECTORY"
+  echo "     These were not part of the new package:"
+  echo "       ${_orphans[*]}"
+  echo "     They now live ONLY here:"
+  echo "       $BK"
+  echo "     Backup rotation deletes that after $KEEP_BACKUPS more deploys."
+  echo "     To keep them, move them back and add each name to:"
+  echo "       $DEPLOY/preserve.list"
+  echo "  ==================================================================="
+  echo
+fi

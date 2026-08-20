@@ -337,13 +337,48 @@ def _tk_or_skip(test: unittest.TestCase) -> object:
         import tkinter as tk
     except ImportError as exc:  # pragma: no cover - 本机装了 tkinter
         test.skipTest(f"平台跳过：这台机器没装 tkinter（{exc}）—— CLI 不受影响")
-    try:
-        root = tk.Tk()
-    except tk.TclError as exc:  # pragma: no cover - 本机有显示
-        test.skipTest(f"平台跳过：这台机器开不了显示（{exc}）—— CLI 不受影响")
-    root.withdraw()
-    test.addCleanup(root.destroy)
+    global _SHARED_ROOT
+    if _SHARED_ROOT is None:
+        try:
+            _SHARED_ROOT = tk.Tk()
+        except tk.TclError as exc:  # pragma: no cover - 本机有显示
+            test.skipTest(f"平台跳过：这台机器开不了显示（{exc}）—— CLI 不受影响")
+        _SHARED_ROOT.withdraw()
+    root = _SHARED_ROOT
+    test.addCleanup(_destroy_children, root)
     return root
+
+
+_SHARED_ROOT = None
+"""整个进程**共用一个** Tk 根窗口。
+
+原来是每条测试 `tk.Tk()` + `addCleanup(destroy)`。Windows 上开到几十个之后
+`Tk()` 会开始抛 `Can't find a usable tk.tcl` —— 而 `_tk_or_skip` 把任何 `TclError`
+都当成"这台机器没有显示"，于是**那条测试静默地跳过了**。2026-08-20 实测：同一条
+命令跑两遍，skip 数在 4/5/6 之间跳，跳掉的每次都不是同一条。
+
+一条 skip 掉的测试和一条不存在的测试，在闸门眼里长得一模一样 —— 这正是本项目
+已经吃过一次亏的那种假绿。共用一个根就没有"开太多"这回事；每条测试结束时
+销毁自己建的子控件，状态不带过去。
+"""
+
+
+def _destroy_children(root: object) -> None:
+    """把这条测试往共用根里建的东西全清掉（含 Toplevel）。
+
+    不销毁根本身 —— 它要给下一条测试用。顺手 `update()` 一次把队列里剩下的
+    虚拟事件（`<<TreeviewSelect>>` 是排进队列的）跑完，免得它们打到下一条测试的
+    控件上。
+    """
+    for child in list(root.winfo_children()):  # type: ignore[attr-defined]
+        try:
+            child.destroy()
+        except Exception:  # noqa: BLE001 - 已经销毁过的子件，收尾而已
+            pass
+    try:
+        root.update()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class _TempRootTest(unittest.TestCase):
@@ -2344,6 +2379,95 @@ class UserNamesTheRunGroup(_SmokeTest):
         app.gtree.selection_set(gui_state.BASE_GROUP)
         app.do_duplicate_group()
         self.assertEqual([g.name for g in bridge.groups()], [gui_state.BASE_GROUP])
+
+
+class WhereBatchesLandIsVisibleAndSafe(_SmokeTest):
+    """★ 2026-08-20 用户真丢了一批结果之后加的一组。
+
+    完整链条见 `tests/test_deploy.py::DeployMustNotEatBatchResults`。这一组只管
+    界面这一端的两半：**落点要看得见、指错了要红**。
+
+    在这之前"我的结果落在哪"在界面上无解：`batch_root` 既不显示也不能改，
+    默认值 `./ewave_batches` 还是相对**启动 GUI 时的 cwd** 的 —— 也就是说
+    答案取决于你从哪个目录敲的命令，而界面上唯一的线索是动作栏里那行拼好的
+    Batch dir（还是省略过的）。
+    """
+
+    def _app(self):
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        bridge, _runner, _sched = _gui(self.root)
+        return bridge, split.build_frame(root, bridge)._ewb_app
+
+    def test_the_default_root_does_not_depend_on_the_current_directory(self) -> None:
+        """★ 承重的一条：默认落点必须是**与 cwd 无关**的。
+
+        判据：把进程的当前目录换掉，算出来的 batch dir 一个字节都不许变。
+        （原来的 `./ewave_batches` 在这条下面必红。）
+        """
+        original = os.getcwd()
+        here = GuiState(batch_name="b").batch_dir()
+        # `self.root` 是本用例自己的临时目录（`_TempRootTest`），拿它当"另一个 cwd"，
+        # 免得在 with 块里 chdir 进一个马上要被删掉的目录（Windows 上删不掉）。
+        try:
+            os.chdir(self.root)
+            elsewhere = GuiState(batch_name="b").batch_dir()
+        finally:
+            os.chdir(original)
+        self.assertEqual(
+            elsewhere, here, "换个目录启动，批次就落到别处去了 —— 那正是 08-20 丢数据的第一环"
+        )
+
+    def test_a_root_inside_the_tool_directory_is_flagged(self) -> None:
+        """落点指进程序自己的目录 -> 红字。部署会把那里的东西搬走并在几次之后删掉。"""
+        bridge, _runner, _sched = _gui(self.root)
+        tool = os.path.dirname(os.path.dirname(os.path.abspath(gui_state.__file__)))
+        bridge.set_batch_root(os.path.join(tool, "ewave_batches"))
+        warning = bridge.batch_root_warning()
+        self.assertIn("inside the tool", warning)
+        self.assertIn("Next:", warning)
+        self.assertTrue(all(ord(ch) < 128 for ch in warning), "红区 LANG 常是 C => 纯 ASCII")
+
+    def test_a_root_outside_is_not_flagged_negative(self) -> None:
+        """反向：正常落点不许报红 —— 逢开必红等于没报。"""
+        bridge, _runner, _sched = _gui(self.root)
+        self.assertEqual(bridge.batch_root_warning(), "", "临时目录也被判成程序目录了")
+        bridge.set_batch_root("~/ewave_batches")
+        self.assertEqual(bridge.batch_root_warning(), "")
+
+    def test_the_gui_shows_the_root_and_the_resolved_dir(self) -> None:
+        """界面上既看得见 root（可改），也看得见拼出来的那个绝对路径。"""
+        bridge, app = self._app()
+        self.assertEqual(app.broot.get(), bridge.batch_root)
+        self.assertIn(bridge.batch_dir(), app.broot_lbl.full_text())
+
+    def test_editing_the_root_in_the_gui_moves_the_batch_dir(self) -> None:
+        """改那一格是真的改落点，不是个装饰。"""
+        bridge, app = self._app()
+        other = os.path.join(self.root, "elsewhere")
+        app.broot.set(other)
+        app.recompute()
+        # 两边都过一次 normcase+abspath 再比：`batch_dir()` 在已经 plan 过之后返回的是
+        # `BatchState.batch_dir`（`os.path.abspath` 的产物，Windows 上是反斜杠），
+        # 而没 plan 过时返回的是自己拼的正斜杠版本。比字符串前缀会被这个差别咬到。
+        def _norm(path: str) -> str:
+            return os.path.normcase(os.path.abspath(path))
+
+        self.assertTrue(
+            _norm(bridge.batch_dir()).startswith(_norm(other)),
+            "改了 Batch root，落点没跟着走：%s" % bridge.batch_dir(),
+        )
+
+    def test_the_warning_shows_up_in_the_gui(self) -> None:
+        """红字要真摆出来，不是只在 bridge 里返回一个字符串。"""
+        bridge, app = self._app()
+        self.assertFalse(app.broot_warn.winfo_manager(), "正常落点不该有红字")
+        tool = os.path.dirname(os.path.dirname(os.path.abspath(gui_state.__file__)))
+        app.broot.set(os.path.join(tool, "ewave_batches"))
+        app.recompute()
+        self.assertTrue(app.broot_warn.winfo_manager(), "指进程序目录了却没红")
+        self.assertIn("inside the tool", app.broot_warn.cget("text"))
 
 
 if __name__ == "__main__":

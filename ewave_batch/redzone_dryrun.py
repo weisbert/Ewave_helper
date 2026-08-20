@@ -111,7 +111,10 @@ EXIT_DIFF = 2
 EXIT_NO_BASELINE = 3
 """没能比对：OFFDIR 里没有 `run_ewave_*.sh`（或里面没有 ewave 那一行）。"""
 
-DEFAULT_BATCH_ROOT = "./ewave_batches"
+DEFAULT_BATCH_ROOT = "~/ewave_batches"
+"""与 `gui.state.DEFAULT_BATCH_ROOT` 同一个值 —— "我的批次落在哪"只许有一个答案。
+本模块只**算**路径、一个目录都不建（见 `--batch-root` 的帮助），
+但两处不一致的话，dry-run 预览出来的路径和真跑出来的就对不上。"""
 """落点的默认根。**只用来算路径，一个目录都不会建。**
 
 刻意是相对路径：红区的绝对路径全是站点坐标，源码里不许有（硬约束 1b）。
