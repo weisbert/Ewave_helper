@@ -476,7 +476,7 @@ echo $status
 步骤 8 退 0 之后：
 
 ```tcsh
-python -c "from ewave_batch.core.spec import EXAMPLE_SPEC; print(EXAMPLE_SPEC)" > my_spec.yaml
+python -c "import sys; from ewave_batch.core.spec import EXAMPLE_SPEC; sys.stdout.buffer.write(EXAMPLE_SPEC.encode('utf-8'))" > my_spec.yaml
 vi my_spec.yaml                                        # 按你要扫的设定改
 bash scripts/redzone_bundle.sh <OFFDIR> --spec my_spec.yaml
 ```

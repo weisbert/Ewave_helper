@@ -185,7 +185,7 @@ csh/tcsh 里看退出码：`echo $status`（不是 `$?`）。
 要一份 spec 样例：
 
 ```sh
-python -c "from ewave_batch.core.spec import EXAMPLE_SPEC; print(EXAMPLE_SPEC)" > my_spec.yaml
+python -c "import sys; from ewave_batch.core.spec import EXAMPLE_SPEC; sys.stdout.buffer.write(EXAMPLE_SPEC.encode('utf-8'))" > my_spec.yaml
 ```
 
 ---

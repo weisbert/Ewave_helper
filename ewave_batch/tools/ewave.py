@@ -65,9 +65,9 @@ def ewave_program(facts: SiteFacts) -> str:
     """
     if not facts.ewave_bin:
         raise ToolMissingError(
-            "SiteFacts.ewave_bin 是空的 —— 不知道该执行哪个 ewave。"
-            "先跑 core.discover.discover_site_facts(<官方 run 目录>)，"
-            "或确认 `ewave` 在 PATH 上（硬约束 1b：工具绝对路径不写进源码）"
+            "SiteFacts.ewave_bin is empty - no idea which ewave to execute.\n"
+            "  Next: run core.discover.discover_site_facts(<official run dir>), "
+            "or make sure `ewave` is on PATH (hard constraint 1b: absolute tool paths never go into the source)"
         )
     return facts.ewave_bin
 
@@ -92,7 +92,7 @@ def build_ewave_plan(run: Run, ctx: PlanContext) -> CommandPlan:
     plan = _cmd.build_command_plan(run, ctx)
     if plan.argv[:1] != (program,):  # pragma: no cover - 两边都读 facts.ewave_bin，对不上说明有人改了其中一边
         raise ToolMissingError(
-            f"程序名对不上：ewave_program 给的是 {program!r}，"
-            f"core.cmd 拼出来的是 {plan.argv[:1]!r} —— 两处必须同源（SiteFacts.ewave_bin）"
+            f"program name mismatch: ewave_program says {program!r}, "
+            f"core.cmd built {plan.argv[:1]!r} - both must come from the same place (SiteFacts.ewave_bin)"
         )
     return plan

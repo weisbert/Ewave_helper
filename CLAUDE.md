@@ -16,7 +16,7 @@ eWave 是公司的商用 3D EM 场求解器（抽电感/走线用）。官方 GU
 
 | 文件 | 内容 | 进 git？ |
 |---|---|---|
-| **`PROJECT_BRIEF.md`** | **唯一的设计权威。** 需求、已拍板的决定 D1–D11、架构、复用清单、未决项 P2–P9 | ✅ |
+| **`PROJECT_BRIEF.md`** | **唯一的设计权威。** 需求、已拍板的决定 D1–D14、架构、复用清单、未决项 P2–P9 | ❌ 里面有真实端口名 / ptxt PDK 串 / 红区实测值；`.gitignore` 第 4 行排除它，`redzone_crosscheck.sh` 拿它当证据源 |
 | `ENVIRONMENT.local.md` | 三套环境对照、红区坐标、Donau 硬规则、可用库清单 | ❌ 含工号/主机名/内网路径 |
 | `references/probes/` | **红区取回的原始证据**（help dump、gdsout_setup、workDir tree、真实运行脚本） | ❌ 红区 |
 | `references/checks/` | 支撑设计决定的可复现验证脚本（纯 stdlib，Windows 直接跑） | ✅ |
@@ -64,13 +64,22 @@ eWave 是公司的商用 3D EM 场求解器（抽电感/走线用）。官方 GU
 ## 三行心智模型
 
 ```
-用户输入：designs = [(Library, Cell, view), …]   +   设定轴 {corner, temperature, equalCurrent, fullWave, …}
+用户输入：designs = [(Library, Cell, view), …]
+          +  设定轴 {corner, temperature, equalCurrent, fullWave, …}
+          +  run groups = [base, 变体1, 变体2, …]      每组只写它覆盖的轴，其余继承 base
+
+组合 = 每个 group 各自取笛卡尔积，结果取并集（跨组重复按 run_id 静默去重）
 
 阶段 1（per-design）      strmout -templateFile <渲染出的 gdsout_setup>   →  <Cell>.gds
 阶段 2（per-design×组合） dsub … ewave --all … --corner=… --temperature=…  →  .sNp  →  归档
 ```
 
-两个最容易搞错的点：
+**「组合」不等于「全批次笛卡尔积」**（用户 2026-08-19 拍板，BRIEF D14）。
+用户真正要的是「一条基线 + 几个单点变体」：`typical @ {-40, 55, 125}` 再加两个只在 55 度上
+各改一根轴的变体 = **5 个 run**；纯笛卡尔积最接近的写法是 12 个，7 个是废的，
+而一个 run 的量级是 10 核 / 100 GB / 35 分钟。不写 `groups:` 时行为与从前逐字相同。
+
+三个最容易搞错的点：
 
 - **端口映射不在 `.sNp` 里，在命令行里**（靠 `-p` 的顺序）。而官方那个顺序就是
   pin 名的 case-sensitive ASCII 排序 —— 所以 `--all` 能逐位复现它。这是"不依赖 GUI"
@@ -78,6 +87,12 @@ eWave 是公司的商用 3D EM 场求解器（抽电感/走线用）。官方 GU
 - **`<corner>_<temp>/` 那层子目录是 eWave 自己建的**，名字只由 corner+temp 决定 →
   同 corner/temp 下换别的 flag 会**静默覆盖**。这正是用户的核心痛点，解法是给每个组合
   独立的 `--workDir`。
+- **`<axes-slug>` 只编码「在变的轴」，而「在变」的口径是全批次的** ——
+  全局轴 ∪ per-design 覆盖 ∪ **run group 覆盖**，三个来源缺一不可。
+  推论很反直觉但必须接受：**加一个组会改掉基线的目录名**（某根轴从"不变"变成"在变"，
+  它就对所有 run 进 slug）。这是对的 —— 不改的话两个组的同一个温度会落进同一个
+  `--workDir`，就是把上一条那个静默覆盖原样重造一遍。
+  代价是给**已经跑过**的批次加组 = 换了一批 `run_id`，resume 认不出老的 `base/...` 目录。
 
 ---
 

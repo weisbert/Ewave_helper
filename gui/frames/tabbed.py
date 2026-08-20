@@ -1,11 +1,17 @@
 # -*- coding: utf-8 -*-
-"""布局 B —— Tabbed：四个 tab（Designs / Settings / Resources / Runs），草图 1b。
+"""布局 B —— Tabbed：三个 tab（Designs / Settings / Runs），草图 1b。
 
 批次栏和动作栏在 notebook **外面**常驻，所以乘法公式和 Submit 永远在屏幕上。
 Settings 页右边多一个 Run count 面板：逐轴 x N，底下 total。Runs 页独占整窗（~20 行）。
 代价：设定和它展开出来的 run 永远不同屏 —— 这一版就是拿「同屏」换「表大 + 页面干净」。
 
-**这个模块只负责摆放。** 八个 section 的控件由 `gui/` 共用层（`gui._ui.BaseApp`）的
+⚠️ 2026-08-19：Resources **从独占的第四个 tab 挪进了 Settings 页底**。
+它只有一个输入框加一行字，独占一页的后果是那一页下面空着约 700px，
+而 Settings 页自己底下也空着约 450px —— 一个空页换一个空页。现在
+Settings 页 = 左上设定 / 左下 Run groups / 右上 Run count / 页底 Resources，
+四块把那页填满，tab 也少一个。**section 一个没少**，只是换了地方摆。
+
+**这个模块只负责摆放。** 九个 section 的控件由 `gui/` 共用层（`gui._ui.BaseApp`）的
 `build_<section>` 出，frame 里不许有业务逻辑；要跟核心说话一律走 `bridge`
 （`ewave_batch.model.GuiBridgeProtocol`）。Run count 面板是本版**独有的摆放件**，
 但它只是把 `bridge.axes()` / `bridge.designs()` / `bridge.runs()` 数出来显示 ——
@@ -40,6 +46,7 @@ LAYOUT_NAME = "tabbed"
 SECTIONS: tuple[str, ...] = (
     "batchbar",
     "designs",
+    "groups",
     "settings",
     "resources",
     "runs",
@@ -50,15 +57,17 @@ SECTIONS: tuple[str, ...] = (
 """三版**必须暴露同一组**顶层构件 —— 这是「界面手感一致」唯一的机器判据。
 
 ⚠️ 必须与 `gui.frames.stacked.SECTIONS` / `gui.frames.split.SECTIONS` **逐字相等**。
-换 tab 不该换掉一个 section：Tabbed 版只是把同样八件东西塞进四个 tab。
+换 tab 不该换掉一个 section：Tabbed 版只是把同样九件东西塞进三个 tab。
+`groups`（Run groups）是草图之后加的第九个，摆在 Designs 和 Settings 之间。
 """
 
-TAB_NAMES: tuple[str, ...] = ("Designs", "Settings", "Resources", "Runs")
-"""四个 tab 的英文标题，顺序即左到右（草图 1b）。"""
+TAB_NAMES: tuple[str, ...] = ("Designs", "Settings", "Runs")
+"""三个 tab 的英文标题，顺序即左到右（草图 1b 是四个，Resources 那页见模块 docstring）。"""
 
 SECTION_TITLES: dict[str, str] = {
     "batchbar": "Batch",
     "designs": "Designs",
+    "groups": "Run groups",
     "settings": "Settings",
     "resources": "Resources",
     "runs": "Runs",
@@ -179,6 +188,42 @@ def count_widgets(widget: object) -> int:
     return 1 + sum(count_widgets(child) for child in widget.winfo_children())
 
 
+MINSIZE_SCREEN_FRACTION = 0.85
+"""minsize 最多占屏幕的几成。上限存在的理由是「窗口比屏幕大就没法用」——
+最小尺寸一旦超过屏幕，标题栏可能落在可视区外，窗口既拖不动也关不掉。
+"""
+
+
+def apply_minsize(frame: object, *, fraction: float = MINSIZE_SCREEN_FRACTION):
+    """把顶层窗口的 `minsize` 设成**现算的**「这版布局真正需要多大」，返回设下去的 (w, h)。
+
+    与 `gui/frames/stacked.py` 的同名函数逐字相同 —— 三个 frame 模块在本仓库里各自自足
+    （`import_shared_layer` / `build_section` / `NullBridge` 都是这么各抄一份的），
+    共用层 `gui/_ui.py` 是另一条分工线上的地盘。理由长注释见 stacked 那一份，一句话：
+    **不许写死像素**（红区是 Linux，字体度量不同），而且要**在 `recompute()` 填内容之前**算
+    （否则一条长路径能把最小窗口撑到一千多像素宽）。
+
+    `frame` 不是直接建在顶层窗口里（= 被嵌进别人的容器）→ 静默跳过。
+    """
+    import tkinter as tk
+
+    try:
+        top = frame.winfo_toplevel()
+        if frame.nametowidget(frame.winfo_parent()) is not top:
+            return None
+        frame.update_idletasks()
+        cap_w = int(top.winfo_screenwidth() * fraction)
+        cap_h = int(top.winfo_screenheight() * fraction)
+        size = (
+            max(1, min(frame.winfo_reqwidth(), cap_w)),
+            max(1, min(frame.winfo_reqheight(), cap_h)),
+        )
+        top.minsize(*size)
+    except tk.TclError:  # pragma: no cover - 窗口已经被关掉的竞态
+        return None
+    return size
+
+
 def axis_counts(bridge: object) -> list[tuple[str, int]]:
     """Run count 面板要显示的每一行：`(名字, 取值个数)`，designs 排第一。
 
@@ -192,10 +237,16 @@ def axis_counts(bridge: object) -> list[tuple[str, int]]:
 
 
 def place_sections(kit: object | None, root: object, bridge: object) -> dict:
-    """把八个 section 摆进 `root` —— **本版布局的全部内容**，两条路共用这一份。
+    """把九个 section 摆进 `root` —— **本版布局的全部内容**，两条路共用这一份。
 
-    摆放照 `mockups/tabbed.py`：批次栏 → notebook（四 tab）→ 动作栏 → 状态栏。
-    返回的 dict 里除了 `built` / `dropped`，还带 `refresh_counts` ——
+    摆放照 `mockups/tabbed.py`：批次栏 → notebook（三 tab）→ 动作栏 → 状态栏。
+
+    🚨 **pack 的顺序就是抢空间的顺序**：动作栏和状态栏建在 notebook **外面**还不够，
+    还得**先于** notebook 从底部 pack。stacked 版就是栽在这上面（整条动作栏被挤出窗口、
+    `Submit` 的 `winfo_ismapped()` 是 0）—— 本版的 notebook 一样是 `expand=True`，
+    同一个坑，同一个治法。
+
+    返回的 dict 里除了 `built` / `dropped` / `minsize`，还带 `refresh_counts` ——
     数据变了以后重画 Run count 面板和 tab 标题上的数字。
     """
     import tkinter as tk
@@ -211,11 +262,11 @@ def place_sections(kit: object | None, root: object, bridge: object) -> dict:
         return widget
 
     # 批次栏在 notebook 外面常驻 —— 换 tab 不该让批次名消失。
-    section("batchbar", root, show_dir=True).pack(fill=tk.X)
-    ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
+    section("batchbar", root, show_dir=True).pack(side=tk.TOP, fill=tk.X)
+    ttk.Separator(root, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X)
 
+    # 先建、**最后 pack**：notebook 只拿动作栏和状态栏挑剩下的空间。
     notebook = ttk.Notebook(root, padding=6)
-    notebook.pack(fill=tk.BOTH, expand=True)
     tabs = {}
     for title in TAB_NAMES:
         page = ttk.Frame(notebook, padding=8)
@@ -231,14 +282,25 @@ def place_sections(kit: object | None, root: object, bridge: object) -> dict:
         text="Every row here is multiplied by every combination on the Settings tab.",
     ).pack(anchor=tk.W, pady=(8, 0))
 
-    # --- Settings 页：左边设定，右边 Run count（这一版把乘法公式做成一张表）
+    # --- Settings 页：左上设定 / 左下 Run groups / 右上 Run count / 页底 Resources。
+    # Run groups 拿 `expand=True` 是**有意的**：这一页原来底下空着约 450px，
+    # 那块空白正是分组面板的家（`resources` 只有一行，撑不起来也不该被撑高）。
     settings_row = ttk.Frame(tabs["Settings"])
     settings_row.pack(fill=tk.BOTH, expand=True)
-    section("settings", settings_row, compact=False, title=" Extraction settings ",
-            show_formula=False).pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    left_col = ttk.Frame(settings_row)
+    left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    right_col = ttk.Frame(settings_row)
+    right_col.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
 
-    count_box = ttk.LabelFrame(settings_row, text=" Run count ", padding=8)
-    count_box.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
+    # 先建 groups 再建 settings（`built` 的顺序必须等于 `SECTIONS`），但**先 pack
+    # settings**：设定在上、分组在下。建的顺序和摆的顺序在这里故意分开。
+    groups_widget = section("groups", left_col)
+    section("settings", left_col, compact=False, title=" Extraction settings ",
+            show_formula=False).pack(side=tk.TOP, fill=tk.X)
+    groups_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(8, 0))
+
+    count_box = ttk.LabelFrame(right_col, text=" Run count ", padding=8)
+    count_box.pack(side=tk.TOP, fill=tk.X)
     count_rows = ttk.Frame(count_box)
     count_rows.pack(fill=tk.X)
     count_rows.columnconfigure(1, weight=1)
@@ -255,19 +317,25 @@ def place_sections(kit: object | None, root: object, bridge: object) -> dict:
         text="Switch to the Runs tab to see every run before submitting.",
     ).pack(anchor=tk.W, pady=(8, 0))
 
-    # --- Resources 页
-    section("resources", tabs["Resources"]).pack(fill=tk.X)
+    # Resources 横贯页底：它就是一条整命令的输入框，横着摆最省地方 ——
+    # 而不是像原来那样独占一个 tab、底下空七百像素。
+    section("resources", tabs["Settings"]).pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
 
     # --- Runs 页：表独占整窗 + 选中详情
     section("runs", tabs["Runs"], rows=20, titled=False,
             header_in_title=False).pack(fill=tk.BOTH, expand=True)
     section("detail", tabs["Runs"]).pack(fill=tk.X, pady=(6, 0))
 
-    # 动作栏也在 notebook 外面 —— Submit 永远在屏幕上。
-    ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
-    section("actionbar", root, show_formula=True, show_dir=False).pack(fill=tk.X)
-    ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
-    section("statusbar", root).pack(fill=tk.X)
+    # 动作栏也在 notebook 外面，而且**先于** notebook 从底部拿空间 —— Submit 永远在屏幕上。
+    # `side=BOTTOM` 时先 pack 的更靠下 ⇒ 状态栏在最底，动作栏在它上面。
+    actionbar = section("actionbar", root, show_formula=True, show_dir=False)
+    statusbar = section("statusbar", root)
+    statusbar.pack(side=tk.BOTTOM, fill=tk.X)
+    ttk.Separator(root, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
+    actionbar.pack(side=tk.BOTTOM, fill=tk.X)
+    ttk.Separator(root, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
+
+    notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
     def refresh_counts() -> tuple[tuple[str, int], ...]:
         """重画 Run count 面板 + tab 标题上的数字，返回这次画出来的行（好被测试看见）。"""
@@ -293,13 +361,14 @@ def place_sections(kit: object | None, root: object, bridge: object) -> dict:
         "notebook": notebook,
         "refresh_counts": refresh_counts,
         "total_label": total_label,
+        "minsize": apply_minsize(root),
     }
 
 
 def build_frame(parent: object, bridge: GuiBridgeProtocol) -> object:
     """建 tabbed 版的主 frame，返回它的根 widget。
 
-    有共用层且 bridge 喂得饱它 → 真界面；否则 → 占位版（同样八个 section）。
+    有共用层且 bridge 喂得饱它 → 真界面；否则 → 占位版（同样九个 section）。
     走了哪条路看 `frame.widget_kit_name`。返回的 widget 上挂着 `refresh_counts()`。
 
     入参坏了抛 `TypeError`，**在建任何控件之前**。
@@ -342,6 +411,7 @@ def build_frame(parent: object, bridge: GuiBridgeProtocol) -> object:
     frame.sections_built = placed.get("built", ())
     frame.dropped_hints = placed.get("dropped", ())
     frame.widget_kit_name = kit_name
+    frame.minsize_applied = placed.get("minsize")
     frame.notebook = placed.get("notebook")
     frame.refresh_counts = placed.get("refresh_counts")
     frame.total_label = placed.get("total_label")

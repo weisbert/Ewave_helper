@@ -43,10 +43,13 @@ EXPECTED_LAYOUT_NAMES = ("stacked", "tabbed", "split")
 EXPECTED_BUILD_FRAME_SIG = "(parent, bridge) -> object"
 EXPECTED_MAIN_SIG = "(argv=) -> int"
 
-# 八个顶层构件。来源：mockups/_ui.py 的 build_* 方法（build_menubar 除外，见下面那条测试）。
+# 九个顶层构件。前八个来源：mockups/_ui.py 的 build_* 方法（build_menubar 除外，见下面
+# 那条测试）。第九个 `groups`（Run groups）是草图之后加的（用户 2026-08-19 拍板的 run
+# group 组合模型），草图里没有它 —— 所以它在下面那条反查里单独豁免，别把豁免删了。
 EXPECTED_SECTIONS = (
     "batchbar",
     "designs",
+    "groups",
     "settings",
     "resources",
     "runs",
@@ -289,9 +292,14 @@ class SectionSet(unittest.TestCase):
         builders = set(re.findall(r"^    def build_(\w+)\(", text, flags=re.M))
         self.assertTrue(builders, "从 mockups/_ui.py 里一个 build_* 都没数出来 —— 正则过时了")
         # build_menubar 不是「摆放件」：菜单条挂在 Tk 根窗口上，不参与 frame 的布局，
-        # 所以它不在 SECTIONS 里。除它之外，两边必须一个不多一个不少。
-        self.assertEqual(builders - {"menubar"}, set(EXPECTED_SECTIONS))
-        self.assertEqual(len(EXPECTED_SECTIONS), 8)
+        # 所以它不在 SECTIONS 里。
+        # `groups` 是草图**之后**加的第九件（run group 组合模型，用户 2026-08-19 拍板），
+        # 而 mockups/ 是当初的设计成果、不再回改 —— 拿它当 fixture 的价值正是「人写的、
+        # 不跟着实现动」。所以这里显式豁免它一件，而不是把这条反查删掉：
+        # 剩下那八件仍然必须与草图一个不多一个不少。
+        self.assertEqual(builders - {"menubar"}, set(EXPECTED_SECTIONS) - {"groups"})
+        self.assertEqual(len(EXPECTED_SECTIONS), 9)
+        self.assertIn("groups", EXPECTED_SECTIONS)
 
     def test_every_layout_exposes_the_same_sections(self) -> None:
         compared = 0
@@ -307,7 +315,7 @@ class SectionSet(unittest.TestCase):
             self.assertEqual(
                 section_gap(tuple(sections), EXPECTED_SECTIONS),
                 ((), ()),
-                "%s.SECTIONS 和草图那八件对不上" % module_name,
+                "%s.SECTIONS 和那九件对不上" % module_name,
             )
             self.assertEqual(tuple(sections), EXPECTED_SECTIONS, "%s 的顺序也得一致" % module_name)
             compared += 1
@@ -432,7 +440,7 @@ class HeadlessBuild(unittest.TestCase):
         module = LAYOUTS["stacked"]
         frame = module.build_frame(self.root, StubBridge())
         self.assertEqual(frame.sections_built, EXPECTED_SECTIONS)
-        self.assertEqual(len(frame.sections_built), 8)
+        self.assertEqual(len(frame.sections_built), 9)
         self.assertEqual(frame.layout_name, "stacked")
         # StubBridge 只满足冻结面，喂不饱 gui._ui.BaseApp ⇒ 这里走的是占位版那条路。
         # 明写出来，免得哪天路径变了而测试还绿着（走哪条路是被测行为的一部分）。
@@ -440,13 +448,22 @@ class HeadlessBuild(unittest.TestCase):
         # 每个 section 至少落一个 widget，外加布局自己的容器和分隔线。
         self.assertGreater(module.count_widgets(frame), len(EXPECTED_SECTIONS))
 
-    def test_tabbed_builds_every_section_and_four_tabs(self) -> None:
+    def test_tabbed_builds_every_section_and_three_tabs(self) -> None:
+        """九个 section 摆进**三**个 tab。
+
+        草图 1b 原本是四个（Resources 独占一页），后来 Resources 挪到 Settings 页底
+        横贯一行 —— 那一页原来底下空着几百像素，而 Resources 本身只有一条输入框。
+        tab 数由布局决定、section 数不由布局决定：这条测试同时钉住这两句话。
+        """
         module = LAYOUTS["tabbed"]
         frame = module.build_frame(self.root, StubBridge())
         self.assertEqual(frame.sections_built, EXPECTED_SECTIONS)
         self.assertEqual(frame.layout_name, "tabbed")
-        self.assertEqual(len(frame.notebook.tabs()), 4)
-        titles = [frame.notebook.tab(i, "text").strip() for i in range(4)]
+        self.assertEqual(module.TAB_NAMES, ("Designs", "Settings", "Runs"))
+        self.assertEqual(len(frame.notebook.tabs()), len(module.TAB_NAMES))
+        titles = [
+            frame.notebook.tab(i, "text").strip() for i in range(len(module.TAB_NAMES))
+        ]
         # tab 标题带计数（"Designs (0)"），所以比开头而不是全等。
         for expected, actual in zip(module.TAB_NAMES, titles):
             self.assertTrue(actual.startswith(expected), "tab %r 不是 %r 开头" % (actual, expected))
@@ -520,11 +537,16 @@ class WidgetKitWiring(unittest.TestCase):
     def test_stacked_asks_the_kit_for_the_sketch_1a_layout(self) -> None:
         kit = self.make_kit()
         placed = self.place("stacked", kit)
-        # 计数断言：八个 section 一个不落地经过了构件层（空 dict 的比对永远好看）。
-        self.assertEqual(len(kit.calls), 8)
+        # 计数断言：九个 section 一个不落地经过了构件层（空 dict 的比对永远好看）。
+        self.assertEqual(len(kit.calls), len(EXPECTED_SECTIONS))
         self.assertEqual(sorted(kit.calls), sorted(EXPECTED_SECTIONS))
         self.assertEqual(placed["built"], EXPECTED_SECTIONS)
-        self.assertEqual(kit.calls["designs"], {"widths": (250, 250, 210), "rows": 2})
+        # Run groups 这一版不递任何布局提示（面板自己按内容撑高）—— 空 dict 是**期望值**，
+        # 不是「忘了写」：递了而共用层不认的话会进 dropped，见下面那条反向测试。
+        self.assertEqual(kit.calls["groups"], {})
+        self.assertEqual(
+            kit.calls["designs"], {"widths": (250, 250, 210), "rows": 2, "buttons": "three"}
+        )
         self.assertEqual(kit.calls["settings"], {"compact": False, "show_formula": False})
         self.assertEqual(kit.calls["runs"], {"rows": 9})
         self.assertEqual(kit.calls["batchbar"], {})
@@ -533,8 +555,9 @@ class WidgetKitWiring(unittest.TestCase):
     def test_tabbed_asks_the_kit_for_the_sketch_1b_layout(self) -> None:
         kit = self.make_kit()
         placed = self.place("tabbed", kit)
-        self.assertEqual(len(kit.calls), 8)
+        self.assertEqual(len(kit.calls), len(EXPECTED_SECTIONS))
         self.assertEqual(placed["built"], EXPECTED_SECTIONS)
+        self.assertEqual(kit.calls["groups"], {})
         self.assertEqual(
             kit.calls["designs"],
             {"widths": (300, 300, 260), "rows": 12, "buttons": "three", "titled": False},
@@ -570,13 +593,28 @@ class WidgetKitWiring(unittest.TestCase):
         """
         kit = self.make_kit(accept_hints=False)
         placed = self.place("stacked", kit)
-        self.assertEqual(len(kit.calls), 8)
+        self.assertEqual(len(kit.calls), len(EXPECTED_SECTIONS))
         dropped = placed["dropped"]
         self.assertIn("runs.rows", dropped)
         self.assertIn("designs.widths", dropped)
         # 只有真给过提示的 section 才该出现在报告里。
         self.assertNotIn("batchbar", "".join(dropped))
-        self.assertEqual(len(dropped), 5)
+        self.assertNotIn("groups", "".join(dropped))
+        # 逐条数出来的：designs 三个（widths/rows/buttons）+ settings 两个
+        # （compact/show_formula）+ runs 一个（rows）= 6。数字写死是有意的 ——
+        # 布局改了递出去的提示，就该有人来改这一行。
+        self.assertEqual(
+            sorted(dropped),
+            [
+                "designs.buttons",
+                "designs.rows",
+                "designs.widths",
+                "runs.rows",
+                "settings.compact",
+                "settings.show_formula",
+            ],
+        )
+        self.assertEqual(len(dropped), 6)
 
     def test_the_real_shared_layer_accepts_every_hint(self) -> None:
         """整条产品路径：真共用层 + 真 `GuiState` —— 一个布局提示都不许落空。
@@ -642,8 +680,17 @@ class TabbedRunCount(unittest.TestCase):
         self.assertEqual(rows, (("designs", 2), ("corner", 3), ("temperature", 2)))
         self.assertEqual(len(rows), 1 + len(bridge.axes()))
         self.assertEqual(frame.total_label.cget("text"), "12 runs")
-        self.assertEqual(frame.notebook.tab(0, "text").strip(), "Designs (2)")
-        self.assertEqual(frame.notebook.tab(3, "text").strip(), "Runs (12)")
+        # tab 的**下标**不是契约（Resources 那页没了之后 Runs 从 3 挪到 2），
+        # tab 的**名字**才是 —— 所以按名字定位，别再写死下标。
+        tabbed = LAYOUTS["tabbed"]
+        self.assertEqual(
+            frame.notebook.tab(tabbed.TAB_NAMES.index("Designs"), "text").strip(),
+            "Designs (2)",
+        )
+        self.assertEqual(
+            frame.notebook.tab(tabbed.TAB_NAMES.index("Runs"), "text").strip(),
+            "Runs (12)",
+        )
 
     def test_panel_rereads_the_bridge_negative(self) -> None:
         """反向：换掉 bridge 里的数据再 refresh，面板必须跟着变。
@@ -667,7 +714,10 @@ class TabbedRunCount(unittest.TestCase):
         self.assertNotEqual(before, after)
         self.assertEqual(after, (("designs", 1), ("corner", 5)))
         self.assertEqual(frame.total_label.cget("text"), "5 runs")
-        self.assertEqual(frame.notebook.tab(3, "text").strip(), "Runs (5)")
+        self.assertEqual(
+            frame.notebook.tab(LAYOUTS["tabbed"].TAB_NAMES.index("Runs"), "text").strip(),
+            "Runs (5)",
+        )
 
 
 class AxisCounts(unittest.TestCase):
@@ -748,7 +798,7 @@ class SmokeEntryPoints(unittest.TestCase):
                 ),
             )
 
-    def test_standalone_smoke_reports_all_eight_sections(self) -> None:
+    def test_standalone_smoke_reports_all_nine_sections(self) -> None:
         """`--smoke` 是本模块自带的那条：不经共用层、不经 gui.app，只证明本布局自己好。"""
         for layout in OWNED_LAYOUTS:
             proc = self.run_module(layout, args=("--smoke",))
@@ -762,19 +812,34 @@ class SmokeEntryPoints(unittest.TestCase):
                 # 平台降级（没 tkinter / 没显示）。本机有显示时不该走到这。
                 self.assertTrue(TK_SKIP, "本机起得了 Tk，冒烟却报 skipped：%r" % out)
                 continue
-            self.assertIn("8/8 sections", out)
+            self.assertIn("9/9 sections", out)
             # 独立那条必须走占位版 —— 它的全部价值就是「不依赖别人的模块」。
             self.assertIn("kit=none", out)
 
 
 class LazyTkinterImport(unittest.TestCase):
-    """CLAUDE.md 硬约束 5：模块顶层不许 import tkinter，也不许在 import 时建 Tk()。"""
+    """CLAUDE.md 硬约束 5：模块顶层不许 import tkinter，也不许在 import 时建 Tk()。
+
+    ⚠️ 这一组盯的是**三版全部**（`EXPECTED_LAYOUT_NAMES`），不是 `OWNED_LAYOUTS`。
+    硬约束 5 是全仓库的纪律，不是某个 agent 的地盘 —— 2026-08-19 复核实测：
+    只覆盖 stacked / tabbed 的那阵子，**默认布局** split 在顶层 import 了 tkinter
+    而两条测试都看不见它；在一台没装 python3-tk 的机器上，闸门第 5 步只红在那一版上。
+    """
+
+    def _layout_paths(self) -> list:
+        """存在的布局模块 → `[(名字, 路径), …]`。一个都没有是错，不是 skip。"""
+        out = []
+        for name in EXPECTED_LAYOUT_NAMES:
+            path = ROOT / "gui" / "frames" / (name + ".py")
+            if path.exists():
+                out.append((name, path))
+        self.assertTrue(out, "一个布局模块都没有")
+        return out
 
     def test_no_module_level_tkinter_import(self) -> None:
         import ast
 
-        for name in OWNED_LAYOUTS:
-            path = ROOT / "gui" / "frames" / (name + ".py")
+        for name, path in self._layout_paths():
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in tree.body:  # 只看**顶层**语句：函数体里的 import 正是我们要的
                 if isinstance(node, ast.Import):
@@ -791,13 +856,20 @@ class LazyTkinterImport(unittest.TestCase):
                     )
 
     def test_importing_the_module_does_not_load_tkinter(self) -> None:
-        """真跑一遍：一个干净的子进程里 import 布局模块，`sys.modules` 里不该出现 tkinter。"""
+        """真跑一遍：一个干净的子进程里 import **三版**布局模块，`sys.modules` 里不该有 tkinter。
+
+        AST 那条只看得见字面上的 `import tkinter`；`from .. import _ui` 这种**间接**把
+        tkinter 拉进来的写法它一个字都看不到 —— split 当初栽的正是这一条。所以两条都要有。
+        """
+        imports = "".join(
+            "importlib.import_module('gui.frames.%s')\n" % name
+            for name, _ in self._layout_paths()
+        )
         code = (
             "import sys, importlib\n"
             "assert 'tkinter' not in sys.modules\n"
-            "importlib.import_module('gui.frames.stacked')\n"
-            "importlib.import_module('gui.frames.tabbed')\n"
-            "assert 'tkinter' not in sys.modules, 'import 时就把 tkinter 拉进来了'\n"
+            + imports
+            + "assert 'tkinter' not in sys.modules, 'import 时就把 tkinter 拉进来了'\n"
             "print('lazy ok')\n"
         )
         proc = subprocess.run(
@@ -919,7 +991,9 @@ class SplitDividerIsDraggable(unittest.TestCase):
         """
         module = LAYOUTS["split"]
         shared = int(_ui_module().BaseApp.GEOMETRY.split("x")[0])
-        mine = int(module.SplitApp.GEOMETRY.split("x")[0])
+        # `SplitApp` 现在由 `_split_app_class()` 现造 —— 模块顶层不许有以 `_ui.BaseApp`
+        # 为基类的类，那会把 tkinter 拉进 import 期（硬约束 5）。
+        mine = int(module._split_app_class(_ui_module()).GEOMETRY.split("x")[0])
         self.assertGreater(mine, shared, "1c 的默认窗口应当比共用默认更宽")
 
 

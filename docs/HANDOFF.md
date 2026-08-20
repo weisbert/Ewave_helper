@@ -14,6 +14,11 @@
 **七个阶段全部落地，闸门 ALL GREEN（962 条单测，退出码 0），可以拿去红区跑第一次只读 dry-run；
 但「跑得对不对」这件事本机一次都没能验证过 —— 所有跟真实 eWave/Donau 打交道的形状都是照证据推的。**
 
+> ⚠️ **这句话说的是 2026-08-18/19 夜跑那一刻（962 条）。** 之后白天又落了 5 个 commit
+> 加一批未提交的改动，最大的一件是 **run group 组合模型**（BRIEF D14）——
+> 闸门仍是 ALL GREEN，条数涨到 **1022**。逐条见 §3 的表和它后面那两节。
+> 除此之外本文其余部分仍然成立。
+
 能干什么：
 
 - 在红区**只读**跑 `redzone_dryrun`，把「我们拼出来的命令」和「官方那条真命令」逐 flag / 逐端口对比
@@ -182,7 +187,12 @@ spec 里显式写 `ports`（把 `-p`/`-i` 照官方粘出来），或者确认�
 | `ca7db68` | P4 | 日志解析：`ewave.log` / `emsolver.log` → 收敛 / 墙钟 / 峰值内存 / 端口数 / 成败 / 频点数 | 863 |
 | `9b21773` | P5 | 界面：`cli`（五个子命令）+ `gui/state.py` 桥 + `gui/_ui.py` 共用层 + 三版 frame | 914 |
 | `5f9c5f5` | — | 修 `log_path` 撞名（`dsub -o` 会让 N 个 job 的 stdout 混进一份日志） | 918 |
-| **未提交** | P6 | 部署链路（`deploy.sh` / `pack.ps1` / `doctor.sh` / `_env_check.py`）+ 红区首跑 bundle | **962** |
+| `01b1757` | P6 | 部署链路（`deploy.sh` / `pack.ps1` / `doctor.sh` / `_env_check.py`）+ 红区首跑 bundle | 962 |
+| `a53e4ab` | — | 收尾：端口数退出源码（= §1.1 那个泄漏，走的是选项 b）+ 子进程解码不再看本机 locale | 962 |
+| `0a418e0` | — | 默认值换成用户 2026-08-19 拍板的那套；撤掉「生产默认值是全局常量」这个被推翻的前提 | 963 |
+| `3cc8b92` | — | 接上「Save spec as…」（`spec_to_mapping` / `dump_spec` / `save_spec` / `have_yaml`）| 975 |
+| `438f3c7` | — | 修 split 布局：左栏内容被裁掉、分隔条拖不动 | 979 |
+| **未提交** | — | `[interface-change]` **run group 组合模型**（BRIEF D14，`INTERFACE_VERSION` 2→3）| **1022** |
 
 ### ⚠️ P6 还没 commit
 
@@ -197,6 +207,49 @@ spec 里显式写 `ports`（把 `-p`/`-i` 照官方粘出来），或者确认�
 按夜跑规矩 agent 不 commit，而 **P6 之后没有再跑「审查 + commit」的轮次**。
 所以这 9 个文件（加上这份 `docs/HANDOFF.md`，共 10 个）是**唯一没经过审查 agent 的产出**。
 早上第一件事是自己复核再 commit。
+
+> ✅ **已了结（2026-08-19）**：复核过了，落成 `01b1757`。
+> §1.1 那个端口数泄漏走的是**选项 b**（`a53e4ab`）：7 个"允许碰"的文件换成合成小值
+> （`.s4p` / `.s3p`，与 P4 fixture 的 4 端口约定一致），`mockups/_common.py` 里那 **1 处没动**
+> —— 它在「不许碰」清单里，而且初始提交就有。所以泄漏面从"今晚会扩散到 8 个文件"
+> 缩回到"origin/main 上早就有的那 1 处"，**没有归零**；要不要连历史一起清仍是待定的判断题。
+
+### run group 组合模型（2026-08-19，`[interface-change]`，**未提交**）
+
+用户当天拍板的一条新决定，写进 `PROJECT_BRIEF.md` **D14**（编号跳过 D13 —— 那个号
+早被「频率不是扫描轴」占了）。**为什么要它**：纯笛卡尔积表达不了「一条基线 + 几个单点变体」，
+最接近的写法里一多半是废 run，而一个 run 的量级是 10 核 / 100 GB / 35 分钟。
+**模型**：批次 = 一列 `RunGroup`，每组是 base 之上的 delta、各自取笛卡尔积、结果取并集，
+跨组重复按 `run_id` 静默去重。
+
+改到的面，自下而上四层：
+
+| 层 | 改了什么 |
+|---|---|
+| 冻结面 | `model.py`：`BASE_GROUP` / `RunGroup` / `RunExpansion`；`BatchSpec`·`BatchState` 加 `groups`、`Run` 加 `group`；`INTERFACE_VERSION` 2→3。`SCHEMA_VERSION` **保持 1**（两个新字段都带默认值，读老 `batch.json` 不会炸，双向兼容 —— 判断依据写在它的 docstring 里）|
+| 核心 | `matrix.axes_for_group` / `expand_runs_detailed`，`varying_axes`·`effective_axis_values` 加 `groups` 口径；`spec.py` 解析/校验/序列化顶层 `groups:` |
+| 桥 | `gui/state.py`：15 个 group 方法；`set_axis_values()`·`axis_selection()`·`axis_counts()` 改成作用于 active group |
+| 界面 | `gui/_ui.py` 的 `build_groups`（第 9 个 section）+ Settings 每根轴的「覆盖」勾选框；三版 frame 的 `SECTIONS` 8→9 |
+
+**这一趟顺带把 10 个核心模块的面向用户字符串全部英文化并压成纯 ASCII**
+（红区 `LANG` 常是 C），代码注释和 docstring 一律保留中文。
+
+#### 闸门状态：**ALL GREEN**（2026-08-19 白天实测）
+
+```
+sh scripts/check.sh  ->  check: ALL GREEN
+Ran 1022 tests ... OK (skipped=4, expected failures=1)
+```
+
+途中有一小段时间是红的，**值得记一笔**，因为它正是本项目最典型的一类失误：
+三版 `gui/frames/*.py` 的 `SECTIONS` 加到 9 个（多了 `groups`）之后，
+`tests/test_gui_frames.py` 里**手抄**的 `EXPECTED_SECTIONS` 还是 8 个、
+还带一条写死 8 的数字断言 —— 13 条红全部长在测试文件上而不是实现上，
+第一眼极容易被误读成"实现写错了"。
+
+**教训已经固化进 `docs/INTERFACES.md`**：`SECTIONS` 那条现在明写
+「改它要同一个 commit 改四处：三版 frame + `tests/test_gui_frames.py` 里那两处」。
+`SECTIONS` 不在冻结面上（self-test 管不着它），所以纪律只能靠文档 + 那条一致性测试兜。
 
 ---
 
@@ -409,7 +462,7 @@ P3 漏的是 kit 里的 job id，P4 漏的是 BRIEF 里的测量值。两次的�
 **怎么验证**（红区，30 秒）：
 
 ```tcsh
-python -c "from ewave_batch.core.spec import EXAMPLE_SPEC; print(EXAMPLE_SPEC)" > my_spec.yaml
+python -c "import sys; from ewave_batch.core.spec import EXAMPLE_SPEC; sys.stdout.buffer.write(EXAMPLE_SPEC.encode('utf-8'))" > my_spec.yaml
 python -m ewave_batch dry-run --spec my_spec.yaml
 ```
 

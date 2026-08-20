@@ -4,7 +4,7 @@
 # 根因已定：$HOME 配额爆了。
 #   eresist 写 resist.rst 写不下 → 0 字节，**但它照样打印 "Execute eresist done."**，
 #   写失败被吞掉；emsolver 随后读空文件 → boost::archive::archive_exception。
-#   `df -h $HOME` 显示 537G 可用是误导 —— 那是文件系统剩余，不是用户配额。
+#   `df -h $HOME` 报的那个「可用」是误导 —— 那是文件系统剩余，不是用户配额。
 #
 # 本脚本：
 #   0. 取证（在 $HOME 和 workarea 各写一个测试文件，直接看谁写得下）

@@ -171,7 +171,8 @@ _OUTCOMES: dict[FakeFailureMode, _Outcome] = {
 
 FAKE_LOG_HEADER = (
     "# FAKE LOG - written by ewave_batch.sched.fake, NOT a real eWave log.\n"
-    "# 别拿它当 core.logparse 的 fixture：那边的期望值只能来自 references/probes/ 的真日志。\n"
+    "# Do not use it as a core.logparse fixture: the expectations over there may only come\n"
+    "# from the real logs under references/probes/.\n"
 )
 """每份假日志的第一行。存在的理由见模块 docstring 「日志是假的」那一节。"""
 
@@ -441,10 +442,10 @@ class FakeRunner:
         items = tuple(str(item) for item in argv)
         self.calls.append(items)
         if not items:
-            raise ToolMissingError("argv 是空的 —— 没有可执行文件可以假装执行")
+            raise ToolMissingError("argv is empty - there is no executable to pretend to run")
         if os.path.basename(items[0]) in self.missing_tools:
             raise ToolMissingError(
-                f"{items[0]}: 找不到可执行文件（FakeRunner.missing_tools 里点名了它）"
+                f"{items[0]}: executable not found (FakeRunner.missing_tools names it)"
             )
 
         if cancel is not None and cancel():
@@ -760,7 +761,7 @@ class FakeScheduler:
         self.submit_calls += 1
         key = _command_key(plan.argv)
         if _lookup(key, {k: True for k in self.fail_submit}) is not None:
-            raise SchedulerError(f"提交失败（FakeScheduler.fail_submit 点名了 {key!r}）")
+            raise SchedulerError(f"submit failed (FakeScheduler.fail_submit names {key!r})")
 
         self._tick += 1
         job_id = f"{self.prefix}-{len(self.jobs) + 1:04d}"
@@ -855,7 +856,7 @@ class FakeScheduler:
             job.state = JobState.DONE
             job.exit_code = 0
             job.ended_at = self._stamp()
-            job.raw = "fake: 终态，但没有 plan —— 没有产物落盘（adopt 时没给 plan）"
+            job.raw = "fake: terminal state but no plan - nothing was written (adopt got no plan)"
             return job
         if not job.started_at:
             job.started_at = self._stamp()

@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """布局 A —— Stacked：单窗口纵向堆叠（草图 1a，`mockups/stacked.py`）。
 
-Batch -> Designs -> Settings -> Resources -> Runs 全部同屏，勾一下和它的后果隔不到几厘米。
-代价：Runs 表只剩 ~9 行。
+Batch -> Designs -> Run groups -> Settings -> Resources -> Runs 全部同屏，
+勾一下和它的后果隔不到几厘米。代价：Runs 表只剩 ~9 行。
 
-**这个模块只负责摆放。** 八个 section 的控件由 `gui/` 共用层（`gui._ui.BaseApp`）的
+**这个模块只负责摆放。** 九个 section 的控件由 `gui/` 共用层（`gui._ui.BaseApp`）的
 `build_<section>` 出，frame 里不许有业务逻辑；要跟核心说话一律走 `bridge`
 （`ewave_batch.model.GuiBridgeProtocol`）。这正是草图的结构：`mockups/_ui.py` 提供构件，
 三个 frame 只写布局。
@@ -40,6 +40,7 @@ LAYOUT_NAME = "stacked"
 SECTIONS: tuple[str, ...] = (
     "batchbar",
     "designs",
+    "groups",
     "settings",
     "resources",
     "runs",
@@ -49,13 +50,19 @@ SECTIONS: tuple[str, ...] = (
 )
 """三版**必须暴露同一组**顶层构件 —— 这是「界面手感一致」唯一的机器判据。
 
-名字对应共用层的 `build_<section>`，和 `mockups/_ui.py` 里那八个 `build_*` 一一对上。
+名字对应共用层的 `build_<section>`：前八个和 `mockups/_ui.py` 的 `build_*` 一一对上，
+`groups`（Run groups）是草图之后加的第九个，摆在 Designs 和 Settings 之间 ——
+它管的是「哪些 design 跟哪些设定相乘」，位置就该在这两者中间。
 布局只决定它们摆在哪、留几行，**不决定有没有**：少一个 section 就是三版分岔的开始。
+
+⚠️ 共用层还没有 `build_groups` 时，`build_section` 自动退回 `_placeholder` ——
+本版布局照样建得起来（那条 fallback 存在的理由正是这个）。
 """
 
 SECTION_TITLES: dict[str, str] = {
     "batchbar": "Batch",
     "designs": "Designs",
+    "groups": "Run groups",
     "settings": "Settings",
     "resources": "Resources",
     "runs": "Runs",
@@ -194,14 +201,68 @@ def count_widgets(widget: object) -> int:
     return 1 + sum(count_widgets(child) for child in widget.winfo_children())
 
 
+MINSIZE_SCREEN_FRACTION = 0.85
+"""minsize 最多占屏幕的几成。**上限存在的理由不是好看，是「窗口比屏幕大就没法用」**：
+最小尺寸一旦超过屏幕，标题栏可能落在可视区外，窗口既拖不动也关不掉。
+超出的那部分交给布局里自带滚动条的构件去吸收（本版是 Runs 表，见 `place_sections`）。
+"""
+
+
+def apply_minsize(frame: object, *, fraction: float = MINSIZE_SCREEN_FRACTION):
+    """把顶层窗口的 `minsize` 设成**现算的**「这版布局真正需要多大」，返回设下去的 (w, h)。
+
+    2026-08-19 实拍：三版一个都没有 `minsize()`，于是窗口随手一缩就把动作栏切掉、
+    `Submit` 的 `winfo_ismapped()` 直接是 0 —— 点不到的按钮是功能性缺陷，不是观感问题。
+
+    尺寸**必须现算**（`winfo_reqwidth/reqheight`），不许写死像素：红区是 Linux，
+    默认字体度量和开发机不同，同样的内容更宽更高。`gui/frames/split.py` 里那个写死的
+    `LEFT_WIDTH = 452` 已经在这件事上栽过一次（左栏第 5 个勾选框整个点不到），别栽第二次。
+
+    **调用时机也是判据的一部分：在 `recompute()` 往界面里填内容之前。**
+    否则批次目录那种长路径会被算进"最低要求"，最小窗口被一条路径撑到一千多像素宽。
+
+    `frame` 不是直接建在顶层窗口里（= 被嵌进别人的容器）→ **静默跳过**：
+    那时候窗口不是我们的，替别人定最小尺寸是越界。
+    """
+    import tkinter as tk
+
+    try:
+        top = frame.winfo_toplevel()
+        if frame.nametowidget(frame.winfo_parent()) is not top:
+            return None
+        frame.update_idletasks()
+        cap_w = int(top.winfo_screenwidth() * fraction)
+        cap_h = int(top.winfo_screenheight() * fraction)
+        size = (
+            max(1, min(frame.winfo_reqwidth(), cap_w)),
+            max(1, min(frame.winfo_reqheight(), cap_h)),
+        )
+        top.minsize(*size)
+    except tk.TclError:  # pragma: no cover - 窗口已经被关掉的竞态
+        return None
+    return size
+
+
 def place_sections(kit: object | None, root: object, bridge: object) -> dict:
-    """把八个 section 摆进 `root` —— **本版布局的全部内容**，两条路共用这一份。
+    """把九个 section 摆进 `root` —— **本版布局的全部内容**，两条路共用这一份。
 
-    摆放照 `mockups/stacked.py`：批次栏在顶、状态栏在底，中间从上到下
-    Designs / Settings / Resources / Runs / Selected run / 动作栏。
+    摆放照 `mockups/stacked.py`：批次栏在顶、动作栏 + 状态栏在底，中间从上到下
+    Designs / Run groups / Settings / Resources / Runs / Selected run。
 
-    返回 `{"built": (...), "dropped": (...)}`，好让 `build_frame` 挂到 frame 上、
-    让测试不起整个 app 也能验「递给构件层的布局参数对不对」。
+    🚨 **pack 的顺序就是抢空间的顺序** —— 这是 2026-08-19 那个「Submit 点不到」的
+    直接病根，不是风格问题。原来 designs…actionbar 全塞在同一个 `body` 里、
+    `runs` 还拿着 `expand=True`：整棵树要 973px，窗口只有 900，于是排在 runs 后面的
+    detail 和**整条动作栏**被挤到窗口外，`btn["Submit"].winfo_ismapped()` 返回 0。
+    现在改成：
+
+    * 动作栏和状态栏**先**从底部拿走自己那份（`side=BOTTOM`，且在 `body` 之前 pack），
+      于是它们永远在屏幕上 —— 无论窗口多矮、字体多大；
+    * `body` 最后 pack，只拿剩下的；
+    * `body` 内部同理，`runs` **最后** pack ⇒ 空间不够时被压缩的是那张**自带竖滚动条**
+      的表（压瘦了还能滚），而不是排在它后面、一滚都不会滚的东西。
+
+    返回 `{"built": (...), "dropped": (...), "minsize": (w, h) | None}`，好让
+    `build_frame` 挂到 frame 上、让测试不起整个 app 也能验「递给构件层的布局参数对不对」。
     """
     import tkinter as tk
     from tkinter import ttk
@@ -215,31 +276,49 @@ def place_sections(kit: object | None, root: object, bridge: object) -> dict:
         dropped.extend("%s.%s" % (name, key) for key in missed)
         return widget
 
-    section("batchbar", root).pack(fill=tk.X)
-    ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
+    section("batchbar", root).pack(side=tk.TOP, fill=tk.X)
+    ttk.Separator(root, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X)
 
+    # 先建、**最后 pack**：body 只拿动作栏和状态栏挑剩下的空间。
     body = ttk.Frame(root, padding=(8, 6))
-    body.pack(fill=tk.BOTH, expand=True)
 
     # 草图 1a 的取舍：Designs 只留 2 行、Runs 只留 9 行，换「全部同屏」。
-    section("designs", body, widths=(250, 250, 210), rows=2).pack(fill=tk.X, pady=(4, 6))
+    # `buttons="three"` = Add / Duplicate / Remove —— 复制一行再改，比删掉重敲三个字段快
+    # 得多；共用层的 `dup_design` 早就实现了，之前只有 tabbed 传了这个参数。
+    section("designs", body, widths=(250, 250, 210), rows=2, buttons="three").pack(
+        fill=tk.X, pady=(4, 6)
+    )
+    section("groups", body).pack(fill=tk.X, pady=(0, 6))
     section("settings", body, compact=False, show_formula=False).pack(fill=tk.X, pady=(0, 6))
     section("resources", body).pack(fill=tk.X, pady=(0, 6))
-    section("runs", body, rows=9).pack(fill=tk.BOTH, expand=True)
-    section("detail", body).pack(fill=tk.X, pady=(6, 0))
-    section("actionbar", body).pack(fill=tk.X, pady=(4, 0))
+    # runs 先建后 pack：detail 得先从 body 底部拿走自己那几行，剩下的才归表。
+    runs = section("runs", body, rows=9)
+    section("detail", body).pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+    runs.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-    ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
-    section("statusbar", root).pack(fill=tk.X)
+    # 动作栏和状态栏建在 root 上、**在 body 之前**从底部 pack（见上面那段长注释）。
+    # `side=BOTTOM` 时先 pack 的更靠下 ⇒ 状态栏在最底，动作栏在它上面。
+    actionbar = section("actionbar", root)
+    statusbar = section("statusbar", root)
+    statusbar.pack(side=tk.BOTTOM, fill=tk.X)
+    ttk.Separator(root, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
+    actionbar.pack(side=tk.BOTTOM, fill=tk.X)
+    ttk.Separator(root, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
 
-    return {"built": tuple(built), "dropped": tuple(dropped)}
+    body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    return {
+        "built": tuple(built),
+        "dropped": tuple(dropped),
+        "minsize": apply_minsize(root),
+    }
 
 
 def build_frame(parent: object, bridge: GuiBridgeProtocol) -> object:
     """建 stacked 版的主 frame，返回它的根 widget。
 
     有共用层且 bridge 喂得饱它 → 真界面（`gui._ui.build` 造 app，`layout()` 里摆 section）；
-    否则 → 占位版（同样八个 section，控件是占位框）。走了哪条路看 `frame.widget_kit_name`。
+    否则 → 占位版（同样九个 section，控件是占位框）。走了哪条路看 `frame.widget_kit_name`。
 
     入参坏了抛 `TypeError`，**在建任何控件之前**。
     """
@@ -270,6 +349,7 @@ def build_frame(parent: object, bridge: GuiBridgeProtocol) -> object:
     frame.sections_built = placed.get("built", ())
     frame.dropped_hints = placed.get("dropped", ())
     frame.widget_kit_name = kit_name
+    frame.minsize_applied = placed.get("minsize")
     return frame
 
 

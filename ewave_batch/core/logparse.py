@@ -385,7 +385,7 @@ def _append_capped(target: list[str], item: str) -> None:
     if len(target) < MAX_MESSAGES:
         target.append(item)
         return
-    note = "（还有更多，已按 MAX_MESSAGES=%d 截断）" % MAX_MESSAGES
+    note = "(more follow; truncated at MAX_MESSAGES=%d)" % MAX_MESSAGES
     if note not in target:
         target.append(note)
 
@@ -486,7 +486,8 @@ def _pick_last(values: Sequence[float], label: str, warnings: list[str]) -> floa
     distinct = sorted(set(values))
     if len(distinct) > 1:
         _append_capped(
-            warnings, f"{label} 在同一份日志里有 {len(distinct)} 个不同的值 {distinct}，取最后一个"
+            warnings,
+            f"{label} has {len(distinct)} different values {distinct} in one log; taking the last one",
         )
     return values[-1]
 
@@ -508,14 +509,15 @@ def _facts_from(found: _Findings, *, may_claim_ok: bool) -> LogFacts:
             # 端口数错位是**静默**的（BRIEF §5「--all 的代价」），所以两处对不上必须喊。
             _append_capped(
                 warnings,
-                f"日志自相矛盾：`All Ports size is {port_count}`，但 `Port:` 那行数出来 {listed} 个",
+                f"the log contradicts itself: `All Ports size is {port_count}`, "
+                f"but the `Port:` line lists {listed}",
             )
 
-    wall = _pick_last(found.wall, "墙钟", warnings)
-    peak = _pick_last(found.peak_mem_mb, "峰值内存", warnings)
-    cpu = _pick_last(found.cpu, "CPU 占用", warnings)
-    calculated = _pick_last(found.calculated, "真算过的频点数", warnings)
-    requested = _pick_last(found.requested, "请求的频点数", warnings)
+    wall = _pick_last(found.wall, "wall clock", warnings)
+    peak = _pick_last(found.peak_mem_mb, "peak memory", warnings)
+    cpu = _pick_last(found.cpu, "cpu usage", warnings)
+    calculated = _pick_last(found.calculated, "frequency points actually solved", warnings)
+    requested = _pick_last(found.requested, "frequency points requested", warnings)
 
     if found.failed:
         ok: bool | None = False
@@ -590,7 +592,7 @@ def parse_memory_estimate_mb(text: str) -> float | None:
     `estimated_memory_mb`，走 `interface_change_requests` 由编排者决定；
     在那之前，需要这个数的调用方直接调本函数。
     """
-    return _pick_last(_scan(text).expected_mem_mb, "估算内存", [])
+    return _pick_last(_scan(text).expected_mem_mb, "estimated memory", [])
 
 
 def merge_log_facts(*facts: LogFacts) -> LogFacts:
@@ -657,19 +659,19 @@ def _read_log(path: str) -> tuple[str, str]:
     try:
         size = os.path.getsize(path)
     except OSError as exc:
-        return "", f"读不到 {_posix(path)}: {exc}"
+        return "", f"cannot read {_posix(path)}: {exc}"
     note = ""
     try:
         with open(path, "rb") as handle:
             if size > MAX_LOG_BYTES:
                 handle.seek(size - MAX_LOG_BYTES)
                 note = (
-                    f"{_posix(path)} 有 {size} 字节，只读了末尾 {MAX_LOG_BYTES} 字节"
-                    "（版本抬头之类在开头的东西可能因此测不到）"
+                    f"{_posix(path)} is {size} bytes; only the last {MAX_LOG_BYTES} bytes were read "
+                    "(things near the top, such as the version banner, may therefore go undetected)"
                 )
             data = handle.read()
     except OSError as exc:
-        return "", f"读不到 {_posix(path)}: {exc}"
+        return "", f"cannot read {_posix(path)}: {exc}"
     return data.decode("utf-8", errors="replace"), note
 
 
@@ -755,15 +757,15 @@ def parse_run_logs(run_dir: str) -> LogFacts:
     """
     root = _posix(run_dir)
     if not root or not os.path.isdir(run_dir):
-        return LogFacts(warnings=(f"日志目录不存在: {root}",))
+        return LogFacts(warnings=(f"log directory does not exist: {root}",))
 
     paths = _collect_log_files(run_dir)
     if not paths:
         expected = " / ".join(LOG_FILE_NAMES)
         return LogFacts(
             warnings=(
-                f"{root} 及其直接子目录里没有任何 eWave 日志"
-                f"（找的是 {expected} 和 {RUN_LOG_PREFIX}*.log）—— 这个 run 可能根本没跑起来",
+                f"no eWave log at all in {root} or its immediate subdirs "
+                f"(looked for {expected} and {RUN_LOG_PREFIX}*.log) - this run may never have started",
             )
         )
 

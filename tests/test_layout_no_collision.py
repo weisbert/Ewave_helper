@@ -260,7 +260,7 @@ class DiscoverEwaveDirAtVerifyTime(unittest.TestCase):
             self.assertFalse(report.ok)
             joined = " ".join(report.reasons)
             self.assertIn("2", joined, "该报出发现了几层：" + joined)
-            self.assertIn("下一步", joined, "报错要带下一步怎么办：" + joined)
+            self.assertIn("Next", joined, "报错要带下一步怎么办：" + joined)
 
 if __name__ == "__main__":
     unittest.main()

@@ -103,7 +103,7 @@ CLI 用 `sched.driver.run_batch` 的 `while` 驱动它，GUI 用 tkinter 的 `af
 
 ---
 
-## 五条会咬人的契约
+## 六条会咬人的契约
 
 1. **`FlagValue` 的 `False` 不是"没有"，是"显式缺席"。**
    生产默认表里带 `--equalCurrent`，equalCurrent 轴的 `off` 取值必须用 `False`
@@ -122,6 +122,89 @@ CLI 用 `sched.driver.run_batch` 的 `while` 驱动它，GUI 用 tkinter 的 `af
 5. **`done` 的判据是 `verify_run_outputs`，不是 job 退出码。**
    实测：eWave 崩了也 `exit=0`、还会留 0 字节文件报 "done"、写失败被吞。
    `Job.exit_code` 只作诊断。
+6. **`varying` 的口径是全批次的 —— run group 的取值必须并进去。**
+   `compute_axes_slug` 只编码「在变的轴」。base 里 `equalCurrent: [on]` 不变 ⇒ 不进 slug；
+   一旦有个组把它覆盖成 `[off]`，它就**对所有 run**（包括基线）进 slug。
+   漏算这一层的后果是两个组的同一个 corner/temp 算出同一个 `run_id` ⇒ 同一个 `--workDir`
+   ⇒ **静默覆盖**，正是本工具存在要消灭的东西。
+   推论（界面上必须让人看见）：**加组会改掉基线的目录名**，所以给已经跑过的批次加组
+   等于换了一批 `run_id`，resume 认不出老的 `base/...` 目录。
+
+---
+
+## run group：批次 = 一列组，run 取并集（用户 2026-08-19 拍板）
+
+今天之前，界面上唯一能表达的是「我勾的所有东西的所有组合」（一个全批次笛卡尔积）。
+用户真正要的是**一条基线 + 几个单点变体**：
+
+```
+typical @ {-40, 55, 125}  +  typical @ 55 且 equalCurrent off  +  typical @ 55 且 full wave  = 5 个 run
+```
+
+笛卡尔积最接近的写法是 `{typical}×{3 温度}×{eqI on/off}×{fw on/off}` = 12 个，7 个是废的。
+按 BRIEF §12 的量级（一个 run 可能 10 核 100GB 跑 35 分钟）这是硬成本。
+（`PROJECT_BRIEF.md` 给 `matrix.py` 的职责本来就写着「笛卡尔积/**显式组合**」—— 这半边当初
+设计到了、没实现。）
+
+**模型**：批次 = 一列 `RunGroup`，每组自己取笛卡尔积，结果取并集。
+**组是 base 之上的 delta**，只列它覆盖的轴，其余继承 base：
+
+```yaml
+axes:                      # base 组。不写 groups: 时行为与以前逐字相同
+  corner: [typical]
+  temperature: ["-40.0", "55.0", "125.0"]
+  fullWave: [off]
+  equalCurrent: [on]
+
+groups:
+  - name: eqcur-off
+    axes: {temperature: ["55.0"], equalCurrent: [off]}
+  - name: fullwave
+    axes: {temperature: ["55.0"], fullWave: [on]}
+```
+
+为什么是这个形状：合并操作**代码早就有了且有测试**（`axes_for_design`），
+`axes_for_group` 是同一个函数换个主人，不引入任何新语义；而且它写得进 spec 文件、
+能 diff、能带注释，base 有多少根轴一个组永远只占两行。
+
+四条必须记住的语义：
+
+| | |
+|---|---|
+| base 组永远存在 | `BatchSpec.groups` / `BatchState.groups` 存的是 **base 之外**的那些组。base 的轴就是顶层 `axes:`，重复存一份必然漂移。`matrix._all_groups` 负责把 base 补在最前 |
+| slug 口径是全批次的 | 见上面第 6 条契约。`effective_axis_values` 在调用方没给 base 组时会自己补上那一层 |
+| 跨组重复静默去重 | 两个组都写了 55 度是很自然的写法。保留**第一个**（base 排最前 ⇒ 基线归 base），合并数从 `RunExpansion.merged` 拿。**同一个组内部**撞 `run_id` 仍然抛 `SpecError`（那是真 bug） |
+| `Run.group` 只是出身标签 | **不进 `run_id`**。进了就等于把去重取消掉：两个组算出同一组轴取值时会变成两个目录 |
+
+`spec.py` 侧：顶层 `groups:` 是一个 **list**（组是有序的，顺序决定谁被留下），
+每项 `{name, axes: {轴名: [取值…]}, label?}`。组名唯一且非空；`base` 是保留名 ——
+用户写 `name: base` 就是显式指 base 组，它的覆盖**合并进顶层 axes** 而不是新建一个组。
+`spec_to_mapping` / `save_spec` 会把 groups 原样写回去（GUI 的「Save spec as…」靠它）。
+
+轴还有一个可选键 **`value_flags:`**（`{取值: {flag: 值}}`）：只在「按取值名重新翻译会得到
+**不同的** flag」时才由 `spec_to_mapping` 写出来，人手写 spec 基本用不到。存在的理由是
+界面自造的两根轴 —— 三段网格 `0.4/0.5/0.4`（`-e`/`-d`/`--viaMergeSpace` 三个值互不相同）
+和频率扫描（`--multiSweep=<串>` 外加两个 `False` 抵消互斥写法）—— 光靠取值字符串
+**翻不回来**。不写的话存盘再打开得到的是另一组 flag，而 `axes_slug` 一个字都不变
+⇒ 归档里那份结果声称自己跑的是它根本没跑的设定（2026-08-19 实测）。
+判据是**语义**相等（`{value}` 占位符先代入再比），不是逐字相等 —— 逐字比会让每根界面造的轴
+都写 `value_flags`，而写了它的轴就不能再现造新取值了。
+
+`core.layout.state_to_dict` / `state_from_dict` **已经**序列化 `BatchState.groups`
+和 `Run.group`（2026-08-19 补上，缺口关闭）。两个字段都按**可选**读，
+`SCHEMA_VERSION` **没有** +1：老的 `batch.json` 里没有这两个键，读回来落
+「整批只有 base」，与加组之前逐字相同（双向兼容，判断依据写在 `model.SCHEMA_VERSION`
+的 docstring 里）。`runs.csv` 也**追加**了最后一列 `group` —— 追加在末尾，
+按列名读的下游一个字都不用改。
+
+⚠️ **`BatchState.axes` 存的是「全批次并集」，不是顶层 `axes:` 那份。**
+`PlanContext.axes` 就是从这里来的，而 `core.cmd.build_flag_layers` 拿
+`run.axis_values[轴名]` 去**轴的取值表里查** flag。只存 base 那份的话，任何一个组独有的
+取值（`equalCurrent: [off]`）都查不到 ⇒ `resolve_axis_flags` 抛
+"axis 'equalCurrent' has no value 'off'"，CLI / GUI / 红区 dry-run 三条路一起废。
+所以 `spec_to_batch` 存进去之前先过一遍 `matrix._batch_axes`（= 每根轴取
+`effective_axis_values` 的并集）。**展开**用的仍然是 base 轴 + `groups`，两者不能混：
+拿并集去展开就等于让基线也扫一遍别的组的取值。
 
 ---
 
@@ -145,16 +228,37 @@ def slugify(text: str) -> str:
     # 把任意取值变成能当目录名的片段。
 def ewave_dir_name(corner: str, temperature: str) -> str:
     # 拼 eWave 自己会建的那层目录名：`<corner>_<temp 的小数点换下划线>`。
-def varying_axes(axes: Sequence[Axis], *, designs: Sequence[Design] = ()) -> list[Axis]:
-    # 挑出**真正在变**的轴（取值 > 1 个的）。
+def varying_axes(axes: Sequence[Axis], *, designs: Sequence[Design] = (), groups: Sequence[RunGroup] = ()) -> list[Axis]:
+    # 挑出**真正在变**的轴（取值 > 1 个的）。口径必须是**全批次**：designs 的覆盖和
+    # groups 的覆盖都要并进来，漏一层就会让某根在变的轴不进 slug ⇒ 两个 run 撞 run_id。
 def compute_axes_slug(axis_values: Mapping[str, str], axes: Sequence[Axis]) -> str:
     # 算 `<axes-slug>` —— 只含 `encoded_in_ewave_dir=False` 且**在变**的轴。
 def axes_for_design(design: Design, axes: Sequence[Axis]) -> list[Axis]:
     # 把 `design.axis_overrides` 套到全局轴定义上，返回这个 design 实际要扫的轴。
+def axes_for_group(group: RunGroup, axes: Sequence[Axis]) -> list[Axis]:
+    # 同构：把 `group.axis_overrides` 套到 base 轴上。未知轴名 → `SpecError`。
 def builtin_axis_catalog() -> dict[str, Axis]:
     # 内置轴目录：轴名 → `Axis`（取值列表为**该轴的合法取值样例**，实际取值由 spec 给）。
-def expand_runs(designs: Sequence[Design], axes: Sequence[Axis], *, options: BatchOptions | None = None) -> list[Run]:
+def expand_runs(designs: Sequence[Design], axes: Sequence[Axis], *, options: BatchOptions | None = None, groups: Sequence[RunGroup] = ()) -> list[Run]:
     # 展开笛卡尔积 → `list[Run]`，每个 Run 带好 `run_id` / `axes_slug` / `ewave_dir`。
+    # `groups=()` 与加这个参数之前**逐字相同**。
+def expand_runs_detailed(designs: Sequence[Design], axes: Sequence[Axis], *, options: BatchOptions | None = None, groups: Sequence[RunGroup] = ()) -> RunExpansion:
+    # 同上，外加「跨组折叠了几个」`merged` 和每组各贡献几个 `per_group`。
+    # `expand_runs` 是它的薄封装。界面显示 "5 runs (1 duplicate merged)" 靠它。
+    # 展开顺序：**组在最外**，然后 design，最后轴。组排最外是因为「跨组重复留第一个」
+    # 要求 base 组必须是那个第一个 —— 基线归 base，才对得上「加组不改变基线归属」。
+def axis_with_values(axis: Axis, values: Sequence[str]) -> Axis:
+    # 把一根轴的取值换成 `values`，其余定义（flag / kind / slug 模板）原样保留。
+    # `core.spec` 和 `axes_for_group` 都靠它把「spec/组里写的取值」套到内置轴上。
+    # ⚠️ 取值不在轴的取值表里时**只有**在这根轴每个取值的 flag 写法完全一致
+    # （都是 `{"--temperature": "{value}"}` 这种带占位符的模板）时才敢现造 —— 造不出来就报错。
+    # 后果见「还没冻结的东西」里 `gui.state` 那条：界面自造的 mesh 轴取值带的是具体 flag、
+    # 没有占位符 ⇒ 组换一个 mesh 写法翻不出来，得由调用方自己把取值表加宽。
+def effective_axis_values(axis: Axis, designs: Sequence[Design] = (), groups: Sequence[RunGroup] = ()) -> list[str]:
+    # 这根轴在**整个批次**上实际会取到的取值（去重、保序）—— `varying_axes` 的口径就是它。
+    # designs 与 groups 的覆盖都要并进来（第 6 条契约）。
+    # ⚠️ 调用方没在 `groups` 里给 base 组时，它**自己补上那一层** —— 漏了 base 的取值
+    # 就会把"只有某个组覆盖过的轴"误判成不在变，于是静默覆盖。
 ```
 
 ### `ewave_batch.core.spec` — P1
@@ -170,8 +274,54 @@ def spec_sha256(path: str) -> str:
     # spec 文件的 sha256（十六进制小写）。进 `Provenance.spec_sha256`，
 def spec_to_batch(spec: BatchSpec, *, batch_root: str, tool_version: str = ) -> BatchState:
     # `BatchSpec` → 全新的 `BatchState`（run 全是 `READY`，还没建目录）。
-EXAMPLE_SPEC   # 见 model.py / 下表
+    # groups 走两条路：传给 `expand_runs`（所以组会真的展开成 run），
+    # 并原样存进 `BatchState.groups`（所以 resume / 存盘看得见批次当初是怎么组的）。
+def spec_to_mapping(spec: BatchSpec) -> dict:
+    # `parse_spec_mapping` 的反函数，GUI「Save spec as…」的落笔处。
+    # **只写非默认字段**（spec 是给人读、给人改的）；往返必须是不动点。
+    # 顶层 `groups:` 在这里原样写回去 —— 没有它，界面上配好的组一存盘就没了。
+def dump_spec(spec: BatchSpec, *, as_json: bool | None = None) -> str:
+    # `BatchSpec` → 写进文件的文本。有 PyYAML 出 YAML，没有出 JSON（字段名完全一样）。
+def save_spec(spec: BatchSpec, path: str) -> str:
+    # 原子写（同目录临时文件 + `os.replace`），**返回真正写到的路径** ——
+    # `load_spec` 按扩展名挑解析器，没有 PyYAML 时内容是 JSON，扩展名必须跟着改，
+    # 否则"自己写的文件自己打不开"。
+def have_yaml() -> bool:
+    # 这台机器能不能写/读 YAML。惰性探测，不在 import 时就依赖 PyYAML。
+EXAMPLE_SPEC   # 见 model.py / 下表；与 `docs/spec_example.yaml` **逐字相同**，测试盯着这条
 ```
+
+顶层 `groups:` 是一个 **list**（组有序，顺序决定跨组重复时谁被留下 —— 而 YAML 的 mapping
+在旧解析器上不保证顺序，写成 mapping 的话去重结果会跟着抖）。
+每项恰好三个键：`{name, axes, label}`，**多一个键就报错** ——
+这条顺带把「组不许覆盖 defaults / extra_flags」钉死在解析层（理由见 BRIEF §11）。
+
+四种情况抛 `SpecError`：
+
+| 情况 | 为什么不能放过 |
+|---|---|
+| 组名为空 | 组名会出现在 Runs 表和每一条关于这个组的消息里 |
+| 组名重复 | 后一个会静默盖掉前一个 |
+| `axes:` 里出现未知轴名 | 消息里列出这个批次到底有哪些轴（写错轴名和"这根轴没定义"长得一样）|
+| **空 delta**（什么都不覆盖的组）| 它展开出来的 run 与 base 逐个相同 ⇒ 全部被跨组去重吃掉 ⇒ 用户看到"加了个组但 run 数没变"，是最难自查的一类静默无效 |
+
+`base` 是**保留名**但**不是错误**：写 `name: base` 就是显式指顶层 `axes:` 那一组，
+它的覆盖生效在 base 身上，**不新建第二个组**（新建的话批次里会有两个 base，
+展开结果一模一样、只是组名不同，跨组去重把后者整组吃掉，看着就像"这条没生效"）。
+也正因如此，空 delta 那条对 `name: base` 网开一面。
+
+落地上分两种情况（2026-08-19 实测后定的）：
+
+| spec 里的形状 | `parse_spec_mapping` 怎么处理 |
+|---|---|
+| 只有 `name: base` 这一条组 | 覆盖**并进顶层 `axes:`**，`BatchSpec.groups` 保持空 |
+| 还有别的组 | **顶层 `axes:` 一个字不动**（它是全批次的轴**定义**），`base` 留在 `groups` 里当第一条（`matrix._all_groups` 支持显式 base），同时把 base 的取值**下放**给每一个没自己覆盖这根轴的组 |
+
+第二种情况为什么不能也收窄：GUI 的「Save spec as…」写出来的顶层 `axes:` 是**全批次并集**
+（某个组用了一个界面自造的取值 —— 三段网格 `0.4/0.5/0.4` 之类 —— 那个取值只在这里有定义）。
+收窄之后它从定义里消失，读回来就是 `SpecError: Axis 'mesh' does not know the value ...`，
+而这份文件正是本工具自己写出去的。「下放给兄弟组」那一步同样不能省：不下放的话那些组会继承
+**宽定义**，替别人多扫一遍它从没要过的取值（`gui.state._axes_and_groups` 里有一模一样的一段）。
 
 ### `ewave_batch.core.cmd` — P1
 
@@ -552,11 +702,36 @@ def tick(self) -> TickReport | None: ...
 | `gui.app.LAYOUTS` | P5 | `("stacked", "tabbed", "split")`，默认 `split` |
 | `gui.frames.*.LAYOUT_NAME` | P5 | 该模块自己的布局名 |
 
-`gui/frames/*.py` 的三条硬要求：
+`gui/frames/*.py` 的四条硬要求：
 1. `build_frame(parent, bridge)` 返回该版布局的根 widget，**只通过 `bridge`
    （`model.GuiBridgeProtocol`）跟核心说话**，frame 里不许有业务逻辑；
 2. **模块顶层不许建 `Tk()`**、不许在 import 时碰 `$DISPLAY`；
 3. `EWB_SMOKE=1 python -m gui.frames.<v>` 要能 headless 建完就退（`check.sh` 第 5 步跑它）。
+4. 三版暴露**同一组** `SECTIONS`（顺序也一致）。这是「三个 agent 各写各的、界面手感不一致」
+   唯一的机器判据（`tests/test_gui_frames.py`）。
+
+`SECTIONS` 现在是 **9 个**（2026-08-19 从 8 个加到 9 个，D14）：
+
+```python
+("batchbar", "designs", "groups", "settings", "resources", "runs", "detail", "actionbar", "statusbar")
+```
+
+新加的是 `groups`（Run groups 面板），位置在 `designs` 和 `settings` **之间** ——
+它管的正是「哪些 design 跟哪些设定相乘」，摆在这两者中间才读得通。
+名字对应共用层的 `build_<section>`；前八个与 `mockups/_ui.py` 的 `build_*` 一一对上，
+`groups` 是草图之后加的，`mockups/` 里没有对应物 —— 草图是当初的设计成果、**不回改**
+（拿它当 fixture 的价值正是"人写的、不跟着实现动"）。
+
+⚠️ 改 `SECTIONS` 要**同一个 commit 改四处**：三版 `gui/frames/*.py`，
+加上 `tests/test_gui_frames.py` 里手抄的 `EXPECTED_SECTIONS`（旁边还有写死条数的断言）。
+只改三版 frame 的话，闸门会**红在测试文件上而不是红在实现上** —— 2026-08-19 真发生过一次，
+一眼看去像"实现写错了"，实际上实现是对的。`SECTIONS` 不在冻结面上、self-test 管不着它，
+所以这条纪律只能靠这段文档 + 那条一致性测试兜住。
+
+还有一处容易被顺手删掉：`test_gui_frames.py` 拿 `mockups/_ui.py` 的 `build_*`
+**反查**期望值（"人写的 fixture 不跟着实现动"才有价值）。`groups` 是草图之后加的，
+草图里没有它 ⇒ 那条反查里**显式豁免了它一件**。别把豁免连同断言一起删掉：
+剩下八件仍然必须与草图一个不多一个不少。
 
 ---
 
@@ -589,6 +764,43 @@ def tick(self) -> TickReport | None: ...
 
 ## 还没冻结的东西（有意留白）
 
+* **`gui.state.GuiState` 的 run group 编辑面** —— 15 个方法，**都不在冻结面上**，
+  冻的只有 `GuiBridgeProtocol` 里那几个。留白的理由：这一面是给 `gui/_ui.py`
+  一个消费者用的，冻了等于把界面的形状也冻住，而界面还在改。
+
+  | 方法 | 干什么 |
+  |---|---|
+  | `groups() -> tuple[RunGroup, ...]` | 全部组，**第一个恒为 base**（`name == BASE_GROUP`）|
+  | `active_group() -> str` / `set_active_group(name)` | 当前在编辑哪个组，默认 base |
+  | `add_group(name="") -> str` / `duplicate_group(name) -> str` | 建组 / 复制一个组（含 base）；**返回实际用的名字**（重名自动加后缀）|
+  | `remove_group(name)` / `rename_group(old, new)` | base 不可删 |
+  | `group_override(axis, group="") -> tuple[str, ...] \| None` | **`None` = 这根轴继承 base**；`group` 省略 = active group |
+  | `set_group_override(axis, values, group="")` / `clear_group_override(axis, group="")` | 写 / 撤销这一层覆盖 |
+  | `group_run_counts() -> list[tuple[str, int]]` | `[(组名, 去重后的 run 数), …]` |
+  | `merged_run_count() -> int` | 跨组折叠掉几个（界面写 "5 runs (1 duplicate merged)"）|
+  | `group_summary(name) -> str` | 一行摘要，例 `+ 55.0, eqI off`；base 组给全量摘要 |
+  | `group_of(run_id) -> str` | 这个 run 出自哪个组（Runs 表的 Group 列）|
+  | `groups_change_warning() -> str` | 批次已经跑过时给出那句「加组会改掉基线目录名、resume 认不出老目录」；**没什么好警告的返回空串** |
+
+  三条关键约定（写错了界面就会说谎）：
+
+  1. **`set_axis_values()` / `axis_selection()` / `axis_counts()` 作用于 active group。**
+     active = base 时与加组之前**逐字相同**；active = 别的组时 `set_axis_values` 写该组的覆盖，
+     而 `axis_selection` 返回**合并后的有效值**（继承的轴给 base 的值）——
+     "这根轴到底是继承还是覆盖"由 `group_override()` 单独回答。
+     这样切组时 `_ui.py` 的 `push()` 几乎不用改。
+  2. **`run_count()` / `formula()` 数的是跨组去重之后的数**，必须与 `plan()` 真正建出来的条数一致
+     —— 两个数不一致的话，界面上那个数就是谎话。`formula()` 只有 base 一个组时保持
+     `2 designs x 1 corner x 3 temp x 2 mode = 12 runs` 的连乘写法（最常见的场景不该因为
+     多了一个功能而变难懂），有组时改成 `2 designs x (3 + 1 + 1) = 10 runs`。
+  3. ⚠️ **界面自造的轴取值（mesh / freq）带的是具体 flag、没有 `{value}` 占位符**，
+     `matrix.axis_with_values` 翻不出组里写的新取值。`GuiState` 只在这种情况下把该轴的取值表
+     加宽成并集，并塞一条**显式的 base 组**把基线的取值锁回去
+     （`matrix._all_groups` 明确支持调用方自己给 base 组）。没有组时这条路径完全不触发。
+     契约里原本没写这一层，是照代码实测补上的。
+* **`gui.frames.*.SECTIONS`** —— 三版必须一致（`tests/test_gui_frames.py` 盯着），
+  但**不在冻结面上**：冻的只有 `LAYOUT_NAME` / `build_frame` / `main`。
+  内容和改它的纪律见上面「四条硬要求」。
 * `analyze/`（v2 接 SNP_RLC_Extractor 做批量对比）—— 本夜不做。
 * `sched.fake` / `sched.donau` 各自的构造参数：只冻了它们必须满足的 Protocol，
   怎么注入假输出由 P3 自己定。

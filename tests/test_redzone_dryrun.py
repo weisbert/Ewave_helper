@@ -835,7 +835,7 @@ class Cli(unittest.TestCase):
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             code = rz.main(["--offdir", os.path.join(tmp, "nope")])
         self.assertEqual(code, rz.EXIT_ERROR)
-        self.assertIn("下一步", err.getvalue())
+        self.assertIn("Next", err.getvalue())
 
     def test_limit_truncates_the_detailed_listing(self) -> None:
         """`--limit N` 只影响详细打印，run 的条数不变（截断的那些仍然列 id 和落点）。"""

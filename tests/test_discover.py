@@ -546,7 +546,7 @@ class PtxtCornerFilter(unittest.TestCase):
 
         with self.assertRaises(DiscoveryError) as caught:
             discover.ptxt_path_for_corner(SiteFacts(ptxt=EXP_PTXT), "cworst")
-        self.assertIn("下一步", str(caught.exception))
+        self.assertIn("Next", str(caught.exception))
 
     def test_template_without_placeholder_is_refused(self) -> None:
         """手工拼的 SiteFacts 里模板没有 `{corner}` → 同样拒绝（那会静默返回不变的路径）。"""
@@ -755,14 +755,14 @@ class DiscoveryErrors(unittest.TestCase):
         with self.assertRaises(DiscoveryError) as caught:
             discover.discover_site_facts("")
         message = str(caught.exception)
-        self.assertIn("下一步", message)
+        self.assertIn("Next", message)
         self.assertIn("gdsout_setup", message)
 
     def test_missing_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(DiscoveryError) as caught:
                 discover.discover_site_facts(os.path.join(tmp, "nope"))
-            self.assertIn("下一步", str(caught.exception))
+            self.assertIn("Next", str(caught.exception))
 
     def test_directory_without_gdsout_setup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -770,7 +770,7 @@ class DiscoveryErrors(unittest.TestCase):
                 discover.discover_site_facts(tmp)
             message = str(caught.exception)
             self.assertIn("gdsout_setup", message)
-            self.assertIn("下一步", message)
+            self.assertIn("Next", message)
 
     def test_error_lists_nearby_candidates(self) -> None:
         """报错时顺手把附近的候选列出来 —— 让机器找，别让人手打长路径。"""

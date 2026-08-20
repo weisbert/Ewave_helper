@@ -242,8 +242,8 @@ class Driver:
     ) -> None:
         if not state.batch_dir:
             raise StateError(
-                "BatchState.batch_dir 是空的 —— 不知道批次落在哪，"
-                "batch.json / runs/ / sparam/ 全都无处可写"
+                "BatchState.batch_dir is empty - no idea where the batch lands, so "
+                "batch.json / runs/ / sparam/ have nowhere to go"
             )
         self._state = state
         self._contexts: dict[str, PlanContext] = dict(contexts)
@@ -270,10 +270,10 @@ class Driver:
         )
         if missing:
             raise SpecError(
-                "contexts 里少了这些 design 的 PlanContext: "
+                "contexts is missing the PlanContext of these designs: "
                 + ", ".join(missing)
-                + "。坐标是 per-design 解析的（每个 design 有自己的官方 run 目录），"
-                "少一个就没法给它拼命令 —— 宁可现在炸，也别跑到一半才发现"
+                + ". Site coordinates are resolved per design (each design has its own official run "
+                "dir), so without one we cannot build its command - better to fail now than halfway through"
             )
 
         self._ensure_streamout_tasks()
@@ -295,7 +295,7 @@ class Driver:
                         design_key=key,
                         status=RunStatus.DONE,
                         gds_path=design.gds_path,
-                        message="spec 里直接给了 gds_path，阶段 1 不用跑",
+                        message="the spec gave gds_path directly, stage 1 is not needed",
                     )
                 )
             else:
@@ -344,13 +344,14 @@ class Driver:
             self._note(
                 events,
                 EventKind.WARNING,
-                f"tick 内部出错（这一拍没推进，下一拍会再试）: {exc.__class__.__name__}: {exc}",
+                f"tick failed internally (this beat made no progress, the next one retries): "
+                f"{exc.__class__.__name__}: {exc}",
             )
         if changed and not self._state.options.dry_run:
             try:
                 self._persist()
             except Exception as exc:  # noqa: BLE001 - 落盘失败不许把批次带走
-                self._note(events, EventKind.WARNING, f"写 batch.json / runs.csv 失败: {exc}")
+                self._note(events, EventKind.WARNING, f"writing batch.json / runs.csv failed: {exc}")
         return TickReport(
             changed=changed,
             finished=self._finished(),
@@ -373,33 +374,33 @@ class Driver:
             try:
                 self._scheduler.cancel(run.job)
             except Exception as exc:  # noqa: BLE001 - 取消失败也要把状态记下来
-                self._emit(EventKind.WARNING, f"取消 job {run.job.job_id} 失败: {exc}", run=run)
+                self._emit(EventKind.WARNING, f"cancelling job {run.job.job_id} failed: {exc}", run=run)
             run.status = RunStatus.FAILED
             run.ended_at = run.job.ended_at or _utcnow()
             run.message = _clip(
-                f"用户取消（job {run.job.job_id}）。RunStatus 没有 cancelled 态，"
-                "取消的 run 记成 failed —— resume 会把它补上"
+                f"cancelled by the user (job {run.job.job_id}). RunStatus has no cancelled state, "
+                "so a cancelled run is recorded as failed - resume will pick it up again"
             )
             self._emit(EventKind.FAILED, run.message, run=run)
             changed = True
         for run in self._state.runs:
             if run.status is RunStatus.READY:
                 run.status = RunStatus.SKIPPED
-                run.message = _clip("批次已取消，这个 run 没提交过")
+                run.message = _clip("the batch was cancelled, this run was never submitted")
                 self._emit(EventKind.SKIPPED, run.message, run=run)
                 changed = True
         for task in self._state.streamout:
             # 阶段 1 还没跑的也要收尾，否则 `_finished()` 永远是 False、批次挂着不动。
             if task.status not in _TERMINAL_RUN_STATUSES:
                 task.status = RunStatus.SKIPPED
-                task.message = _clip("批次已取消，阶段 1 没跑")
+                task.message = _clip("the batch was cancelled, stage 1 never ran")
                 self._emit(EventKind.SKIPPED, task.message, design_key=task.design_key)
                 changed = True
         if changed and not self._state.options.dry_run:
             try:
                 self._persist()
             except Exception as exc:  # noqa: BLE001
-                self._emit(EventKind.WARNING, f"取消之后落盘失败: {exc}")
+                self._emit(EventKind.WARNING, f"persisting after cancel failed: {exc}")
 
     # ---- 一拍的主体 -----------------------------------------------------
 
@@ -434,7 +435,7 @@ class Driver:
                 self._note(
                     events,
                     EventKind.WARNING,
-                    f"阶段 1 拼不出命令: {exc}",
+                    f"stage 1 cannot build its command: {exc}",
                     design_key=design_key,
                 )
                 continue
@@ -442,7 +443,7 @@ class Driver:
             self._note(
                 events,
                 EventKind.PLANNED,
-                "阶段 1: " + " ".join(plan.argv),
+                "stage 1: " + " ".join(plan.argv),
                 design_key=design_key,
             )
         for run in self._state.runs:
@@ -450,11 +451,11 @@ class Driver:
                 plan = self._plan_for(run)
             except EwaveBatchError as exc:
                 run.status = RunStatus.FAILED
-                run.message = _clip(f"拼命令失败: {exc}")
+                run.message = _clip(f"building the command failed: {exc}")
                 self._note(events, EventKind.FAILED, run.message, run=run)
                 continue
             run.argv = tuple(plan.argv)
-            self._note(events, EventKind.PLANNED, "阶段 2: " + " ".join(plan.argv), run=run)
+            self._note(events, EventKind.PLANNED, "stage 2: " + " ".join(plan.argv), run=run)
         self._dry_run_done = True
         return True
 
@@ -471,7 +472,7 @@ class Driver:
         try:
             updated = self._scheduler.poll([run.job for run in in_flight if run.job is not None])
         except Exception as exc:  # noqa: BLE001 - 查不到状态不等于 job 挂了
-            self._note(events, EventKind.WARNING, f"轮询失败（下一拍再试）: {exc}")
+            self._note(events, EventKind.WARNING, f"polling failed (retry next beat): {exc}")
             return False
 
         changed = False
@@ -494,7 +495,7 @@ class Driver:
                 run.status = mapped
                 if mapped is RunStatus.RUNNING:
                     run.started_at = (run.job.started_at if run.job else "") or _utcnow()
-                    self._note(events, EventKind.STARTED, f"job {run.job.job_id} 开跑", run=run)
+                    self._note(events, EventKind.STARTED, f"job {run.job.job_id} started", run=run)
                 changed = True
         return changed
 
@@ -510,7 +511,8 @@ class Driver:
             self._note(
                 events,
                 EventKind.INFO,
-                f"调度器连着 {seen} 拍查不到 job {job_id}，但产物验过了 —— 判 done",
+                f"the scheduler could not find job {job_id} for {seen} beats in a row, "
+                "but the outputs verify - calling it done",
                 run=run,
             )
             self._finish_run(run, events, verdict=verdict)
@@ -518,7 +520,8 @@ class Driver:
         run.status = RunStatus.FAILED
         run.ended_at = run.ended_at or _utcnow()
         run.message = _clip(
-            f"调度器连着 {seen} 拍都查不到 job {job_id}，产物也验不过："
+            f"the scheduler could not find job {job_id} for {seen} beats in a row, "
+            "and the outputs do not verify either: "
             + _MESSAGE_SEP.join(verdict.reasons)
         )
         self._note(events, EventKind.FAILED, run.message, run=run)
@@ -541,15 +544,15 @@ class Driver:
 
         if not report.ok:
             run.status = RunStatus.FAILED
-            detail = _MESSAGE_SEP.join(report.reasons) or "产物验收没过（没有给出原因）"
+            detail = _MESSAGE_SEP.join(report.reasons) or "output verification failed (no reason given)"
             code = job.exit_code if job is not None else None
             if code == 0:
                 detail += (
-                    "。⚠️ 这个 job 的退出码是 0 —— 退出码不可信，"
-                    "判据是产物（BRIEF §10 实测）"
+                    ". NOTE: this job's exit code is 0 - the exit code cannot be trusted, "
+                    "the outputs are the criterion (BRIEF sec. 10, measured)"
                 )
             elif code is not None:
-                detail += f"。job 退出码 = {code}"
+                detail += f". job exit code = {code}"
             run.message = _clip(detail)
             self._note(events, EventKind.FAILED, run.message, run=run)
             return
@@ -567,14 +570,15 @@ class Driver:
             self._note(
                 events,
                 EventKind.WARNING,
-                f"产物验过了，但 job 退出码是 {code} —— 按 §12 以产物为准，记一笔备查",
+                f"the outputs verify, but the job exit code is {code} - per sec. 12 the outputs win; "
+                "noting it for the record",
                 run=run,
             )
         self._note(
             events,
             EventKind.FINISHED,
-            f"验收通过：{len(report.sparam_files)} 份参数文件 / {report.total_bytes} 字节"
-            + (f" / {report.port_count} 端口" if report.port_count else ""),
+            f"verified: {len(report.sparam_files)} parameter files / {report.total_bytes} bytes"
+            + (f" / {report.port_count} ports" if report.port_count else ""),
             run=run,
         )
         self._archive(run, events)
@@ -595,21 +599,26 @@ class Driver:
                 keep_logs_on_failure=options.keep_logs_on_failure,
             )
         except Exception as exc:  # noqa: BLE001 - 归档失败不许把已经验过的产物判死
-            self._note(events, EventKind.WARNING, f"归档失败（产物仍在 run 目录里）: {exc}", run=run)
+            self._note(
+                events,
+                EventKind.WARNING,
+                f"archiving failed (the outputs are still in the run dir): {exc}",
+                run=run,
+            )
             return
         if report.errors:
             self._note(
                 events,
                 EventKind.WARNING,
-                "归档有问题: " + _MESSAGE_SEP.join(report.errors),
+                "archiving had problems: " + _MESSAGE_SEP.join(report.errors),
                 run=run,
             )
         run.artifacts = self._flat_artifacts(paths)
         self._note(
             events,
             EventKind.ARCHIVED,
-            f"归档：留 {len(report.kept)} 个 / 删 {len(report.removed)} 个 / "
-            f"释放 {report.bytes_freed} 字节 / 扁平区 {len(run.artifacts)} 份",
+            f"archived: kept {len(report.kept)} / removed {len(report.removed)} / "
+            f"freed {report.bytes_freed} bytes / {len(run.artifacts)} in the flat area",
             run=run,
         )
 
@@ -667,7 +676,7 @@ class Driver:
         runs = [run for run in self._state.runs if run.design_key == design_key]
         if not runs:
             raise SpecError(
-                f"design {design_key!r} 一个 run 都没有 —— 阶段 1 导出来的 GDS 没人用"
+                f"design {design_key!r} has not a single run - nobody would use the GDS stage 1 exports"
             )
         paths = self._paths_for(runs[0])
         fields = _strmout.gdsout_fields_for_design(design, ctx, gds_path=paths.design_gds)
@@ -683,13 +692,13 @@ class Driver:
         if design.gds_path:
             task.status = RunStatus.DONE
             task.gds_path = design.gds_path
-            task.message = "spec 里直接给了 gds_path，阶段 1 不用跑"
+            task.message = "the spec gave gds_path directly, stage 1 is not needed"
             self._note(events, EventKind.INFO, task.message, design_key=design_key)
             return
         try:
             plan, rendered, paths = self._streamout_plan(design)
         except EwaveBatchError as exc:
-            self._fail_streamout(task, events, f"阶段 1 拼不出命令: {exc}")
+            self._fail_streamout(task, events, f"stage 1 cannot build its command: {exc}")
             return
 
         try:
@@ -697,7 +706,7 @@ class Driver:
             _write_text(paths.design_gdsout, rendered)
             self._write_cds_lib(design, plan, events)
         except (OSError, EwaveBatchError) as exc:
-            self._fail_streamout(task, events, f"阶段 1 准备落点失败: {exc}")
+            self._fail_streamout(task, events, f"stage 1 failed to prepare its target dirs: {exc}")
             return
 
         task.gdsout_setup_path = paths.design_gdsout
@@ -707,7 +716,7 @@ class Driver:
         task.status = RunStatus.RUNNING
         task.started_at = _utcnow()
         self._note(
-            events, EventKind.STARTED, "阶段 1: " + " ".join(plan.argv), design_key=design_key
+            events, EventKind.STARTED, "stage 1: " + " ".join(plan.argv), design_key=design_key
         )
 
         try:
@@ -718,11 +727,11 @@ class Driver:
                 timeout=self._state.options.timeout_seconds,
             )
         except ToolMissingError as exc:
-            self._fail_streamout(task, events, f"strmout 跑不起来: {exc}")
+            self._fail_streamout(task, events, f"strmout cannot be started: {exc}")
             return
         except Exception as exc:  # noqa: BLE001 - runner 是注入进来的别人的代码
             self._fail_streamout(
-                task, events, f"strmout 跑不起来: {exc.__class__.__name__}: {exc}"
+                task, events, f"strmout cannot be started: {exc.__class__.__name__}: {exc}"
             )
             return
         task.ended_at = _utcnow()
@@ -732,20 +741,20 @@ class Driver:
         size = os.path.getsize(gds) if os.path.isfile(gds) else -1
         if size <= 0:
             # 与阶段 2 同一条判据：**产物说了算**。
-            why = "GDS 根本没生成" if size < 0 else "GDS 是 0 字节"
+            why = "the GDS was never produced" if size < 0 else "the GDS is 0 bytes"
             self._fail_streamout(
                 task,
                 events,
-                f"阶段 1 失败：{why}（{gds}），strmout 退出码 = {result.returncode}"
-                + ("，而且超时了" if result.timed_out else ""),
+                f"stage 1 failed: {why} ({gds}), strmout exit code = {result.returncode}"
+                + (", and it timed out" if result.timed_out else ""),
             )
             return
         if result.returncode != 0:
             self._note(
                 events,
                 EventKind.WARNING,
-                f"strmout 退出码是 {result.returncode}，但 GDS 是有的（{size} 字节）"
-                " —— 按「产物说了算」继续，记一笔备查",
+                f"strmout exit code is {result.returncode}, but the GDS is there ({size} bytes)"
+                " - continuing on the 'outputs decide' rule; noting it for the record",
                 design_key=design_key,
             )
         task.status = RunStatus.DONE
@@ -753,7 +762,7 @@ class Driver:
         self._note(
             events,
             EventKind.FINISHED,
-            f"阶段 1 完成：{gds}（{size} 字节），整个设定矩阵共用它（D1a）",
+            f"stage 1 done: {gds} ({size} bytes), shared by the whole settings matrix (D1a)",
             design_key=design_key,
         )
 
@@ -768,7 +777,7 @@ class Driver:
             _write_text(task.log_path, body)
         except OSError:
             # 日志写不出来不该把阶段 1 判死 —— 产物才是判据。
-            task.message = _clip((task.message + " ").strip() + "（阶段 1 的日志没写出来）")
+            task.message = _clip((task.message + " ").strip() + "(the stage 1 log was not written)")
 
     def _write_cds_lib(self, design: Design, plan: CommandPlan, events: list[DriverEvent]) -> None:
         """在 `cdswork/` 里放一行 `INCLUDE <找到的>/cds.lib`（BRIEF §10 step1 实测可行）。
@@ -791,9 +800,9 @@ class Driver:
                 self._note(
                     events,
                     EventKind.WARNING,
-                    f"没在官方 run 目录往上 {_CDS_LIB_SEARCH_UP} 层里找到 {_CDS_LIB_NAME}"
-                    f"（起点: {start or '<空>'}）—— {_CDS_LIB_NAME} 没写，"
-                    "strmout 可能看不见目标 library",
+                    f"no {_CDS_LIB_NAME} found within {_CDS_LIB_SEARCH_UP} levels above the official "
+                    f"run dir (start: {start or '<empty>'}) - {_CDS_LIB_NAME} was not written, "
+                    "so strmout may not see the target library",
                     design_key=design_key,
                 )
             return
@@ -809,8 +818,8 @@ class Driver:
             self._note(
                 events,
                 EventKind.WARNING,
-                "stop_design_on_streamout_failure=False —— 阶段 1 挂了仍然照提交阶段 2，"
-                "那些 job 多半会失败在同一个原因上",
+                "stop_design_on_streamout_failure=False - stage 2 is submitted even though stage 1 "
+                "died; those jobs will most likely fail for the very same reason",
                 design_key=task.design_key,
             )
             return
@@ -819,14 +828,14 @@ class Driver:
             if run.design_key != task.design_key or run.status in _TERMINAL_RUN_STATUSES:
                 continue
             run.status = RunStatus.SKIPPED
-            run.message = _clip(f"阶段 1（strmout）失败，这一列不跑：{why}")
+            run.message = _clip(f"stage 1 (strmout) failed, this column is skipped: {why}")
             self._note(events, EventKind.SKIPPED, run.message, run=run)
             skipped += 1
         self._note(
             events,
             EventKind.INFO,
-            f"阶段 1 失败 ⇒ design {task.design_key} 名下 {skipped} 个组合全部 skipped，"
-            "一个 job 都不提交",
+            f"stage 1 failed => all {skipped} combinations under design {task.design_key} are "
+            "skipped, not one job is submitted",
             design_key=task.design_key,
         )
 
@@ -848,7 +857,8 @@ class Driver:
             if task is None:
                 run.status = RunStatus.SKIPPED
                 run.message = _clip(
-                    f"design {run.design_key!r} 不在 designs 列表里 —— 没有阶段 1 的账，也没有坐标"
+                    f"design {run.design_key!r} is not in the designs list - no stage 1 record, "
+                    "no site coordinates either"
                 )
                 self._note(events, EventKind.SKIPPED, run.message, run=run)
                 changed = True
@@ -876,7 +886,7 @@ class Driver:
             plan = self._plan_for(run)
         except Exception as exc:  # noqa: BLE001 - 拼不出命令只该让这一个 run 失败
             run.status = RunStatus.FAILED
-            run.message = _clip(f"拼命令失败: {exc.__class__.__name__}: {exc}")
+            run.message = _clip(f"building the command failed: {exc.__class__.__name__}: {exc}")
             self._note(events, EventKind.FAILED, run.message, run=run)
             return False
 
@@ -886,7 +896,7 @@ class Driver:
             layout.write_cmd_sh(paths, plan)
         except Exception as exc:  # noqa: BLE001
             run.status = RunStatus.FAILED
-            run.message = _clip(f"建落点 / 写 cmd.sh 失败: {exc}")
+            run.message = _clip(f"creating the target dirs / writing cmd.sh failed: {exc}")
             self._note(events, EventKind.FAILED, run.message, run=run)
             return False
 
@@ -895,9 +905,10 @@ class Driver:
             self._note(
                 events,
                 EventKind.INFO,
-                f"重跑前清掉上一次留下的 {len(removed)} 个文件 —— 端口数变了的时候新产物"
-                "不会覆盖旧的（.s3p 和 .s4p 是两个文件名），混在一起验收器会判"
-                "「端口数不一致」而永远好不了",
+                f"cleared {len(removed)} files left over from the previous attempt before rerunning - "
+                "when the port count changes the new output does not overwrite the old one "
+                "(.s3p and .s4p are two different file names), and the mixture makes the verifier "
+                "report 'port counts disagree' forever",
                 run=run,
             )
 
@@ -908,7 +919,7 @@ class Driver:
             job = self._scheduler.submit(plan, resources=resources, name=run.run_id)
         except Exception as exc:  # noqa: BLE001 - 调度器是注入进来的别人的代码
             run.status = RunStatus.FAILED
-            run.message = _clip(f"提交失败: {exc}")
+            run.message = _clip(f"submit failed: {exc}")
             self._note(events, EventKind.FAILED, run.message, run=run)
             return False
 
@@ -923,8 +934,8 @@ class Driver:
         self._note(
             events,
             EventKind.SUBMITTED,
-            f"job {job.job_id or '<无 id>'}（第 {run.attempts} 次提交；不自动重试，"
-            "失败停在 failed 由人按 resume）",
+            f"job {job.job_id or '<no id>'} (submit attempt {run.attempts}; no automatic retry, "
+            "a failure stops at failed and waits for a human to resume)",
             run=run,
         )
         return True
@@ -971,7 +982,7 @@ class Driver:
             return cached
         design = self._designs.get(run.design_key)
         if design is None:
-            raise SpecError(f"run {run.run_id!r} 的 design {run.design_key!r} 不在 designs 列表里")
+            raise SpecError(f"design {run.design_key!r} of run {run.run_id!r} is not in the designs list")
         paths = layout.compute_run_paths(self._state.batch_dir, design, run)
         run.work_dir = paths.run_dir
         self._paths[run.run_id] = paths
@@ -1103,14 +1114,14 @@ class Driver:
         self._note(
             events,
             EventKind.INFO,
-            "resume 核对完毕："
-            + "、".join(f"{key}={value}" for key, value in sorted(counts.items()) if value),
+            "resume reconciliation done: "
+            + ", ".join(f"{key}={value}" for key, value in sorted(counts.items()) if value),
         )
         if not self._state.options.dry_run:
             try:
                 self._persist()
             except Exception as exc:  # noqa: BLE001
-                self._note(events, EventKind.WARNING, f"resume 落盘失败: {exc}")
+                self._note(events, EventKind.WARNING, f"persisting during resume failed: {exc}")
 
     def _check_spec_hash(self, events: list[DriverEvent]) -> None:
         """spec 改过了就发一条 WARNING，**但照跑**（`model.resume_batch` 的原话）。"""
@@ -1127,9 +1138,9 @@ class Driver:
             self._note(
                 events,
                 EventKind.WARNING,
-                f"spec 变了（{prov.spec_path}）：批次记的 sha 是 {prov.spec_sha256[:12]}…，"
-                f"现在是 {current[:12]}… —— resume 用的是 batch.json 里冻住的那份设定，"
-                "不是新 spec。要用新设定就起一个新批次",
+                f"the spec changed ({prov.spec_path}): the batch recorded sha {prov.spec_sha256[:12]}..., "
+                f"now it is {current[:12]}... - resume uses the settings frozen in batch.json, "
+                "not the new spec. Start a new batch to use the new settings",
             )
 
     def _reconcile_streamout(self, task: StreamoutTask, events: list[DriverEvent]) -> None:
@@ -1141,7 +1152,8 @@ class Driver:
             self._note(
                 events,
                 EventKind.INFO,
-                f"阶段 1 记的是 done，但 GDS 不在或是 0 字节（{gds or '<没记路径>'}）—— 重跑阶段 1",
+                f"stage 1 was recorded as done, but the GDS is missing or 0 bytes "
+                f"({gds or '<no path recorded>'}) - rerunning stage 1",
                 design_key=task.design_key,
             )
             return
@@ -1157,12 +1169,12 @@ class Driver:
                 return
             run.status = RunStatus.FAILED
             run.message = _clip(
-                "batch.json 记的是 done，但磁盘上的产物验不过："
+                "batch.json says done, but the outputs on disk do not verify: "
                 + _MESSAGE_SEP.join(verdict.reasons)
-                + "。这次 resume 会重跑它"
+                + ". This resume will rerun it"
             )
             self._note(events, EventKind.WARNING, run.message, run=run)
-            self._requeue(run, events, "上一次记的 done 在磁盘上验不过")
+            self._requeue(run, events, "the done recorded last time does not verify on disk")
             return
 
         if run.status in _IN_FLIGHT_RUN_STATUSES and run.job is not None and run.job.job_id:
@@ -1174,14 +1186,15 @@ class Driver:
                 self._note(
                     events,
                     EventKind.INFO,
-                    f"上一次是 {run.status.value}：{run.message or '（没记原因）'} —— 重排",
+                    f"last time it was {run.status.value}: {run.message or '(no reason recorded)'} "
+                    "- requeueing",
                     run=run,
                 )
             self._requeue(run, events, "")
             return
 
         # pending/running 但没有 job id：上一次连提交都没成 ⇒ 当没跑过。
-        self._requeue(run, events, "上一次记的是在飞，却没有 job id —— 当它没提交过")
+        self._requeue(run, events, "recorded as in flight but with no job id - treating it as never submitted")
 
     def _reconcile_in_flight(self, run: Run, events: list[DriverEvent]) -> None:
         job = run.job
@@ -1189,7 +1202,9 @@ class Driver:
         try:
             updated = self._scheduler.poll([job])
         except Exception as exc:  # noqa: BLE001
-            self._note(events, EventKind.WARNING, f"resume 查 job {job.job_id} 失败: {exc}", run=run)
+            self._note(
+                events, EventKind.WARNING, f"resume could not query job {job.job_id}: {exc}", run=run
+            )
             return
         fresh = updated.get(job.job_id)
         state = JobState.UNKNOWN if fresh is None else fresh.state
@@ -1202,7 +1217,7 @@ class Driver:
             self._note(
                 events,
                 EventKind.INFO,
-                f"job {job.job_id} 还活着（{state.value}）—— 继续等，不重新提交",
+                f"job {job.job_id} is still alive ({state.value}) - keep waiting, do not resubmit",
                 run=run,
             )
             return
@@ -1210,7 +1225,8 @@ class Driver:
             self._note(
                 events,
                 EventKind.INFO,
-                f"job {job.job_id} 已经是 {state.value} —— 去验产物（终态不等于成功）",
+                f"job {job.job_id} is already {state.value} - verifying the outputs "
+                "(a terminal state is not success)",
                 run=run,
             )
             self._finish_run(run, events)
@@ -1221,12 +1237,15 @@ class Driver:
             self._note(
                 events,
                 EventKind.INFO,
-                f"调度器查不到 job {job.job_id}，但产物验过了 —— 判 done，不重跑",
+                f"the scheduler cannot find job {job.job_id}, but the outputs verify - "
+                "calling it done, no rerun",
                 run=run,
             )
             self._finish_run(run, events, verdict=verdict)
             return
-        self._requeue(run, events, f"调度器查不到 job {job.job_id}，产物也验不过")
+        self._requeue(
+            run, events, f"the scheduler cannot find job {job.job_id} and the outputs do not verify either"
+        )
 
     def _requeue(self, run: Run, events: list[DriverEvent], why: str) -> None:
         """把一个 run 放回 `ready`。**不清 `attempts`** —— 那是"人按过几次 resume"的账。"""
@@ -1283,7 +1302,7 @@ class SubprocessRunner:
         """
         items = [str(item) for item in argv]
         if not items:
-            raise ToolMissingError("argv 是空的 —— 没有可执行文件可以起")
+            raise ToolMissingError("argv is empty - there is no executable to start")
 
         merged = dict(os.environ)
         if env:
@@ -1315,8 +1334,9 @@ class SubprocessRunner:
             )
         except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
             raise ToolMissingError(
-                f"{items[0]}: 起不来（{exc.__class__.__name__}: {exc}）—— "
-                "工具绝对路径不写进源码，它来自 SiteFacts / PATH（硬约束 1b）"
+                f"{items[0]}: cannot be started ({exc.__class__.__name__}: {exc}) - "
+                "absolute tool paths never go into the source; this one comes from SiteFacts / PATH "
+                "(hard constraint 1b)"
             ) from exc
 
         out_lines: list[str] = []
@@ -1484,7 +1504,8 @@ def resume_batch(
         driver._note(
             events,
             EventKind.INFO,
-            f"batch.json 里记的 batch_dir 是 {state.batch_dir}，实际在 {root} —— 以后者为准",
+            f"batch.json records batch_dir as {state.batch_dir}, but it actually lives at {root} - "
+            "the latter wins",
         )
         state.batch_dir = root
     driver._reconcile(events)

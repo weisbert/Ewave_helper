@@ -336,8 +336,8 @@ def build_flag_layers(run: Run, ctx: PlanContext) -> FlagLayers:
             # 轴定义没了而 run 还带着它的取值 —— 这个 run 的身份就说不清了。
             # 静默忽略等于"目录名说 fw-on、命令行里没有 --fullWave"，正是要消灭的坑。
             raise SpecError(
-                f"run {run.run_id!r} 带着轴 {name!r}={value!r}，但 PlanContext.axes 里没有这根轴 —— "
-                "轴定义和 run 对不上，目录名会和实际跑的命令说两套话"
+                f"run {run.run_id!r} carries axis {name!r}={value!r}, but PlanContext.axes has no such axis - "
+                "axis definitions and the run disagree, so the directory name and the real command tell two stories"
             )
         axis.update(resolve_axis_flags(found, value, ctx.facts))
 
@@ -410,7 +410,7 @@ def resolve_axis_flags(axis: Axis, value: str, facts: SiteFacts) -> FlagDict:
             break
     else:
         legal = ", ".join(repr(v.value) for v in axis.values)
-        raise SpecError(f"轴 {axis.name!r} 没有取值 {value!r}（合法取值：{legal}）")
+        raise SpecError(f"axis {axis.name!r} has no value {value!r} (legal values: {legal})")
 
     resolved: FlagDict = {}
     for flag, raw in axis_value.flags.items():
@@ -436,7 +436,9 @@ def merge_flag_layers(layers: FlagLayers) -> FlagDict:
         # FlagLayer 的 value 就是 FlagLayers 上对应字段的名字（builtin/defaults/extra/axis/locked）。
         chunk = getattr(layers, layer.value, None)
         if chunk is None:  # pragma: no cover - 冻结面改了字段名才会到这
-            raise SpecError(f"FlagLayers 上没有 {layer.value!r} 这一层 —— 冻结面和实现对不上了")
+            raise SpecError(
+                f"FlagLayers has no {layer.value!r} layer - the frozen interface and the implementation disagree"
+            )
         merged.update(chunk)
     return merged
 
@@ -464,8 +466,8 @@ def detect_flag_conflicts(layers: FlagLayers, axes: Sequence[Axis]) -> list[Flag
                     FlagConflict(
                         flag=flag,
                         reason=(
-                            f"轴 {owner[flag]!r} 和轴 {axis.name!r} 都掌管 {flag} —— "
-                            "后展开的那根会盖掉前一根，而目录名会把两根都写进去"
+                            f"axis {owner[flag]!r} and axis {axis.name!r} both own {flag} - "
+                            "the one expanded later overwrites the earlier one, while the dir name records both"
                         ),
                         layer=FlagLayer.AXIS,
                         axis_name=axis.name,
@@ -480,8 +482,8 @@ def detect_flag_conflicts(layers: FlagLayers, axes: Sequence[Axis]) -> list[Flag
                 FlagConflict(
                     flag=flag,
                     reason=(
-                        f"{flag} 由工具自己按 run 算出来（锁死层），Extra flags 里不许再给一遍 —— "
-                        "改了它工具自身的机制就失效了"
+                        f"{flag} is computed per run by the tool itself (locked layer); "
+                        "do not give it again in Extra flags - overriding it disables the tool's own mechanism"
                     ),
                     layer=FlagLayer.EXTRA,
                     value=value,
@@ -494,8 +496,9 @@ def detect_flag_conflicts(layers: FlagLayers, axes: Sequence[Axis]) -> list[Flag
                 FlagConflict(
                     flag=flag,
                     reason=(
-                        f"{flag} 已经是轴 {owner[flag]!r} 在管的，Extra flags 里不许再给一遍 —— "
-                        "否则目录名会和实际跑的值对不上（那正是原生 GUI 覆盖坑的根因）"
+                        f"{flag} is already owned by axis {owner[flag]!r}; do not give it again in Extra flags - "
+                        "otherwise the directory name disagrees with the value actually used "
+                        "(that is the root cause of the native GUI overwrite trap)"
                     ),
                     layer=FlagLayer.EXTRA,
                     axis_name=owner[flag],
@@ -513,8 +516,9 @@ def detect_flag_conflicts(layers: FlagLayers, axes: Sequence[Axis]) -> list[Flag
                 FlagConflict(
                     flag=flag,
                     reason=(
-                        f"{flag} 是机制层自己算的，某根轴也在写它 —— 轴定义写错了："
-                        "机制层最后落笔，轴给的值会被静默丢掉"
+                        f"{flag} is computed by the mechanism layer, yet an axis writes it too - "
+                        "the axis definition is wrong: the mechanism layer has the last word, "
+                        "so the axis value is silently dropped"
                     ),
                     layer=FlagLayer.AXIS,
                     axis_name=owner.get(flag, ""),
@@ -579,14 +583,15 @@ def build_command_plan(run: Run, ctx: PlanContext) -> CommandPlan:
     """
     if not ctx.facts.ewave_bin:
         raise DiscoveryError(
-            "SiteFacts.ewave_bin 是空的 —— 不知道该执行哪个 ewave。"
-            "先跑 core.discover.discover_site_facts(<官方 run 目录>)，"
-            "或者确认 `ewave` 在 PATH 上（硬约束 1b：工具绝对路径不写进源码）"
+            "SiteFacts.ewave_bin is empty - no idea which ewave to execute.\n"
+            "  Next: run core.discover.discover_site_facts(<official run dir>), "
+            "or make sure `ewave` is on PATH (hard constraint 1b: absolute tool paths never go into the source)"
         )
     if not run.work_dir:
         raise SpecError(
-            f"run {run.run_id!r} 没有 work_dir —— `--workDir` 会是空的，eWave 就把产物写进当前目录，"
-            "于是同 corner/temp 的组合互相静默覆盖。那正是本工具要消灭的坑（BRIEF §5）"
+            f"run {run.run_id!r} has no work_dir - `--workDir` would be empty, so eWave writes its outputs "
+            "into the current directory and combinations sharing one corner/temp silently overwrite each other. "
+            "That is exactly the trap this tool exists to kill (BRIEF sec. 5)"
         )
 
     layers = build_flag_layers(run, ctx)
@@ -594,7 +599,8 @@ def build_command_plan(run: Run, ctx: PlanContext) -> CommandPlan:
     fatal = [c for c in conflicts if c.fatal]
     if fatal:
         raise FlagConflictError(
-            "参数冲突，拒绝拼命令：\n" + "\n".join(f"  {c.flag}: {c.reason}" for c in fatal)
+            "flag conflicts, refusing to build the command:\n"
+            + "\n".join(f"  {c.flag}: {c.reason}" for c in fatal)
         )
 
     flags = merge_flag_layers(layers)

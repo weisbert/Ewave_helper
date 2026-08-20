@@ -58,6 +58,7 @@ from ewave_batch.model import (
     PortSpec,
     RunStatus,
     SiteFacts,
+    SpecError,
     StreamoutTask,
     TickReport,
 )
@@ -411,7 +412,7 @@ class LayoutContract(unittest.TestCase):
         """★ `SECTIONS` 不许是一张**说了不算**的清单。
 
         `tests/test_gui_frames.py` 比的是三版的 `SECTIONS` 常量彼此相同 ——
-        那证明不了任何一版真的建了那八件。这条把常量和 `layout()` 里的调用对上：
+        那证明不了任何一版真的建了那九件。这条把常量和 `layout()` 里的调用对上：
         源码里 `self.build_<x>(` 出现过的那些，必须**恰好**是 `SECTIONS`。
         """
         from gui import _ui
@@ -419,7 +420,9 @@ class LayoutContract(unittest.TestCase):
 
         source = (ROOT / "gui" / "frames" / "split.py").read_text(encoding="utf-8")
         built = set(re.findall(r"self\.build_([a-z_]+)\(", source))
-        self.assertEqual(len(split.SECTIONS), 8)
+        # 九件（草图那八件 + 后加的 `groups`，用户 2026-08-19 拍板的 run group 模型）。
+        self.assertEqual(len(split.SECTIONS), 9)
+        self.assertIn("groups", split.SECTIONS)
         self.assertEqual(built, set(split.SECTIONS))
         for name in split.SECTIONS:
             self.assertTrue(
@@ -1211,6 +1214,504 @@ class TemperatureNormalization(_TempRootTest):
         self.assertEqual(ewave_dir_name("typical", "-40.0"), "typical_-40_0")
         self.assertNotEqual(
             ewave_dir_name("typical", "-40"), ewave_dir_name("typical", "-40.0")
+        )
+
+# ==========================================================================
+# 8. run group（用户 2026-08-19 拍板的组合模型）—— `GuiState` 这一侧
+# ==========================================================================
+
+# ★ 手写的期望表：契约里那个原型在**界面这条路**上展开成什么。
+#
+#   base            corner=typical, temperature={-40, 55, 125}, fullWave=off, equalCurrent=on
+#   组 eqcur-off    temperature={55}, equalCurrent=off
+#   组 fullwave     temperature={55}, fullWave=on
+#                                                            => 3 + 1 + 1 = 5 个 run
+#
+# 注意 slug 全都带上了 `fw-…__eqI-…`：加了组之后 fullWave / equalCurrent 在**整个批次**
+# 上都在变了，于是它们对**所有** run（基线那 3 个也一样）进 slug。基线的目录名因此从
+# `base/` 变成 `fw-off__eqI-on/` —— 这是正确且不可避免的（否则两个组的 55 度落进同一个
+# 目录 = 静默覆盖 = 本工具存在的理由），而且正是 `groups_change_warning()` 要说的那件事。
+# 片段顺序 = 轴在界面上的顺序（fullWave 的勾选框在 equalCurrent 前面）。
+EXPECTED_GROUP_RUN_IDS: tuple[tuple[str, str], ...] = (
+    # (run_id, 出自哪个组)
+    (f"{DESIGN_A}/fw-off__eqI-on/typical_-40_0", "base"),
+    (f"{DESIGN_A}/fw-off__eqI-on/typical_55_0", "base"),
+    (f"{DESIGN_A}/fw-off__eqI-on/typical_125_0", "base"),
+    (f"{DESIGN_A}/fw-off__eqI-off/typical_55_0", "eqcur-off"),
+    (f"{DESIGN_A}/fw-on__eqI-on/typical_55_0", "fullwave"),
+)
+
+
+def _bare_bridge(root: str, *, temps: tuple[str, ...] = ("-40.0", "55.0", "125.0")) -> GuiState:
+    """一个只勾了 base、**还没 plan()** 的 bridge。正反两向共用这一条构造路径。
+
+    刻意不复用 `_gui()`：那个helper 一进来就 `plan()` 了两个 design 的 12 个 run，
+    而组这一段要看的是"边勾边算"的那些数（`run_count()` / `formula()`），
+    落不落盘不重要，反而是噪声。
+    """
+    offdir = f"{_workarea(root)}/ewave_simulation/design"
+    facts = _facts(offdir)
+    runner = FakeRunner(port_count=PORT_COUNT)
+    bridge = GuiState(
+        batch_root=root,
+        batch_name="gui_batch",
+        official_run_dir=offdir,
+        scheduler=FakeScheduler(runner),
+        runner=runner,
+        discover=lambda _path: facts,
+    )
+    bridge.set_axis_values("corner", ("typical",))
+    bridge.set_axis_values("temperature", temps)
+    bridge.set_axis_values("fullWave", ("off",))
+    bridge.set_axis_values("equalCurrent", ("on",))
+    # 这两根轴清空，好让 run_id 与上面那张手写表逐字对得上（它们进 slug 就多一截）。
+    for name in ("relativeTolerance", "relativeCurrentTolerance"):
+        bridge.set_axis_values(name, ())
+    bridge.add_design(FAKE_LIB, FAKE_CELL_A, FAKE_VIEW)
+    return bridge
+
+
+def _prototype(bridge: GuiState) -> GuiState:
+    """把契约里那两个组配上去。**走的全是界面会走的那几个方法**，不手搓 `RunGroup`。"""
+    bridge.add_group("eqcur-off")  # add_group 顺手切过去 —— 界面上点 [+ Add] 就是这个手感
+    bridge.set_axis_values("temperature", ("55.0",))
+    bridge.set_axis_values("equalCurrent", ("off",))
+    bridge.add_group("fullwave")
+    bridge.set_axis_values("temperature", ("55.0",))
+    bridge.set_axis_values("fullWave", ("on",))
+    return bridge
+
+
+class RunGroupBridge(_TempRootTest):
+    """`GuiState` 的 run group 编辑面。
+
+    这一面**不在冻结面上**（`docs/INTERFACES.md`「还没冻结的东西」），所以这里测的是
+    那一节写下的约定，尤其是这一条：`set_axis_values()` / `axis_selection()` /
+    `axis_counts()` 作用于 **active group**，active = base 时与加组之前**逐字相同**。
+    """
+
+    def test_base_only_is_exactly_the_old_behaviour(self) -> None:
+        """★ 回归闸门：一个组都没加时，界面这条路必须和以前一模一样。"""
+        bridge = _bare_bridge(self.root)
+        self.assertEqual([g.name for g in bridge.groups()], ["base"])
+        self.assertEqual(bridge.active_group(), "base")
+        self.assertEqual(bridge.run_count(), 3)
+        self.assertEqual(bridge.formula(), "1 designs x 1 corner x 3 temp x 1 mode = 3 runs")
+        self.assertEqual(bridge.merged_run_count(), 0)
+        self.assertEqual(bridge.group_run_counts(), [("base", 3)])
+        # base 没有"覆盖"这一说：它的取值就是勾选本身。
+        self.assertIsNone(bridge.group_override("temperature"))
+        bridge.plan()
+        self.assertEqual(
+            [run.run_id for run in bridge.runs()],
+            [
+                f"{DESIGN_A}/base/typical_-40_0",
+                f"{DESIGN_A}/base/typical_55_0",
+                f"{DESIGN_A}/base/typical_125_0",
+            ],
+            "没有组的时候 fullWave/equalCurrent 各只有一个取值 => 不在变 => 不进 slug",
+        )
+        self.assertEqual({run.group for run in bridge.runs()}, {"base"})
+
+    def test_prototype_expands_to_five_runs(self) -> None:
+        """★ 契约里那个例子，从界面这条路走一遍：3 + 1 + 1 = 5。
+
+        笛卡尔积最接近的写法是 {typical}x{3 温度}x{eqI on/off}x{fw on/off} = 12 个，
+        7 个是废的 —— 一个 run 的量级是 10 核 / 100GB / 35 分钟（BRIEF §12）。
+        """
+        bridge = _prototype(_bare_bridge(self.root))
+        self.assertEqual(bridge.run_count(), 5)
+        bridge.plan()
+        self.assertEqual(
+            [(run.run_id, run.group) for run in bridge.runs()],
+            list(EXPECTED_GROUP_RUN_IDS),
+        )
+        # 计数断言：5 个 run_id 互不相同。撞了就是同一个 --workDir = 静默覆盖。
+        self.assertEqual(len({run.run_id for run in bridge.runs()}), 5)
+        self.assertEqual(bridge.group_run_counts(), [("base", 3), ("eqcur-off", 1), ("fullwave", 1)])
+        self.assertEqual(bridge.group_of(EXPECTED_GROUP_RUN_IDS[3][0]), "eqcur-off")
+
+    def test_baseline_slug_changes_when_a_group_is_added_negative(self) -> None:
+        """反向：同一条构造路径、只是不加组 —— 基线的 slug 就该退回 `base`。
+
+        没有这条，上面那张表可能只是因为 fullWave/equalCurrent 永远进 slug。
+        两条一起才说明"加组会改掉基线的目录名"这件事是**由组引起的**。
+        """
+        without = _bare_bridge(self.root)
+        without.plan()
+        self.assertEqual({run.axes_slug for run in without.runs()}, {"base"})
+        with_groups = _prototype(_bare_bridge(self.root))
+        with_groups.plan()
+        self.assertEqual(
+            {run.axes_slug for run in with_groups.runs()},
+            {"fw-off__eqI-on", "fw-off__eqI-off", "fw-on__eqI-on"},
+        )
+
+    def test_set_axis_values_lands_on_the_active_group(self) -> None:
+        """★ 本次最容易写错的一处：切了组之后再勾，勾的是**那个组**，不是基线。
+
+        写错的症状是"用户以为自己在配变体，其实把基线改了" —— 而基线一改，
+        整批的 run_id 全变，已经跑完的东西 resume 认不出来。
+        """
+        bridge = _bare_bridge(self.root)
+        base_before = bridge.axis_selection()
+        bridge.add_group("eqcur-off")
+        self.assertEqual(bridge.active_group(), "eqcur-off", "add_group 该顺手切过去")
+        bridge.set_axis_values("equalCurrent", ("off",))
+
+        self.assertEqual(bridge.group_override("equalCurrent"), ("off",))
+        # 继承的轴：`group_override` 给 None，`axis_selection` 给 base 的值。
+        self.assertIsNone(bridge.group_override("temperature"))
+        self.assertEqual(bridge.axis_selection()["temperature"], ("-40.0", "55.0", "125.0"))
+        self.assertEqual(bridge.axis_selection()["equalCurrent"], ("off",))
+        # ★ 基线一个字都没动
+        bridge.set_active_group("base")
+        self.assertEqual(bridge.axis_selection(), base_before)
+        self.assertEqual(bridge.axis_selection()["equalCurrent"], ("on",))
+
+    def test_axis_counts_follow_the_active_group(self) -> None:
+        """每根轴右边那个 `-> N` 也跟着 active group 走，否则界面在说谎。"""
+        bridge = _bare_bridge(self.root)
+        self.assertEqual(bridge.axis_counts()["temperature"], 3)
+        bridge.add_group("hot")
+        bridge.set_axis_values("temperature", ("55.0",))
+        self.assertEqual(bridge.axis_counts()["temperature"], 1)
+        bridge.set_active_group("base")
+        self.assertEqual(bridge.axis_counts()["temperature"], 3)
+
+    def test_clear_override_gives_the_axis_back_to_base(self) -> None:
+        """撤销覆盖 = 回去继承。空取值走的也是这条路（对一个组来说"空"不是"不扫"）。"""
+        bridge = _bare_bridge(self.root)
+        bridge.add_group("hot")
+        bridge.set_axis_values("temperature", ("55.0",))
+        bridge.clear_group_override("temperature")
+        self.assertIsNone(bridge.group_override("temperature"))
+        self.assertEqual(bridge.axis_selection()["temperature"], ("-40.0", "55.0", "125.0"))
+        bridge.set_axis_values("temperature", ("55.0",))
+        self.assertEqual(bridge.group_override("temperature"), ("55.0",))
+        bridge.set_axis_values("temperature", ())
+        self.assertIsNone(bridge.group_override("temperature"), "空取值 = 撤销覆盖")
+
+    def test_formula_switches_shape_when_groups_appear(self) -> None:
+        """算式：只有 base 时是连乘，有组时是 `designs x (a + b + c)`。
+
+        为什么要换形状：有组之后整批已经不是一个笛卡尔积了，写成连乘就是假的。
+        为什么只有 base 时不换：最常见的场景不该因为多了一个功能而变难懂。
+        """
+        bridge = _bare_bridge(self.root)
+        self.assertEqual(bridge.formula(), "1 designs x 1 corner x 3 temp x 1 mode = 3 runs")
+        _prototype(bridge)
+        self.assertEqual(bridge.formula(), "1 designs x (3 + 1 + 1) = 5 runs")
+
+    def test_cross_group_duplicates_are_counted_and_shown(self) -> None:
+        """两个组都写了 55 度 —— 折叠掉一个，而且那个数必须让人看见。
+
+        只写 "3 runs" 会让用户以为自己那条组写错了、少展开了一个。
+        """
+        bridge = _bare_bridge(self.root)
+        bridge.add_group("hot")
+        bridge.set_axis_values("temperature", ("55.0",))
+        bridge.add_group("hot-again")
+        bridge.set_axis_values("temperature", ("55.0",))
+        self.assertEqual(bridge.run_count(), 3, "两个组的 55 度都被 base 的 55 度吃掉")
+        self.assertEqual(bridge.merged_run_count(), 2)
+        self.assertEqual(
+            bridge.group_run_counts(), [("base", 3), ("hot", 0), ("hot-again", 0)]
+        )
+        self.assertIn("(2 duplicates merged)", bridge.formula())
+
+    def test_group_names_are_made_unique_and_base_is_protected(self) -> None:
+        bridge = _bare_bridge(self.root)
+        self.assertEqual(bridge.add_group("hot"), "hot")
+        self.assertEqual(bridge.add_group("hot"), "hot-2", "重名自动加后缀，别静默合并")
+        with self.assertRaises(SpecError):
+            bridge.remove_group("base")
+        with self.assertRaises(SpecError):
+            bridge.rename_group("hot", "base")
+        with self.assertRaises(SpecError):
+            bridge.set_active_group("ghost")
+        # 删掉刚删过的那一行是很自然的重复点击 —— no-op，不弹框。
+        bridge.remove_group("no-such-group")
+        self.assertEqual([g.name for g in bridge.groups()], ["base", "hot", "hot-2"])
+        bridge.set_active_group("hot-2")
+        bridge.remove_group("hot-2")
+        self.assertEqual(bridge.active_group(), "base", "删掉正在编辑的组要退回 base")
+
+    def test_duplicate_base_writes_the_selection_out_explicitly(self) -> None:
+        """复制 base 得到的是一个**写死了取值**的组 —— 空覆盖的副本就是 base 本身。"""
+        bridge = _bare_bridge(self.root)
+        name = bridge.duplicate_group("base")
+        self.assertEqual(bridge.active_group(), name)
+        self.assertEqual(bridge.group_override("temperature"), ("-40.0", "55.0", "125.0"))
+        self.assertEqual(bridge.group_override("equalCurrent"), ("on",))
+        # 全是和 base 一样的取值 => 展开出来逐个撞车 => 全被折叠 => 这个组贡献 0。
+        self.assertEqual(bridge.run_count(), 3)
+        self.assertEqual(dict(bridge.group_run_counts())[name], 0)
+
+    def test_groups_reach_the_spec_snapshot(self) -> None:
+        """「Save spec as…」靠这一条：界面上配的组要真的进 `BatchSpec.groups`。
+
+        丢了的症状是"存了、下次打开组没了"，而且无声。
+        """
+        bridge = _prototype(_bare_bridge(self.root))
+        snapshot = bridge.spec_snapshot()
+        self.assertEqual([g.name for g in snapshot.groups], ["eqcur-off", "fullwave"])
+        self.assertEqual(
+            {k: tuple(v) for k, v in snapshot.groups[0].axis_overrides.items()},
+            {"temperature": ("55.0",), "equalCurrent": ("off",)},
+        )
+
+    def test_group_summary_is_a_delta_for_groups_and_a_full_line_for_base(self) -> None:
+        bridge = _prototype(_bare_bridge(self.root))
+        self.assertEqual(bridge.group_summary("eqcur-off"), "+ 55.0, eqI off")
+        base_line = bridge.group_summary("base")
+        self.assertNotIn("+ ", base_line, "base 给的是全量，不是 delta")
+        self.assertIn("typical", base_line)
+        self.assertIn("-40.0/55.0/125.0", base_line)
+        self.assertTrue(
+            all(ord(ch) < 128 for ch in base_line + bridge.group_summary("eqcur-off")),
+            "红区 LANG 常是 C => 界面字符串必须是纯 ASCII",
+        )
+
+    def test_no_warning_before_the_batch_has_run(self) -> None:
+        """反向：还没跑过就没什么好警告的 —— 每次都弹的警告等于没有警告。"""
+        bridge = _prototype(_bare_bridge(self.root))
+        self.assertEqual(bridge.groups_change_warning(), "")
+        bridge.plan()
+        self.assertEqual(bridge.groups_change_warning(), "", "只 plan 不算跑过")
+
+    def test_warning_after_the_batch_has_started(self) -> None:
+        """★ 跑过之后再动组 = 换了一批 run_id，resume 认不出老的目录 —— 必须出声。"""
+        bridge = _prototype(_bare_bridge(self.root))
+        bridge.start(dry_run=True)
+        for _ in range(200):
+            if bridge.tick() is None or not bridge.is_running():
+                break
+        self.assertTrue(bridge.has_started())
+        warning = bridge.groups_change_warning()
+        self.assertNotEqual(warning, "")
+        self.assertIn("run id", warning.lower(), "得说清是 run id 变了")
+        self.assertIn("Next:", warning, "报错/警告都要给下一步")
+        self.assertTrue(
+            all(ord(ch) < 128 for ch in warning), "红区 LANG 常是 C => 纯 ASCII"
+        )
+
+
+class WidenedAxisDoesNotLeakIntoSiblingGroups(_TempRootTest):
+    """★ 2026-08-19 复核抓到的静默多跑：**加宽一根轴，别的组不许跟着多扫**。
+
+    `_axes_and_groups()` 会在"某个组写了核心翻译不出来的取值"时把该轴的取值表加宽
+    （界面自造的 mesh / freq 轴带的是具体 flag、没有 `{value}` 占位符）。加宽是**改轴的
+    定义**，而轴的定义对每一个组都生效 —— 只把 base 锁回去的话，任何一个没碰这根轴的
+    **兄弟组**都会继承加宽后的取值表，替别人扫一遍它从没要过的取值。
+    一个 run 是 10 核 / 100 GB / 35 分钟（BRIEF §12），多扫一条不是显示问题。
+
+    这条 bug 还是条件性的：`mesh: [0.5]`（目录里有的取值）不触发加宽，数就是对的；
+    换成 `0.45` 才发作 —— 也就是说"我这个组多跑了一个 run"取决于**别的组**填了什么。
+    """
+
+    def _bridge(self) -> GuiState:
+        bridge = _bare_bridge(self.root)
+        bridge.set_axis_values("mesh", ("0.4",))
+        return bridge
+
+    def _add_groups(self, bridge: GuiState, mesh_value: str) -> GuiState:
+        bridge.add_group("mesh-var")
+        bridge.set_axis_values("mesh", (mesh_value,))
+        bridge.add_group("eqcur-off")
+        bridge.set_axis_values("temperature", ("55.0",))
+        bridge.set_axis_values("equalCurrent", ("off",))
+        return bridge
+
+    def test_sibling_group_keeps_inheriting_base(self) -> None:
+        bridge = self._add_groups(self._bridge(), "0.45")
+        self.assertEqual(
+            bridge.group_run_counts(),
+            [("base", 3), ("mesh-var", 3), ("eqcur-off", 1)],
+            "eqcur-off 一根 mesh 都没碰 => 必须继承 base 的 0.4，只贡献 1 个 run",
+        )
+        self.assertEqual(bridge.run_count(), 7)
+        self.assertEqual(bridge.formula(), "1 designs x (3 + 3 + 1) = 7 runs")
+        bridge.plan()
+        self.assertEqual(len(bridge.runs()), 7, "界面上的数必须等于 plan() 真建出来的条数")
+        leaked = [r.run_id for r in bridge.runs() if r.group == "eqcur-off" and "0_45" in r.run_id]
+        self.assertEqual(leaked, [], "eqcur-off 里不该出现 mesh 0.45 的 run")
+
+    def test_value_the_catalog_knows_gives_the_same_count_negative(self) -> None:
+        """反向：换一个**不需要加宽**的 mesh 取值，条数必须一模一样。
+
+        两条数不同的话，"跑几个 run"就取决于别的组填了哪个值 —— 那正是这个 bug 的形状。
+        """
+        bridge = self._add_groups(self._bridge(), "0.5")
+        self.assertEqual(
+            bridge.group_run_counts(), [("base", 3), ("mesh-var", 3), ("eqcur-off", 1)]
+        )
+        self.assertEqual(bridge.run_count(), 7)
+
+    def test_saved_spec_expands_to_the_same_count(self) -> None:
+        """存盘再读回来，批次大小不许变 —— 变了就是"下次打开跑的不是同一批"。"""
+        from ewave_batch.core import spec as spec_module
+
+        bridge = self._add_groups(self._bridge(), "0.45")
+        target = os.path.join(self.root, "saved.yaml")
+        written = spec_module.save_spec(bridge.spec_snapshot(), target)
+        reloaded = spec_module.load_spec(written)
+        state = spec_module.spec_to_batch(reloaded, batch_root=self.root)
+        self.assertEqual(len(state.runs), bridge.run_count())
+        self.assertEqual(
+            [r.run_id for r in state.runs], [r.run_id for r in bridge.runs() or ()] or
+            [r.run_id for r in state.runs],
+        )
+
+
+class GroupsWarningAcrossSessions(_TempRootTest):
+    """★ 2026-08-19 复核抓到的沉默：跨会话给已经跑过的批次加组，界面一声不吭。
+
+    `has_started()` 只知道"**本进程**里点过 Dry-run/Submit"。而批次跨天是常态
+    （一个 run 10 核 / 100 GB / 35 分钟），最常见的场景恰恰是"昨天跑完，今天重开 GUI
+    加个组" —— 那时 `self._driver is None`，老判据一个字都不说，而磁盘上那批
+    `base/...` 目录已经对不上号了。
+    """
+
+    def _finished_batch_on_disk(self) -> list[str]:
+        from ewave_batch.core import layout as layout_module
+
+        bridge = _bare_bridge(self.root)
+        bridge.plan()
+        state = bridge._state
+        assert state is not None
+        os.makedirs(state.batch_dir, exist_ok=True)
+        layout_module.write_batch_state(
+            os.path.join(state.batch_dir, "batch.json"), state
+        )
+        return [run.run_id for run in bridge.runs()]
+
+    def test_new_session_on_an_existing_batch_warns(self) -> None:
+        old_ids = self._finished_batch_on_disk()
+        fresh = _bare_bridge(self.root)  # 同一个 batch_root / batch_name = 第二天重开 GUI
+        self.assertFalse(fresh.has_started(), "前提：新进程里 driver 是 None")
+        fresh.add_group("eqcur-off")
+        fresh.set_axis_values("equalCurrent", ("off",))
+        warning = fresh.groups_change_warning()
+        self.assertNotEqual(warning, "", "磁盘上已经有这个批次了，必须警告")
+        self.assertIn("run id", warning.lower())
+        self.assertIn("Next:", warning)
+        self.assertTrue(all(ord(ch) < 128 for ch in warning), "红区 LANG 常是 C => 纯 ASCII")
+        fresh.plan()
+        new_ids = [run.run_id for run in fresh.runs()]
+        self.assertFalse(
+            set(new_ids) & set(old_ids),
+            "前提没了：加组之后 run_id 竟然还对得上，那这条警告就没必要存在",
+        )
+
+    def test_a_batch_that_is_not_on_disk_stays_silent_negative(self) -> None:
+        """反向：没跑过的新批次不许警告 —— 逢改必警等于没警告。"""
+        fresh = _bare_bridge(self.root)
+        fresh.batch_name = "never_ran"
+        self.assertEqual(fresh.groups_change_warning(), "")
+
+
+class TreeColumnsAreNotSqueezedBack(_SmokeTest):
+    """★ `_fit_tree_columns` 算出来的宽度，不许被 ttk 又压回去。
+
+    2026-08-19 视觉复验之后仍然漏网的一条回归：那一轮把 `minwidth` 设成**表头宽度**，
+    而 `design` / `extra` 是 `stretch=True` 的列 —— 视口比"列宽之和"窄的时候（split 版
+    的常态：十列合 1085px、视口 827px），ttk 会把可拉伸的列一路压回 `minwidth`。
+    实测 `design` 算出来 277px、被压成 78px，于是两个不同的 design key 又双双显示成
+    同一串前缀 —— 正是 `_fit_tree_columns` 本来要修的那个缺陷，从另一扇门走了回来。
+
+    比"看起来窄"更糟的是：**横向滚动条对这种情况不起作用**。列本身变窄了，不是被推到
+    视口外，滚过去看到的还是被切掉的字，而 Treeview 不画省略号 —— 用户没有任何手段
+    看到完整的 design key。
+
+    触发条件是 `recompute()`（每敲一个键、每点一个勾选框都会跑），所以这不是边角情况。
+    """
+
+    def test_fit_sets_minwidth_equal_to_the_width_it_computed(self) -> None:
+        """纯不变量：`minwidth == width`。这一条不需要显示，永远跑得了。"""
+        root = _tk_or_skip(self)
+        from tkinter import font as tkfont, ttk
+
+        from gui._ui import _fit_tree_columns
+
+        tree = ttk.Treeview(root, columns=("a", "b"), show="headings")
+        tree.heading("a", text="Design")
+        tree.heading("b", text="X")
+        tree.column("a", stretch=True)
+        tree.insert("", "end", values=("MY_LIB_a_very_long_design_key_layout", "y"))
+        mono = tkfont.nametofont("TkFixedFont")
+        _fit_tree_columns(
+            tree, ("a", "b"), head_font=mono, cell_font=mono, floors={"a": 10, "b": 10}
+        )
+        for key in ("a", "b"):
+            self.assertEqual(
+                tree.column(key, "minwidth"),
+                tree.column(key, "width"),
+                "minwidth 小于 width => ttk 会在视口不够时把这一列压回去",
+            )
+        # 顺带钉住"宽度真的按内容算"，否则上面那条在两个都等于 0 时也成立。
+        self.assertGreater(tree.column("a", "width"), tree.column("b", "width"))
+
+    def test_recompute_does_not_shrink_the_design_column(self) -> None:
+        """整版 split：反复 `recompute()` 之后，没有一列比自己算出来的宽度窄。"""
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        bridge, _runner, _sched = _gui(self.root)
+        frame = split.build_frame(root, bridge)
+        frame.pack(fill="both", expand=True)
+        app = frame._ewb_app
+        # ⚠️ 必须真映射。`_tk_or_skip` 默认 `withdraw()`，而 ttk 只在窗口**映射之后**
+        #    才按视口去压可拉伸的列 —— 在隐藏窗口里这条测试即使规则被改回去也照样绿
+        #    （实测过：把 minwidth 改回 head_width，隐藏窗口下 3 条全 OK）。
+        #    一条抓不到自己那个 bug 的回归测试比没有更糟，所以这里宁可闪一下窗口。
+        root.deiconify()
+        root.geometry("1560x900")
+        root.update_idletasks()
+        root.update()
+        for _ in range(3):  # 一次不够：压回去是"视口已经算出来了"之后才发生的
+            app.recompute()
+            root.update_idletasks()
+            root.update()
+
+        squeezed = []
+        for name, tree in (("runs", app.tree), ("designs", app.dtree)):
+            cache = getattr(tree, "_ewb_col_widths", {})
+            for key in tree["columns"]:
+                want = int(cache.get(key, 0))
+                got = int(tree.column(key, "width"))
+                if want > got + 1:
+                    squeezed.append("%s.%s want=%d got=%d" % (name, key, want, got))
+        self.assertEqual(squeezed, [], "这些列被 ttk 压回去了，横向滚动条救不了它们")
+
+    def test_a_squeezable_column_is_the_precondition_negative(self) -> None:
+        """反向：确认前提还在 —— runs 表**确实**有可拉伸的列、且列宽和大于视口。
+
+        没有这个前提，上面那条测试即使规则被改回去也照样绿（= 一条假绿的测试）。
+        """
+        root = _tk_or_skip(self)
+        from gui._ui import RUN_STRETCH_COLS
+
+        from gui.frames import split
+
+        bridge, _runner, _sched = _gui(self.root)
+        frame = split.build_frame(root, bridge)
+        frame.pack(fill="both", expand=True)
+        app = frame._ewb_app
+        root.deiconify()          # 同上：不映射就量不到真实视口
+        root.geometry("1560x900")
+        root.update_idletasks()
+        root.update()
+        app.recompute()
+        root.update_idletasks()
+        root.update()
+
+        self.assertTrue(RUN_STRETCH_COLS, "一根可拉伸的列都没有 => 压不回去 => 上一条测不到东西")
+        total = sum(int(app.tree.column(key, "width")) for key in app.tree["columns"])
+        self.assertGreater(
+            total,
+            app.tree.winfo_width(),
+            "列宽之和已经装得进视口了 => ttk 不会压任何列 => 上一条测不到东西",
         )
 
 

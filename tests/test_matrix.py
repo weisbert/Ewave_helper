@@ -22,7 +22,17 @@ from __future__ import annotations
 import unittest
 
 from ewave_batch.core import matrix
-from ewave_batch.model import BASE_SLUG, Axis, AxisKind, AxisValue, BatchOptions, Design, SpecError
+from ewave_batch.model import (
+    BASE_GROUP,
+    BASE_SLUG,
+    Axis,
+    AxisKind,
+    AxisValue,
+    BatchOptions,
+    Design,
+    RunGroup,
+    SpecError,
+)
 
 # ==========================================================================
 # 期望表（手写字面量）
@@ -553,6 +563,58 @@ class AxesForDesign(unittest.TestCase):
             matrix.axes_for_design(design, axes)
 
 
+class AxesForGroup(unittest.TestCase):
+    """`axes_for_group` 与 `axes_for_design` 同构 —— 但报错必须说清是**组**写错了。
+
+    直接点名这个函数（而不是只经 `expand_runs` 顺带覆盖）：它是冻结面上的符号，
+    `core.spec` 和 `gui.state` 都会单独调它。经 expand_runs 的那几条只证明"整条路能报错"，
+    证明不了这个函数自己的契约。
+    """
+
+    def test_unlisted_axes_are_inherited_verbatim(self) -> None:
+        """组是 **delta**：没列的轴原样继承 base，连对象都是同一个。"""
+        axes = make_axes(corner=["typical", "cbest"], temperature=["-40.0", "55.0"])
+        group = RunGroup(name="hot", axis_overrides={"temperature": ("55.0",)})
+        resolved = matrix.axes_for_group(group, axes)
+        self.assertEqual([a.name for a in resolved], ["corner", "temperature"])
+        self.assertIs(resolved[0], axes[0], "没被覆盖的轴不该被复制一份")
+        self.assertEqual([v.value for v in resolved[1].values], ["55.0"])
+        self.assertEqual(
+            resolved[1].flags, axes[1].flags, "覆盖的是取值列表，不是 flag 定义"
+        )
+        self.assertEqual(
+            [v.value for v in axes[1].values], ["-40.0", "55.0"], "不许改到原对象"
+        )
+
+    def test_an_empty_override_map_changes_nothing_negative(self) -> None:
+        """反向：一根轴都不覆盖的组 == base 自己。上面那条才不是"覆盖永远生效"的假绿。"""
+        axes = make_axes(corner=["typical", "cbest"], temperature=["-40.0", "55.0"])
+        resolved = matrix.axes_for_group(RunGroup(name="empty"), axes)
+        self.assertEqual(
+            [(a.name, [v.value for v in a.values]) for a in resolved],
+            [("corner", ["typical", "cbest"]), ("temperature", ["-40.0", "55.0"])],
+        )
+
+    def test_unknown_axis_name_says_which_group(self) -> None:
+        axes = make_axes(corner=["typical"], temperature=["-40.0"])
+        group = RunGroup(name="eqcur-off", axis_overrides={"equalCurent": ("off",)})
+        with self.assertRaises(SpecError) as ctx:
+            matrix.axes_for_group(group, axes)
+        message = str(ctx.exception)
+        self.assertIn("equalCurent", message, "把用户写错的那个名字原样回显出来")
+        self.assertIn("eqcur-off", message, "得说清是哪个组写错了，用户才知道去改 spec 的哪一段")
+        self.assertIn("corner", message, "报错要把这个批次有哪些轴列出来")
+        self.assertIn("temperature", message)
+        self.assertIn("Next:", message, "报错必须带「下一步怎么办」")
+
+    def test_empty_override_is_rejected(self) -> None:
+        """空取值列表 = 笛卡尔积塌成 0 个 run。拒绝而不是静默产出空批次。"""
+        axes = make_axes(corner=["typical"])
+        with self.assertRaises(SpecError) as ctx:
+            matrix.axes_for_group(RunGroup(name="oops", axis_overrides={"corner": ()}), axes)
+        self.assertIn("oops", str(ctx.exception))
+
+
 class GuardRails(unittest.TestCase):
     def test_no_designs(self) -> None:
         with self.assertRaises(SpecError):
@@ -610,6 +672,208 @@ class NativeMultiValue(unittest.TestCase):
             options=BatchOptions(native_multi_value=True),
         )
         self.assertEqual([r.axis_values["corner"] for r in runs], ["typical", "cbest"])
+
+
+# ==========================================================================
+# run group —— base 之上的单点变体（用户 2026-08-19 拍板的组合模型）
+# ==========================================================================
+
+# 契约里那个原型：base = typical @ 3 个温度；再加两个只覆盖一两根轴的组。
+# 3 + 1 + 1 = 5 个 run。期望值一行一行敲出来，不在测试里现算。
+#
+# 注意 slug：加了组之后 equalCurrent 和 fullWave 在**整个批次**上都在变了
+# ⇒ 它们对**所有** run（包括 base 那 3 个）进 slug。基线的目录名因此从 base/ 变成
+# fw-off__eqI-on/ —— 这是正确且不可避免的，否则两组的同一个温度会落进同一个目录。
+GOLDEN_GROUPS: tuple[tuple[str, str, str], ...] = (
+    # (run_id, axes_slug, ewave_dir)
+    ("MY_LIB_CELL_A_layout/fw-off__eqI-on/typical_-40_0", "fw-off__eqI-on", "typical_-40_0"),
+    ("MY_LIB_CELL_A_layout/fw-off__eqI-on/typical_55_0", "fw-off__eqI-on", "typical_55_0"),
+    ("MY_LIB_CELL_A_layout/fw-off__eqI-on/typical_125_0", "fw-off__eqI-on", "typical_125_0"),
+    ("MY_LIB_CELL_A_layout/fw-off__eqI-off/typical_55_0", "fw-off__eqI-off", "typical_55_0"),
+    ("MY_LIB_CELL_A_layout/fw-on__eqI-on/typical_55_0", "fw-on__eqI-on", "typical_55_0"),
+)
+
+
+def prototype_axes() -> list[Axis]:
+    """契约里那套 base 轴。正反测试共用这一条构造路径。"""
+    return make_axes(
+        corner=["typical"],
+        temperature=["-40.0", "55.0", "125.0"],
+        fullWave=["off"],
+        equalCurrent=["on"],
+    )
+
+
+def prototype_groups() -> list[RunGroup]:
+    return [
+        RunGroup(
+            name="eqcur-off",
+            axis_overrides={"temperature": ("55.0",), "equalCurrent": ("off",)},
+        ),
+        RunGroup(
+            name="fullwave", axis_overrides={"temperature": ("55.0",), "fullWave": ("on",)}
+        ),
+    ]
+
+
+class RunGroups(unittest.TestCase):
+    def test_five_runs_exactly(self) -> None:
+        runs = matrix.expand_runs(
+            make_designs(1), prototype_axes(), groups=prototype_groups()
+        )
+        problems, compared = diff_rows(rows_of(runs), GOLDEN_GROUPS)
+        self.assertEqual(compared, 15, "5 行 x 3 个字段 = 15 次比较（防空过）")
+        self.assertEqual(problems, [], "\n".join(problems))
+        # 与上面那条比对**不重复**：diff_rows 只保证"每行等于期望表那一行"，
+        # 期望表自己写成两行一样的话它照样绿。而 run_id 相同 = 同一个 --workDir
+        # = 静默覆盖，正是本工具存在要消灭的东西 —— 所以单独钉一条。
+        self.assertEqual(len({run.run_id for run in runs}), 5)
+        self.assertEqual(len(runs), 5)
+
+    def test_group_attribution(self) -> None:
+        """每个 run 记得自己出自哪个组；base 的 3 个归 base。"""
+        runs = matrix.expand_runs(
+            make_designs(1), prototype_axes(), groups=prototype_groups()
+        )
+        self.assertEqual(
+            [r.group for r in runs],
+            [BASE_GROUP, BASE_GROUP, BASE_GROUP, "eqcur-off", "fullwave"],
+        )
+
+    def test_per_group_counts_and_zero_merges(self) -> None:
+        report = matrix.expand_runs_detailed(
+            make_designs(1), prototype_axes(), groups=prototype_groups()
+        )
+        self.assertEqual(report.merged, 0, "这个原型里没有跨组重复")
+        self.assertEqual(report.per_group, ((BASE_GROUP, 3), ("eqcur-off", 1), ("fullwave", 1)))
+
+    def test_no_groups_is_byte_for_byte_the_old_behaviour(self) -> None:
+        """`groups=()` 必须和不传这个参数逐字相同 —— 最常见的场景不许被组功能碰坏。"""
+        designs = make_designs(2)
+        axes = make_axes(corner=["typical", "cbest"], temperature=["-40.0", "125.0"])
+        self.assertEqual(
+            rows_of(matrix.expand_runs(designs, axes, groups=())),
+            rows_of(matrix.expand_runs(designs, axes)),
+        )
+        self.assertEqual(rows_of(matrix.expand_runs(designs, axes)), list(GOLDEN_BASE))
+
+    def test_group_values_make_an_axis_count_as_varying(self) -> None:
+        """★ 本次最容易写错的一条（契约点名）。
+
+        base 只有 `temperature: [55.0]` + `equalCurrent: [on]`，组把 equalCurrent 换成 off。
+        只看 base 的话 equalCurrent 是"不变的" ⇒ 不进 <axes-slug> ⇒ 两个 run 的 run_id
+        都是 `<design>/base/typical_55_0` ⇒ 同一个 --workDir ⇒ 第二个静默覆盖第一个。
+        所以 `effective_axis_values` / `varying_axes` 的口径必须把组的取值并进去。
+        """
+        axes = make_axes(corner=["typical"], temperature=["55.0"], equalCurrent=["on"])
+        groups = [
+            RunGroup(name="eqcur-off", axis_overrides={"equalCurrent": ("off",)}),
+        ]
+        runs = matrix.expand_runs(make_designs(1), axes, groups=groups)
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(len({r.run_id for r in runs}), 2, "run_id 撞了就是静默覆盖")
+        for run in runs:
+            self.assertIn("eqI", run.axes_slug, f"equalCurrent 在变却没进 slug: {run.axes_slug}")
+        self.assertEqual(
+            [r.axes_slug for r in runs], ["eqI-on", "eqI-off"], "基线的目录名也跟着变，这是对的"
+        )
+        # 同一条判据的两个下层函数也要点名，免得只有 expand_runs 侥幸对
+        equal_current = axes[2]
+        self.assertEqual(
+            matrix.effective_axis_values(equal_current, (), groups), ["on", "off"]
+        )
+        self.assertEqual(
+            [a.name for a in matrix.varying_axes(axes, groups=groups)], ["equalCurrent"]
+        )
+
+    def test_without_the_group_that_axis_is_not_varying_negative(self) -> None:
+        """反向：去掉组之后 equalCurrent 就该退回"不变" ⇒ slug 退回 base。
+
+        没有这条，上面那条可能只是因为 equalCurrent 永远进 slug。
+        """
+        axes = make_axes(corner=["typical"], temperature=["55.0"], equalCurrent=["on"])
+        runs = matrix.expand_runs(make_designs(1), axes)
+        self.assertEqual([r.axes_slug for r in runs], [BASE_SLUG])
+        self.assertEqual(matrix.varying_axes(axes), [])
+
+    def test_cross_group_duplicates_are_merged_silently(self) -> None:
+        """两个组都写了 55 度是很自然的写法 —— 折叠掉，别逼用户手工排除。"""
+        axes = make_axes(corner=["typical"], temperature=["-40.0", "55.0"])
+        groups = [
+            RunGroup(name="hot", axis_overrides={"temperature": ("55.0",)}),
+            RunGroup(name="hot-again", axis_overrides={"temperature": ("55.0",)}),
+        ]
+        report = matrix.expand_runs_detailed(make_designs(1), axes, groups=groups)
+        self.assertEqual(len(report.runs), 2, "两个组的 55 度都被 base 的 55 度吃掉")
+        self.assertEqual(report.merged, 2)
+        self.assertEqual(report.per_group, ((BASE_GROUP, 2), ("hot", 0), ("hot-again", 0)))
+        self.assertEqual([r.group for r in report.runs], [BASE_GROUP, BASE_GROUP])
+
+    def test_duplicate_inside_one_group_still_raises(self) -> None:
+        """组内重复是真 bug（轴取值列表里有重复项），不是"用户两处都写了"。"""
+        axes = make_axes(corner=["typical"], temperature=["-40.0"])
+        groups = [RunGroup(name="dup", axis_overrides={"temperature": ("55.0", "55.0")})]
+        with self.assertRaises(SpecError):
+            matrix.expand_runs(make_designs(1), axes, groups=groups)
+
+    def test_unknown_axis_in_a_group(self) -> None:
+        axes = make_axes(corner=["typical"])
+        groups = [RunGroup(name="oops", axis_overrides={"conrer": ("cbest",)})]
+        with self.assertRaises(SpecError) as ctx:
+            matrix.expand_runs(make_designs(1), axes, groups=groups)
+        message = str(ctx.exception)
+        self.assertIn("conrer", message)
+        self.assertIn("oops", message, "报错要说清是哪个组写错了")
+        self.assertIn("corner", message, "报错要把能用的轴名列出来")
+
+    def test_empty_override_in_a_group(self) -> None:
+        axes = make_axes(corner=["typical"])
+        groups = [RunGroup(name="empty", axis_overrides={"corner": ()})]
+        with self.assertRaises(SpecError):
+            matrix.expand_runs(make_designs(1), axes, groups=groups)
+
+    def test_duplicate_group_names(self) -> None:
+        axes = make_axes(corner=["typical", "cbest"])
+        groups = [
+            RunGroup(name="same", axis_overrides={"corner": ("cbest",)}),
+            RunGroup(name="same", axis_overrides={"corner": ("typical",)}),
+        ]
+        with self.assertRaises(SpecError):
+            matrix.expand_runs(make_designs(1), axes, groups=groups)
+
+    def test_design_override_wins_over_group_override(self) -> None:
+        """design 是这颗 design 的特例，压在组这层粗调之上（`expand_runs` 的套用顺序）。"""
+        axes = make_axes(corner=["typical"], temperature=["-40.0"])
+        designs = [
+            Design(library="MY_LIB", cell="CELL_A", view="layout"),
+            Design(
+                library="MY_LIB",
+                cell="CELL_B",
+                view="layout",
+                axis_overrides={"temperature": ("125.0",)},
+            ),
+        ]
+        groups = [RunGroup(name="hot", axis_overrides={"temperature": ("55.0",)})]
+        runs = matrix.expand_runs(designs, axes, groups=groups)
+        self.assertEqual(
+            [(r.design_key, r.axis_values["temperature"], r.group) for r in runs],
+            [
+                ("MY_LIB_CELL_A_layout", "-40.0", BASE_GROUP),
+                ("MY_LIB_CELL_B_layout", "125.0", BASE_GROUP),
+                ("MY_LIB_CELL_A_layout", "55.0", "hot"),
+            ],
+            "CELL_B 的组 run 被它自己的覆盖压回 125.0 ⇒ 和它的 base run 重合 ⇒ 折叠掉",
+        )
+
+    def test_a_group_named_base_is_merged_not_duplicated(self) -> None:
+        """调用方自己塞一个 name=base 的组时不另建组，只是排到最前（`core.spec` 走的是合并路）。"""
+        axes = make_axes(corner=["typical"], temperature=["-40.0"])
+        groups = [
+            RunGroup(name=BASE_GROUP),
+            RunGroup(name="hot", axis_overrides={"temperature": ("55.0",)}),
+        ]
+        report = matrix.expand_runs_detailed(make_designs(1), axes, groups=groups)
+        self.assertEqual([g for g, _ in report.per_group], [BASE_GROUP, "hot"])
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -182,7 +182,7 @@ _NEXT_STEPS: tuple[tuple[type, tuple[str, ...]], ...] = (
         SpecError,
         (
             "compare the spec with the built-in example: "
-            '`python -c "from ewave_batch.core.spec import EXAMPLE_SPEC; print(EXAMPLE_SPEC)"`',
+            "`python -c \"import sys; from ewave_batch.core.spec import EXAMPLE_SPEC; sys.stdout.buffer.write(EXAMPLE_SPEC.encode('utf-8'))\"`",
             "`dry-run <spec>` prints the whole matrix without writing anything",
         ),
     ),

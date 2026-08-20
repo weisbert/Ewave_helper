@@ -38,6 +38,8 @@ from ewave_batch.core import layout as layout_module
 from ewave_batch.core import matrix as matrix_module
 from ewave_batch.core import spec as spec_module
 from ewave_batch.model import (
+    BASE_GROUP,
+    BATCH_JSON_NAME,
     USER_FORBIDDEN_FLAGS,
     Axis,
     AxisKind,
@@ -53,6 +55,8 @@ from ewave_batch.model import (
     FlagDict,
     PlanContext,
     Run,
+    RunExpansion,
+    RunGroup,
     RunnerProtocol,
     RunStatus,
     SchedulerProtocol,
@@ -246,8 +250,9 @@ def mesh_flags_for(value: str) -> FlagDict:
         parts = parts * 3
     if len(parts) != 3 or not all(parts):
         raise SpecError(
-            f"网格取值 {value!r} 认不出：要么写一个数（三个 flag 同值），"
-            f"要么写三段 `边/纵向/via` —— 分别对应 {' '.join(MESH_FLAGS)}"
+            f"Mesh value {value!r} is not understood: write a single number (all three "
+            f"flags get it), or three segments edge/vertical/via separated by "
+            f"{MESH_SEP!r} - they map to {' '.join(MESH_FLAGS)} in that order."
         )
     return dict(zip(MESH_FLAGS, parts))
 
@@ -267,16 +272,20 @@ def axis_from_catalog(name: str, values: Sequence[str]) -> Axis:
     catalog = matrix_module.builtin_axis_catalog()
     axis = catalog.get(name)
     if axis is None:
-        raise SpecError(f"内置轴目录里没有 {name!r}")
+        raise SpecError(
+            f"There is no builtin axis called {name!r}.\n"
+            f"  Builtin axes: {', '.join(sorted(catalog))}"
+        )
     wanted = _dedup(values)
     known = {av.value: av for av in axis.values}
     if name in _TOGGLE_AXES or all(value in known for value in wanted):
         missing = [value for value in wanted if value not in known]
         if missing:
             raise SpecError(
-                f"轴 {name!r} 不认识取值 {', '.join(missing)} —— "
-                f"它只有 {', '.join(sorted(known))}（开关轴的取值不许现造，会让"
-                "目录名和命令行说两套话）"
+                f"Axis {name!r} does not know the value(s) {', '.join(missing)}.\n"
+                f"  Legal values: {', '.join(sorted(known))}\n"
+                "  (A toggle axis refuses to invent new values - guessing wrong makes the "
+                "directory name and the command line say two different things.)"
             )
         return replace(axis, values=tuple(known[value] for value in wanted))
     return matrix_module.axis_with_values(axis, wanted)
@@ -296,7 +305,7 @@ def mesh_axis(values: Sequence[str]) -> Axis:
         kind=AxisKind.GROUP,
         flags=MESH_FLAGS,
         short="mesh",
-        description="网格密度，一个取值同时改三个 flag（官方 0.4，eWave 默认 0.5）",
+        description="Mesh density - one value drives all three flags (site 0.4, eWave default 0.5)",
     )
 
 
@@ -322,7 +331,10 @@ def sweep_axis(mode: str, values: Sequence[str]) -> Axis:
         kind=AxisKind.VALUE,
         flags=SWEEP_AXIS_FLAGS,
         short="freq",
-        description=f"频率扫描（{mode}）—— 写 {flag}，另外两个用 False 抵消",
+        description=(
+            f"Frequency sweep ({mode}) - writes {flag}, "
+            "the other two are cancelled with False"
+        ),
     )
 
 
@@ -378,6 +390,12 @@ class GuiState:
 
         self._designs: list[Design] = []
         self._selection: dict[str, tuple[str, ...]] = dict(DEFAULT_AXIS_SELECTION)
+        self._groups: list[RunGroup] = []
+        """base **之外**的 run group。base 的取值就是 `_selection`，存两份必然漂
+        （`groups()` 现造一个空覆盖的 base 对象给界面用）。"""
+        self._active_group: str = BASE_GROUP
+        """界面正在编辑哪个组。`set_axis_values()` / `axis_selection()` 作用于它 ——
+        active = base 时这两个方法与加组之前**逐字相同**。"""
         self._sweep: dict[str, str] = dict(DEFAULT_SWEEP)
         self._extra_text = ""
         self._default_overrides: FlagDict = {}
@@ -406,7 +424,31 @@ class GuiState:
         spec = spec_module.load_spec(path)
         self._spec = spec
         self._designs = list(spec.designs)
+        # 组也要灌回界面，否则「Load 一个带 groups 的 spec」会静默退化成全笛卡尔积 ——
+        # 那正是 run group 要消灭的东西，而界面上完全看不出少了什么。
+        # 深拷一份 overrides：`BatchSpec` 里的 dict 后面还会被 `spec_to_batch` 用到。
+        self._groups = [
+            RunGroup(
+                name=group.name,
+                axis_overrides={k: tuple(v) for k, v in group.axis_overrides.items()},
+                label=group.label,
+            )
+            for group in spec.groups
+            if group.name != BASE_GROUP
+        ]
+        self._active_group = BASE_GROUP
         self._selection = self._selection_from_axes(spec.axes)
+        # spec 里可能带一条**显式的 base 组**：顶层 `axes:` 是全批次的轴**定义**（并集），
+        # base 自己扫哪几个由这条说了算。界面上"base 的勾选"就是 `_selection`，
+        # 所以把它落到 `_selection` 上，而**不是**当成第 N 个组 ——
+        # 当成组的话 `groups()` 会返回两个 base（它自己已经把 base 补在最前了）。
+        # 这条正是 `_axes_and_groups()` 加宽轴时写出去的那一条，一来一回要闭合。
+        for group in spec.groups:
+            if group.name != BASE_GROUP:
+                continue
+            for name, values in group.axis_overrides.items():
+                if name in self._selection:
+                    self._selection[name] = tuple(str(v) for v in values)
         self._sweep = self._sweep_from_axes(spec.axes)
         self._extra_text = " ".join(_render_flag_token(k, v) for k, v in spec.extra_flags.items())
         self._default_overrides = dict(spec.defaults)
@@ -654,16 +696,278 @@ class GuiState:
         return tuple((d.library, d.cell, d.view) for d in self._designs)
 
     def axis_selection(self) -> dict[str, tuple[str, ...]]:
-        """轴名 → 当前勾选的取值（拷贝，改它不影响状态）。"""
-        return dict(self._selection)
+        """**active group** 的有效取值（轴名 → 取值），拷贝，改它不影响状态。
+
+        active = base 时就是 base 自己的勾选，与加组之前**逐字相同**。
+        active 是别的组时返回**合并后**的有效值：这个组覆盖了的轴给它自己的取值，
+        没覆盖的轴给 base 的 - 界面上那一排勾选框显示的就该是这个组实际会跑的东西。
+        「这根轴到底是继承还是覆盖」问 `group_override()`（`None` = 继承）。
+        """
+        if self.active_group() == BASE_GROUP:
+            return dict(self._selection)
+        merged = dict(self._selection)
+        merged.update(
+            {name: tuple(values) for name, values in self._active().axis_overrides.items()}
+        )
+        return merged
 
     def set_axis_values(self, name: str, values: Sequence[str]) -> None:
-        """改一根轴的取值。`temperature` 会顺手归一成带小数位的写法。"""
-        cleaned = [str(v).strip() for v in values if str(v).strip()]
-        if name == "temperature":
-            cleaned = [normalize_temperature(v) for v in cleaned]
-        self._selection[name] = _dedup(cleaned)
+        """改一根轴的取值 - 落在 **active group** 上。`temperature` 顺手归一。
+
+        active = base：改 base 的勾选（与加组之前逐字相同）。
+        active 是别的组：写这个组的覆盖；空取值 = 撤销覆盖（回去继承 base）——
+        因为「空取值」对一个组来说不是"这根轴不扫"，而是笛卡尔积塌成 0 个 run，
+        `core.matrix` 对它明确拒绝。
+        """
+        target = self.active_group()
+        if target == BASE_GROUP:
+            self._set_base_values(name, values)
+        else:
+            self._set_group_values(target, name, values)
+
+    # ------------------------------------------------------------ run group
+    # 非冻结面（`docs/INTERFACES.md`「还没冻结的东西」）。模型见 INTERFACES 的
+    # 「run group」一节：批次 = 一列组，每组在 base 之上覆盖几根轴、各自取笛卡尔积、
+    # 结果取并集。**组是 delta**，所以这里存的永远只是覆盖，不是一份完整的轴表。
+
+    def groups(self) -> tuple[RunGroup, ...]:
+        """全部组，**第一个恒为 base**（现造的空覆盖对象）。
+
+        base 不存在 `self._groups` 里：它的轴就是界面上的勾选（`_selection`），
+        存两份必然漂 - 这也是 `BatchSpec.groups` 的口径（那里存的是 base 之外的组）。
+        """
+        return (RunGroup(name=BASE_GROUP),) + tuple(self._groups)
+
+    def active_group(self) -> str:
+        """当前在编辑哪个组。默认 base；组被删掉之后自动退回 base。"""
+        if self._active_group != BASE_GROUP and self._find_group(self._active_group) is None:
+            self._active_group = BASE_GROUP
+        return self._active_group
+
+    def set_active_group(self, name: str) -> None:
+        """切换正在编辑的组。名字不认识 -> `SpecError`（**不许静默退回 base**：
+        那会让用户以为自己在改某个组，实际上改的是基线）。"""
+        cleaned = str(name).strip() or BASE_GROUP
+        if cleaned != BASE_GROUP:
+            self._require_group(cleaned)
+        self._active_group = cleaned
+
+    def add_group(self, name: str = "") -> str:
+        """加一个空组并切过去，返回**实际用的名字**（重名自动加后缀）。
+
+        新组一根轴都不覆盖 => 它展开出来的 run 与 base 逐字相同 => 全被跨组去重吃掉
+        => 贡献 0 个 run。这不是 bug，是"还没配"的正常中间态；`group_run_counts()`
+        照样给它一行 0，界面上看得见。
+        """
+        actual = self._unique_group_name(name or "group")
+        self._groups.append(RunGroup(name=actual))
+        self._active_group = actual
         self._invalidate()
+        return actual
+
+    def duplicate_group(self, name: str) -> str:
+        """复制一个组（base 也能复制）成新组并切过去，返回新名字。
+
+        复制 base 时把当前勾选**逐轴写成显式覆盖** - 空覆盖的副本没有意义
+        （它就是 base），而写成显式覆盖之后用户改一根轴就得到一个真正的变体。
+        """
+        source = str(name).strip() or BASE_GROUP
+        if source == BASE_GROUP:
+            overrides = {
+                axis.name: tuple(av.value for av in axis.values) for axis in self._base_axes()
+            }
+            label = ""
+        else:
+            group = self._require_group(source)
+            overrides = {k: tuple(v) for k, v in group.axis_overrides.items()}
+            label = group.label
+        actual = self._unique_group_name(f"{source}-copy")
+        self._groups.append(RunGroup(name=actual, axis_overrides=overrides, label=label))
+        self._active_group = actual
+        self._invalidate()
+        return actual
+
+    def remove_group(self, name: str) -> None:
+        """删一个组。删 base -> `SpecError`（base 就是顶层的轴，删不掉）。
+
+        名字不存在是 **no-op**：界面上"删掉刚删过的那一行"是很自然的重复点击，
+        为它弹一个框没有意义；而删 base 是界面把按钮接错了，必须响。
+        """
+        cleaned = str(name).strip()
+        if cleaned == BASE_GROUP:
+            raise SpecError(
+                "The base group cannot be removed - it is the top-level axes themselves "
+                "(every batch has one).\n"
+                "  Next: to drop the extra runs, remove the other groups instead."
+            )
+        group = self._find_group(cleaned)
+        if group is None:
+            return
+        self._groups.remove(group)
+        if self._active_group == cleaned:
+            self._active_group = BASE_GROUP
+        self._invalidate()
+
+    def rename_group(self, old: str, new: str) -> None:
+        """改组名。base 改不了；新名字必须非空、不是 `base`、且不与别的组重名。"""
+        source = str(old).strip()
+        target = str(new).strip()
+        if source == BASE_GROUP or target == BASE_GROUP:
+            raise SpecError(
+                f"{BASE_GROUP!r} is a reserved group name (it means the top-level axes), "
+                "so it cannot be renamed or reused.\n"
+                "  Next: pick another name, e.g. eqcur-off"
+            )
+        if not target:
+            raise SpecError(
+                "A run group needs a name - it shows up in the Runs table and in every "
+                "message about that group.\n"
+                "  Next: e.g. eqcur-off"
+            )
+        group = self._require_group(source)
+        if target == source:
+            return
+        if self._find_group(target) is not None:
+            raise SpecError(
+                f"There is already a run group called {target!r} - two groups with one name "
+                "would shadow each other.\n"
+                "  Next: pick another name"
+            )
+        group.name = target
+        if self._active_group == source:
+            self._active_group = target
+        self._invalidate()
+
+    def group_override(self, axis: str, group: str = "") -> tuple[str, ...] | None:
+        """这个组在这根轴上的覆盖。`None` = **继承 base**（界面据此画"继承"的样子）。
+
+        `group` 省略 = active group。base 永远返回 `None`：base 没有"覆盖"这一说，
+        它的取值就是 `axis_selection()`。
+        """
+        name = str(group).strip() or self.active_group()
+        if name == BASE_GROUP:
+            return None
+        values = self._require_group(name).axis_overrides.get(str(axis))
+        return tuple(values) if values is not None else None
+
+    def set_group_override(self, axis: str, values: Sequence[str], group: str = "") -> None:
+        """给某个组的某根轴写覆盖。`group` 省略 = active group；`group` 是 base 时
+        改的就是 base 自己的勾选。空取值 = 撤销覆盖（见 `set_axis_values`）。"""
+        name = str(group).strip() or self.active_group()
+        if name == BASE_GROUP:
+            self._set_base_values(axis, values)
+            return
+        self._set_group_values(name, axis, values)
+
+    def clear_group_override(self, axis: str, group: str = "") -> None:
+        """把这根轴还给 base（继承）。base 上是 no-op - base 没有可撤的覆盖。"""
+        name = str(group).strip() or self.active_group()
+        if name == BASE_GROUP:
+            return
+        if self._require_group(name).axis_overrides.pop(str(axis), None) is not None:
+            self._invalidate()
+
+    def group_run_counts(self) -> list[tuple[str, int]]:
+        """`[(组名, 去重后的 run 数), ...]`，顺序 = `groups()`（base 在最前）。
+
+        数的是**跨组去重之后**的：两个组都写了 55 度时那个 run 归先出现的组
+        （base 排最前 => 基线永远归 base）。一个组的 run 全被吃掉时它就是 0，
+        界面照样要给它一行 - 0 正是"这个组还没改出任何新东西"的信号。
+        """
+        expansion = self._expansion()
+        counts = dict(expansion.per_group) if expansion is not None else {}
+        return [(group.name, counts.get(group.name, 0)) for group in self.groups()]
+
+    def merged_run_count(self) -> int:
+        """跨组撞车、被静默折叠掉的 run 数（界面显示 "5 runs (1 duplicate merged)"）。
+
+        这个数必须让人看见：只写 "5 runs" 会让用户以为自己那条组写错了、少展开了一个。
+        """
+        expansion = self._expansion()
+        return expansion.merged if expansion is not None else 0
+
+    def group_summary(self, name: str) -> str:
+        """一行摘要。组给 delta（`"+ 55.0, eqI off"`），base 给全量。"""
+        target = str(name).strip() or self.active_group()
+        axes = {axis.name: axis for axis in self._base_axes()}
+        if target == BASE_GROUP:
+            parts = [
+                _summary_fragment(axis, tuple(av.value for av in axis.values))
+                # 扫频不进摘要：它的取值本身带逗号（`adaptive,0:0.1:40`），塞进这行
+                # 会跟分隔符打架，而界面上它自己有一整排格子。
+                for axis in self._base_axes()
+                if axis.name != "freq"
+            ]
+            return ", ".join(parts) or "(no axes selected)"
+        group = self._require_group(target)
+        if not group.axis_overrides:
+            return "(inherits base - nothing overridden yet)"
+        parts = []
+        for axis_name, values in group.axis_overrides.items():
+            axis = axes.get(axis_name)
+            parts.append(
+                _summary_fragment(axis, tuple(values))
+                if axis is not None
+                else f"{axis_name} {'/'.join(str(v) for v in values)}"
+            )
+        return "+ " + ", ".join(parts)
+
+    def group_of(self, run_id: str) -> str:
+        """这个 run 出自哪个组。认不出的 run_id -> 空串。"""
+        run = self.run(run_id)
+        if run is None:
+            return ""
+        return run.group or BASE_GROUP
+
+    def groups_change_warning(self) -> str:
+        """改组之前该不该警告用户。没什么好警告的 -> 空串。
+
+        为什么这句话必须存在：`<axes-slug>` 只编码「全批次在变」的轴，而组的取值也算在
+        「全批次」里。于是**加一个组会改掉基线自己的目录名**（`base/...` 变成
+        `eqI-on__fw-off/...`）- 这是正确且不可避免的（否则两个组的 55 度落进同一个
+        目录 = 静默覆盖），但对一个已经跑过的批次来说，resume 靠 run_id 对号，
+        老目录当场就认不出来了。
+
+        ⚠️ **判据不能只看 `has_started()`**（那只是"本进程里点过 Dry-run/Submit"）。
+        批次跨天是常态（一个 run 10 核 / 100 GB / 35 分钟，BRIEF §12），最常见的场景
+        恰恰是"昨天跑完，今天重开 GUI 加个组" —— 那时 `self._driver is None`，
+        只看 `has_started()` 的话界面上一声不吭，而磁盘上那批 `base/...` 目录已经
+        对不上号了。所以磁盘上已经有这个批次的 `batch.json` 时同样要警告
+        （2026-08-19 复核实测）。
+        """
+        started = self.has_started()
+        on_disk = (not started) and self._batch_json_exists()
+        if not started and not on_disk:
+            return ""
+        head = (
+            "This batch has already been submitted once. "
+            if started
+            else "A batch with this name already exists on disk (%s). " % self._batch_json_path()
+        )
+        return (
+            head + "Editing run groups changes which "
+            "axes vary across the batch, and every varying axis goes into the directory name "
+            "- so the run ids change, the baseline ones included (base/... becomes "
+            "eqI-on__fw-off/... for example). Resume matches runs by run id, so the finished "
+            "runs already on disk would no longer be recognised.\n"
+            "  Next: press New batch (or pick another batch name) to start a fresh batch with "
+            "these groups, or leave the groups as they are."
+        )
+
+    def _batch_json_path(self) -> str:
+        """这个批次的 `batch.json` 该在哪。**不读盘**，只拼路径。"""
+        return os.path.join(self.batch_dir(), BATCH_JSON_NAME).replace("\\", "/")
+
+    def _batch_json_exists(self) -> bool:
+        """磁盘上已经有这个批次了没有。
+
+        探测失败（权限、路径怪）一律当"没有"：这条警告是提示，不该因为探测本身
+        把界面搞崩。
+        """
+        try:
+            return os.path.isfile(self._batch_json_path())
+        except OSError:  # pragma: no cover - 怪到 isfile 都抛的路径
+            return False
 
     def sweep(self) -> dict[str, str]:
         return dict(self._sweep)
@@ -809,27 +1113,58 @@ class GuiState:
 
     # -------------------------------------------------------------- 只读视图
     def run_count(self) -> int:
-        """当前勾选会展开出多少个 run。**不落盘、不建目录** —— 边勾边看的那个数。"""
-        try:
-            return len(matrix_module.expand_runs(self._designs, self._build_axes()))
-        except EwaveBatchError:
-            return 0
+        """当前勾选会展开出多少个 run。**不落盘、不建目录** - 边勾边看的那个数。
+
+        有组时这是**跨组去重之后**的数（两个组都写了 55 度只算一个），
+        与 `plan()` 真正建出来的条数一致 - 两个数不一致的话，界面上那个数就是谎话。
+        """
+        expansion = self._expansion()
+        return len(expansion.runs) if expansion is not None else 0
 
     def formula(self) -> str:
-        """`2 designs x 1 corner x 3 temp x 2 mode = 12 runs` 那一行。"""
-        selection = self.axis_selection()
-        parts = [f"{len(self._designs)} designs"]
-        for name, label in (
-            ("corner", "corner"),
-            ("temperature", "temp"),
-            ("fullWave", "mode"),
-        ):
-            parts.append(f"{len(selection.get(name, ()))} {label}")
-        return " x ".join(parts) + f" = {self.run_count()} runs"
+        """算式那一行。
+
+        只有 base 时保持今天的写法 `2 designs x 1 corner x 3 temp x 2 mode = 12 runs`
+        （最常见的场景不该因为多了一个功能而变难懂）。
+        有组时改成 `2 designs x (3 + 1 + 1) = 10 runs`：括号里逐组一项，因为这时候
+        整批已经不是一个笛卡尔积了，写成连乘就是假的。
+        """
+        expansion = self._expansion()
+        total = len(expansion.runs) if expansion is not None else 0
+        merged = expansion.merged if expansion is not None else 0
+        tail = f" = {total} runs"
+        if merged:
+            word = "duplicate" if merged == 1 else "duplicates"
+            tail += f" ({merged} {word} merged)"
+        per_group = [count for _name, count in (expansion.per_group if expansion else ())]
+        if len(per_group) <= 1:
+            # 实际参与展开的只有 base（没有组，或者组都还空着）=> 用今天的连乘写法。
+            # 空组写成 `1 designs x (1)` 是纯噪声：那个括号里永远只有基线自己。
+            selection = self.axis_selection()
+            parts = [f"{len(self._designs)} designs"]
+            for name, label in (
+                ("corner", "corner"),
+                ("temperature", "temp"),
+                ("fullWave", "mode"),
+            ):
+                parts.append(f"{len(selection.get(name, ()))} {label}")
+            return " x ".join(parts) + tail
+        designs = len(self._designs)
+        # 每组的 run 数都能被 design 数整除时才把 design 提到括号外 - 提不出来
+        # （某个 design 自己覆盖了轴）就老实写各组的总数，宁可难看也别写错。
+        if designs and all(count % designs == 0 for count in per_group):
+            inner = " + ".join(str(count // designs) for count in per_group)
+            return f"{designs} designs x ({inner})" + tail
+        return " + ".join(str(count) for count in per_group) + tail
 
     def axis_counts(self) -> dict[str, int]:
-        """轴名 → 取值个数（界面上每一行右边那个 `-> N`）。"""
-        counts = {name: len(values) for name, values in self._selection.items()}
+        """轴名 -> 取值个数（界面上每一行右边那个 `-> N`）。
+
+        口径跟着 **active group** 走（用的就是 `axis_selection()`）：选中一个组的时候，
+        每根轴右边那个 `-> N` 说的必须是这个组实际会扫几个值，否则界面在说谎 -
+        用户看着 `temperature -> 3` 却只跑出 1 个 run。active = base 时与以前逐字相同。
+        """
+        counts = {name: len(values) for name, values in self.axis_selection().items()}
         counts["freq"] = 1
         counts["design"] = len(self._designs)
         return counts
@@ -909,6 +1244,74 @@ class GuiState:
         return f"Finished - {counts['done']} / {total} done, {counts['failed']} failed"
 
     # ------------------------------------------------------------ 内部
+    def _find_group(self, name: str) -> RunGroup | None:
+        for group in self._groups:
+            if group.name == name:
+                return group
+        return None
+
+    def _require_group(self, name: str) -> RunGroup:
+        """按名字取组。`base` 也进不来 - 调用方必须先自己处理 base 那条分支。"""
+        group = self._find_group(str(name).strip())
+        if group is None:
+            raise SpecError(
+                f"There is no run group called {str(name)!r} in this batch.\n"
+                f"  Groups: {', '.join(item.name for item in self.groups())}\n"
+                "  Next: pick one of the names above, or add the group first"
+            )
+        return group
+
+    def _active(self) -> RunGroup:
+        return self._require_group(self.active_group())
+
+    def _unique_group_name(self, wanted: str) -> str:
+        """想要的名字 -> 没被占用的名字。`base` 是保留名，也算被占用。"""
+        stem = str(wanted).strip() or "group"
+        taken = {BASE_GROUP} | {group.name for group in self._groups}
+        if stem not in taken:
+            return stem
+        index = 2
+        while f"{stem}-{index}" in taken:
+            index += 1
+        return f"{stem}-{index}"
+
+    def _clean_values(self, name: str, values: Sequence[str]) -> tuple[str, ...]:
+        """界面给的取值 -> 干净的取值（去空、去重，温度归一）。归一见 `normalize_temperature`。"""
+        cleaned = [str(value).strip() for value in values if str(value).strip()]
+        if name == "temperature":
+            cleaned = [normalize_temperature(value) for value in cleaned]
+        return _dedup(cleaned)
+
+    def _set_base_values(self, name: str, values: Sequence[str]) -> None:
+        """改 base 自己的勾选（加组之前 `set_axis_values` 的全部行为）。"""
+        self._selection[str(name)] = self._clean_values(str(name), values)
+        self._invalidate()
+
+    def _set_group_values(self, group: str, name: str, values: Sequence[str]) -> None:
+        """改某个组在某根轴上的覆盖。空取值 = 撤销覆盖（回去继承 base）。"""
+        target = self._require_group(group)
+        axis_name = str(name)
+        cleaned = self._clean_values(axis_name, values)
+        if not cleaned:
+            if target.axis_overrides.pop(axis_name, None) is not None:
+                self._invalidate()
+            return
+        base_axes = {axis.name: axis for axis in self._base_axes()}
+        axis = base_axes.get(axis_name)
+        if axis is None:
+            raise SpecError(
+                f"Run group {target.name!r} cannot override axis {axis_name!r}: that axis has "
+                "no values selected in the base group, so it is not part of this batch.\n"
+                f"  Axes in this batch: {', '.join(sorted(base_axes)) or '(none at all)'}\n"
+                "  Next: select at least one value for it in the base group first "
+                "(a group only lists the axes it changes, everything else is inherited)"
+            )
+        # 当场校验一遍取值：留到 plan() 才炸的话，用户已经忘了自己刚点了什么，
+        # 而这里能说清"这根轴的合法取值是哪几个"。
+        self._axis_with_gui_values(axis_name, tuple(av.value for av in axis.values) + cleaned)
+        target.axis_overrides[axis_name] = cleaned
+        self._invalidate()
+
     def _invalidate(self) -> None:
         """勾选变了 ⇒ 上一次 plan 的结果作废。**正在跑的批次不动**（改设定不该动它）。"""
         if not self._running:
@@ -920,7 +1323,132 @@ class GuiState:
             self._on_event(event)
 
     def _build_axes(self) -> list[Axis]:
-        """当前勾选 → 轴清单。取值为空的轴直接不出现（笛卡尔积会塌成空集）。
+        """全批次口径的轴清单（`axes()` / `_spec_snapshot()` 用的就是它）。
+
+        没有组时逐字等于 `_base_axes()`。有组、且某个组的取值这根轴**表达不出来**时
+        才会加宽（见 `_axes_and_groups`），加宽的代价由一条显式的 base 组覆盖抵消。
+        """
+        return self._axes_and_groups()[0]
+
+    def _axes_and_groups(self) -> tuple[list[Axis], list[RunGroup]]:
+        """一次算出「传给 `expand_runs` 的轴」和「传给它的组」。两样必须配套算出来。
+
+        为什么会有"加宽"这一步：`matrix.axes_for_group` 靠 `axis_with_values` 把组写的
+        取值套到轴上，而它只在**能安全翻译**的时候才现造 `AxisValue`（开关轴 on/off
+        写法不同 => 拒绝而不是猜）。界面自己造的 mesh / freq 轴的取值带的是**具体**
+        flag（`-e 0.4/-d 0.5`、`--multiSweep=adaptive,0:0.1:40`），没有 `{value}` 占位符
+        => 一个组想换一个 mesh 写法时核心翻译不出来。
+        解法是把那几个取值先并进轴的取值表（用界面自己的构造器算好 flag），再用一条
+        **显式的 base 组**把 base 自己那份取值锁回去 - 否则加宽会让基线也跟着多扫几个 run。
+        `matrix._all_groups` 明确支持调用方自己塞一个 `base` 组（会被挪到最前）。
+
+        ⚠️ 锁回去的**不只是 base**：加宽是"改轴的定义"，而轴的定义对**每一个**组都生效。
+        只锁 base 的话，任何一个没碰这根轴的**兄弟组**都会继承加宽后的取值表，
+        于是它替别的组要的那个取值也扫一遍 —— 2026-08-19 复核实测：base 3 个 run，
+        `mesh-var` 组要 mesh 0.45，另一个只改 equalCurrent 的组就从 1 个 run 变成 2 个
+        （多出来的那条 slug 里带着 `mesh-0_45`，而它根本没要过 0.45）。
+        一个 run 是 10 核 / 100 GB / 35 分钟，多扫一条不是显示问题。
+        所以下面对**所有**组补一层"这根轴按 base 来"的覆盖，只有自己写过这根轴的组豁免。
+        """
+        axes = self._base_axes()
+        groups = self._groups_for_expand(axes)
+        if not groups:
+            # 一个组都没有 => 与加组之前**逐字相同**（这条是最大的回归风险，有测试守着）。
+            return axes, []
+        widened: list[Axis] = []
+        base_overrides: dict[str, tuple[str, ...]] = {}
+        for axis in axes:
+            extra = self._values_axis_cannot_express(axis, groups)
+            if not extra:
+                widened.append(axis)
+                continue
+            base_values = tuple(av.value for av in axis.values)
+            try:
+                widened.append(self._axis_with_gui_values(axis.name, base_values + extra))
+            except EwaveBatchError as exc:
+                # 加宽本身失败（组里写了一个这根轴根本不认识的取值）=> 保持窄的那份，
+                # 让 `expand_runs` 去报那条更具体的错。这里不许静默丢掉用户的设定。
+                self._note(f"run group value not usable on axis {axis.name!r}: {exc}")
+                widened.append(axis)
+                continue
+            base_overrides[axis.name] = base_values
+        if base_overrides:
+            # 兄弟组：没写过这根轴的，一律钉回 base 的取值（继承的语义就是"跟 base 一样"，
+            # 而加宽之后"轴的默认取值"已经不是 base 那份了）。
+            for group in groups:
+                for name, base_values in base_overrides.items():
+                    group.axis_overrides.setdefault(name, base_values)
+            groups.insert(0, RunGroup(name=BASE_GROUP, axis_overrides=dict(base_overrides)))
+        return widened, groups
+
+    def _groups_for_expand(self, axes: Sequence[Axis]) -> list[RunGroup]:
+        """界面上的组 -> 能交给核心的组（拷贝，核心改不到界面状态）。
+
+        丢掉两种东西：**一根轴都没覆盖的组**（它展开出来就是 base，全被去重吃掉，
+        而 `core.spec` 会拒绝把这种组写进 spec 文件，留着就存不下来）；
+        **界面表达不出来的轴上的覆盖**（记一条 note，不静默）。
+        """
+        known = {axis.name for axis in axes}
+        out: list[RunGroup] = []
+        for group in self._groups:
+            overrides = {
+                name: tuple(values)
+                for name, values in group.axis_overrides.items()
+                if name in known
+            }
+            dropped = sorted(name for name in group.axis_overrides if name not in known)
+            if dropped:
+                self._note(
+                    f"run group {group.name!r}: ignored override(s) for {', '.join(dropped)} "
+                    "- that axis has no values selected in the base group"
+                )
+            if not overrides:
+                continue
+            out.append(
+                RunGroup(name=group.name, axis_overrides=overrides, label=group.label)
+            )
+        return out
+
+    def _values_axis_cannot_express(
+        self, axis: Axis, groups: Sequence[RunGroup]
+    ) -> tuple[str, ...]:
+        """这些组在这根轴上写了、而 `matrix.axis_with_values` 翻译不出来的取值。"""
+        extra: list[str] = []
+        for group in groups:
+            for value in group.axis_overrides.get(axis.name, ()):
+                text = str(value)
+                if text in extra:
+                    continue
+                try:
+                    matrix_module.axis_with_values(axis, [text])
+                except EwaveBatchError:
+                    extra.append(text)
+        return tuple(extra)
+
+    def _axis_with_gui_values(self, name: str, values: Sequence[str]) -> Axis:
+        """轴名 + 取值 -> `Axis`，走**界面自己的**构造器（flag 由它们算，只有一份实现）。"""
+        if name == "mesh":
+            return mesh_axis(values)
+        if name == "freq":
+            return sweep_axis(self._sweep.get("mode", "adaptive"), values)
+        return axis_from_catalog(name, values)
+
+    def _expansion(self) -> RunExpansion | None:
+        """现在这套勾选展开出什么（run 数 / 每组几个 / 折叠了几个）。展不开 -> None。
+
+        展不开在界面上是**常态**（一个 design 都没勾就是空矩阵），所以这里吞异常；
+        真正会炸的地方是 `plan()`，那条路上错误有地方显示。
+        """
+        axes, groups = self._axes_and_groups()
+        try:
+            return matrix_module.expand_runs_detailed(
+                self._designs, axes, options=self._options, groups=groups
+            )
+        except EwaveBatchError:
+            return None
+
+    def _base_axes(self) -> list[Axis]:
+        """base 组的轴清单。取值为空的轴直接不出现（笛卡尔积会塌成空集）。
 
         顺序是固定的：corner → temperature → 频率 → mesh → fullWave → equalCurrent →
         两个 tolerance。`expand_runs` 保证"第一根轴变得最慢"，于是 runs 表的行序稳定，
@@ -955,12 +1483,19 @@ class GuiState:
         return axes
 
     def _spec_snapshot(self) -> BatchSpec:
-        """当前界面状态 → 一份 `BatchSpec`（`plan()` 和「Save spec」共用这一条路）。"""
+        """当前界面状态 -> 一份 `BatchSpec`（`plan()` 和「Save spec」共用这一条路）。
+
+        组也要进去，两个理由：`plan()` 靠 `spec_to_batch` 把它们传给 `expand_runs`
+        （不传的话组只存不跑）；「Save spec as...」靠它把界面上配的组写回文件
+        （不传的话存下来的 spec 与界面显示的不是一回事）。
+        """
+        axes, groups = self._axes_and_groups()
         return BatchSpec(
             batch_name=self.batch_name,
             batch_root=self.batch_root,
             designs=list(self._designs),
-            axes=self._build_axes(),
+            axes=axes,
+            groups=groups,
             defaults=dict(self._default_overrides),
             extra_flags=parse_extra_flags(self._extra_text),
             options=self._options,
@@ -1071,6 +1606,19 @@ class GuiState:
 # --------------------------------------------------------------------------
 # 私有小工具
 # --------------------------------------------------------------------------
+
+
+def _summary_fragment(axis: Axis, values: Sequence[str]) -> str:
+    """一根轴 + 取值 -> 摘要里的一段（`"55.0"` / `"eqI off"`）。
+
+    corner / temperature 不带前缀：它们进的是 eWave 自己那层 `<corner>_<temp>` 目录名，
+    在摘要里也就是"位置就说明了它是什么"。其余轴带 `short`（`eqI` / `fw` / `mesh`），
+    否则 `"off"` 一个词根本看不出说的是哪根轴。
+    """
+    body = "/".join(str(value) for value in values)
+    if axis.encoded_in_ewave_dir:
+        return body
+    return f"{axis.short or axis.name} {body}"
 
 
 def _flag_value_text(value: object) -> str:

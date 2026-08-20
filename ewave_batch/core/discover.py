@@ -278,20 +278,22 @@ def ptxt_path_for_corner(facts: SiteFacts, corner: str) -> str:
     """
     if not facts.ptxt_name_template:
         raise DiscoveryError(
-            "SiteFacts.ptxt_name_template 是空的 —— 没能从官方 ptxt 路径里认出 corner 那一段，\n"
-            "  于是换 corner 时 --emssTechFile 会**不跟着变**：目录名说一个工艺角、\n"
-            "  实际算的是另一个，而且跑得出来、数字也像（BRIEF §7）。\n"
-            "  下一步（三选一）：\n"
-            "    1) 确认官方 run 目录里 run_ewave_*.sh 的 --emssTechFile 文件名里确实带 corner 名；\n"
-            "    2) corner 名与文件名里那一段拼写不同时，在 spec 的 corner 轴上直接写死\n"
-            "       --emssTechFile 的取值（轴的 flags 支持多 flag）；\n"
-            "    3) 这个批次本来就不扫 corner 轴 —— 那就别让 corner 轴进 spec。"
+            "SiteFacts.ptxt_name_template is empty - the corner segment could not be recognized\n"
+            "  inside the official ptxt path, so switching corner leaves --emssTechFile UNCHANGED:\n"
+            "  the directory name says one process corner while another one is actually solved,\n"
+            "  and it still runs and the numbers still look plausible (BRIEF sec. 7).\n"
+            "  Next (pick one):\n"
+            "    1) check that --emssTechFile in run_ewave_*.sh of the official run dir really\n"
+            "       carries the corner name in its file name;\n"
+            "    2) if the corner name is spelled differently there, pin --emssTechFile directly\n"
+            "       on the corner axis in the spec (an axis may carry several flags);\n"
+            "    3) if this batch does not sweep corner at all, keep the corner axis out of the spec."
         )
     if _PTXT_CORNER_KEY not in facts.ptxt_name_template:
         raise DiscoveryError(
-            f"SiteFacts.ptxt_name_template 里没有 {_PTXT_CORNER_KEY} 占位符"
-            f"（拿到的是 {facts.ptxt_name_template!r}）—— 换 corner 会得到一条**没变**的 ptxt 路径。\n"
-            "  下一步：让 discover_site_facts 重新解析官方 run 目录，别手工拼这个字段。"
+            f"SiteFacts.ptxt_name_template has no {_PTXT_CORNER_KEY} placeholder "
+            f"(got {facts.ptxt_name_template!r}) - switching corner would yield an UNCHANGED ptxt path.\n"
+            "  Next: let discover_site_facts re-parse the official run dir; do not hand-build this field."
         )
     name = facts.ptxt_name_template.replace(_PTXT_CORNER_KEY, corner)
     directory = facts.ptxt_dir or posixpath.dirname(facts.ptxt)
@@ -308,7 +310,8 @@ def _ptxt_name_template(ptxt: str, corner: str) -> tuple[str, int]:
     2. **词边界**（前后不是字母/数字）。`atypical` 里的 `typical` 不是 corner，
        换掉它得到的是 `acworst` 这种没人能一眼看出错的字符串。
        `_` / `.` / `-` **算**边界 —— ptxt 文件名就是用 `_` 分段的
-       （`…_AL28K_<corner>_V1.0_encrypted_package.ptxt`）。
+       （形如 `<工艺标识若干段>_<corner>_<版本>_….ptxt`；具体分几段、每段叫什么是站点身份，
+       不进源码，运行时从官方 run 目录里现读，硬约束 1b）。
 
     命中 > 1 次时照样全换，但调用方会记一条 warning：文件名里出现两处 corner
     本身就是歧义，静默挑一处才是更坏的选择。
@@ -475,27 +478,28 @@ def _validate_official_dir(official_run_dir: str) -> str:
     """三道闸，每条错误都带一条能照着做的下一步。返回 `gdsout_setup` 的路径。"""
     if not official_run_dir or not official_run_dir.strip():
         raise DiscoveryError(
-            "没给官方 run 目录 —— 不知道去哪儿解析站点坐标。\n"
-            "  它是官方 GUI（eWave on Virtuoso）跑过的那个 design 目录，长这样：\n"
-            "    <workarea>/ewave_simulation/<library>_<topCell>_<view>/   （里面有 gdsout_setup）\n"
-            "  下一步：spec 里写 designs[].official_run_dir，或 CLI 传 --official-run-dir。\n"
+            "no official run dir given - nowhere to parse the site coordinates from.\n"
+            "  It is the design dir the official GUI (eWave on Virtuoso) has run in, shaped like:\n"
+            "    <workarea>/ewave_simulation/<library>_<topCell>_<view>/   (it contains gdsout_setup)\n"
+            "  Next: set designs[].official_run_dir in the spec, or pass --official-run-dir on the CLI.\n"
             + _candidates_help(os.getcwd())
         )
     path = official_run_dir.strip()
     if not os.path.isdir(path):
-        what = "是个文件，不是目录" if os.path.exists(path) else "不存在"
+        what = "is a file, not a directory" if os.path.exists(path) else "does not exist"
         raise DiscoveryError(
-            f"官方 run 目录{what}: {path}\n"
-            "  下一步：确认路径拼写（红区路径很长，打错一个字符后面全废）。\n"
+            f"the official run dir {what}: {path}\n"
+            "  Next: check the spelling (these paths are long; one wrong character ruins everything).\n"
             + _candidates_help(os.path.dirname(os.path.abspath(path)) or os.getcwd())
         )
     setup_path = os.path.join(path, _SETUP_NAME)
     if not os.path.isfile(setup_path):
         raise DiscoveryError(
-            f"{path} 里没有 {_SETUP_NAME} —— 这不像是官方 GUI 的 design 目录。\n"
-            f"  判据就是这个文件：官方 stream out 时会把它留在 design 目录里。\n"
-            "  下一步：多半是指到了上一级（ewave_simulation/）或指到了 <corner>_<temp>/ 子目录，\n"
-            "  往下/往上挪一层再试。\n" + _candidates_help(path)
+            f"{path} has no {_SETUP_NAME} - this does not look like an official GUI design dir.\n"
+            f"  That file is the criterion: the official stream out leaves it in the design dir.\n"
+            "  Next: you most likely pointed at the parent (ewave_simulation/) or into a\n"
+            "  <corner>_<temp>/ subdir - move one level down, or one level up, and try again.\n"
+            + _candidates_help(path)
         )
     return setup_path
 
@@ -512,9 +516,9 @@ def _candidates_help(root: str) -> str:
         if len(candidates) >= 10:
             break
     if not candidates:
-        return "  -- 在附近没找到含 gdsout_setup 的目录（请手动指定）--"
+        return "  -- no directory containing gdsout_setup found nearby (please name one yourself) --"
     listed = "\n".join("    " + c for c in candidates[:10])
-    return "  -- 在附近找到的候选（直接抄一行）--\n" + listed
+    return "  -- candidates found nearby (copy one of these lines) --\n" + listed
 
 
 def _read_gdsout(facts: SiteFacts, setup_path: str, source_files: dict[str, str]) -> None:
@@ -540,24 +544,24 @@ def _read_run_script(
     scripts = _find_run_scripts(directory)
     if not scripts:
         warnings.append(
-            f"{directory} 里没有 {_RUNSH_GLOB_PREFIX}*{_RUNSH_SUFFIX} —— "
-            "ptxt / key / corner / 端口表全解析不出来。"
-            "下一步：在官方 GUI 里对这个 design 跑一次（哪怕只是生成脚本），再回来。"
+            f"{directory} has no {_RUNSH_GLOB_PREFIX}*{_RUNSH_SUFFIX} - "
+            "ptxt / key / corner / port list cannot be parsed at all. "
+            "Next: run this design once in the official GUI (generating the scripts is enough), then come back."
         )
         return
     if len(scripts) > 1:
         warnings.append(
-            f"官方 run 脚本有 {len(scripts)} 份，取排序后的第一份 "
-            f"({os.path.basename(scripts[0])})。它们之间通常只差 corner/temperature，"
-            "但 flag 若真有分歧，学到的默认表就取决于文件名排序 —— 值得看一眼。"
+            f"there are {len(scripts)} official run scripts; taking the first one after sorting "
+            f"({os.path.basename(scripts[0])}). They usually differ only in corner/temperature, "
+            "but if the flags really disagree the learned default table depends on file name order - worth a look."
         )
     script_path = scripts[0]
     text = _read_text(script_path)
     line = template.extract_command_line(text, program="ewave")
     if line is None:
         warnings.append(
-            f"{script_path} 里没找到 ewave 那一行 —— 官方脚本的形态可能变了。"
-            "下一步：打开它确认第一条非注释命令确实是 ewave（或它的绝对路径）。"
+            f"no ewave line found in {script_path} - the shape of the official script may have changed. "
+            "Next: open it and check that the first non-comment command really is ewave (or its absolute path)."
         )
         return
 
@@ -582,18 +586,19 @@ def _read_run_script(
         facts.ptxt_name_template = name_template
         if hits == 0:
             warnings.append(
-                f"ptxt 文件名里没认出 corner ({facts.corner!r})，"
-                "换 corner 时 --emssTechFile 不会跟着变（BRIEF §7 要求同时改两处）。"
-                "下一步：corner 轴上直接写死 --emssTechFile 的取值，或别扫 corner 轴。"
+                f"the corner ({facts.corner!r}) was not recognized inside the ptxt file name, so "
+                "--emssTechFile will not follow when corner changes (BRIEF sec. 7 wants both changed together). "
+                "Next: pin the --emssTechFile value on the corner axis, or do not sweep the corner axis."
             )
         elif hits > 1:
             warnings.append(
-                f"ptxt 文件名里 corner ({facts.corner!r}) 出现了 {hits} 次，全部换掉了。"
-                "下一步：换 corner 之后核对一眼 --emssTechFile 是不是你要的那个文件。"
+                f"the corner ({facts.corner!r}) appears {hits} times in the ptxt file name; all of them were replaced. "
+                "Next: after switching corner, double-check that --emssTechFile points at the file you wanted."
             )
     else:
         warnings.append(
-            "官方命令里没有 --emssTechFile —— ptxt 路径解析不出来，corner 轴会跑不起来。"
+            "the official command has no --emssTechFile - the ptxt path cannot be parsed "
+            "and the corner axis will not work."
         )
 
     for name in (
@@ -638,8 +643,8 @@ def _read_remote_script(
     remote_path = os.path.join(directory, _REMOTE_NAME)
     if not os.path.isfile(remote_path):
         warnings.append(
-            f"{directory} 里没有 {_REMOTE_NAME} —— dsub 的账号/队列/资源没学到。"
-            "下一步：在 spec 的 scheduler 段里显式写 account / queue / resources。"
+            f"{directory} has no {_REMOTE_NAME} - the dsub account/queue/resources were not learned. "
+            "Next: write account / queue / resources explicitly in the scheduler section of the spec."
         )
         return
     options = parse_dsub_options(_read_text(remote_path))
@@ -655,8 +660,8 @@ def _read_remote_script(
             source_files[name] = remote_path
         else:
             warnings.append(
-                f"{_REMOTE_NAME} 里没解析出 dsub 的 {key} —— 该字段留空，"
-                "下一步：在 spec 的 scheduler 段里显式给它。"
+                f"could not parse the dsub {key} out of {_REMOTE_NAME} - the field stays empty. "
+                "Next: give it explicitly in the scheduler section of the spec."
             )
 
 
@@ -680,8 +685,9 @@ def _resolve_tools(
             source_files[attr] = f"which:{name}"
         else:
             warnings.append(
-                f"PATH 上没有 {name}（也没有 {name.upper()}_BIN / {name.upper()}_ABS 环境变量）——"
-                f" 本机没装是正常的，dry-run 照跑；真提交前需要 `ma` 出 {name} 所在的模块。"
+                f"{name} is not on PATH (and no {name.upper()}_BIN / {name.upper()}_ABS env var either) - "
+                f"not having it on a dev box is normal and dry-run still works; "
+                f"before a real submit, `ma` the module that provides {name}."
             )
 
 

@@ -32,17 +32,29 @@ from typing import ClassVar, Protocol, runtime_checkable
 # 版本
 # --------------------------------------------------------------------------
 
-INTERFACE_VERSION = 2
+INTERFACE_VERSION = 3
 """冻结接口的版本。任何 `[interface-change]` commit 都要 +1。
 
 * 1 → 2（P2 复审返工）：**只加符号 + 改注释，没动任何已有签名** ——
   `core.cmd.KEY_FLAG`、`tools.strmout` 的 7 个跨模块符号、新模块条目
   `ewave_batch.redzone_dryrun`，外加 `render_ports` 的 docstring 与实现对齐
   （`ALL` → 返回空 list，`--all` 由机制层出）。老调用方一个都不用改。
+* 2 → 3（run group 组合模型，用户 2026-08-19 拍板）：新增 `BASE_GROUP` / `RunGroup` /
+  `RunExpansion`，`BatchSpec` 与 `BatchState` 各加一个 `groups` 字段、`Run` 加 `group`，
+  并给 `varying_axes` / `expand_runs` 加了 keyword-only 的 `groups` 参数
+  （**默认空 = 逐字保持老行为**，所以老调用方不用改，但签名变了 ⇒ 必须 +1）。
+  理由：全批次一个笛卡尔积表达不了「typical@3 温度 + typical@55 关 eqI + typical@55 开 fw」
+  这种「基线 + 几个单点变体」，硬凑要跑 12 个 run 里 7 个是废的，而一个 run 是 10 核/100GB/35 分钟。
 """
 
 SCHEMA_VERSION = 1
-"""`batch.json` 的 schema 版本。读到更大的值要拒绝而不是猜。"""
+"""`batch.json` 的 schema 版本。读到更大的值要拒绝而不是猜。
+
+**加 `Run.group` / `BatchState.groups` 时判断过要不要 +1，结论是不用**：两个新字段都带默认值
+⇒ 老的 `batch.json`（没这两个键）读回来是合法对象，新写出来的多几个键也被
+`state_from_dict` 的逐键 `get` 忽略 ⇒ 双向兼容。什么时候才要 +1：某个新字段变成
+**resume 正确性的必要输入**（缺了会把别人的批次跑坏），那时候「拒绝而不是猜」才有意义。
+"""
 
 
 # --------------------------------------------------------------------------
@@ -211,6 +223,13 @@ BASE_SLUG = "base"
 """没有额外轴时 `<axes-slug>` 的取值（BRIEF §5）。此时 `runs/<design>/base/<corner>_<temp>/`
 的内层与官方目录同构，只多插了一层常量 —— 不重复、不跟工具对抗。"""
 
+BASE_GROUP = "base"
+"""base 组的固定名字（`RunGroup`）。批次里**永远有** base 组，它的轴就是顶层 `axes:`。
+
+⚠️ 取值恰好和 `BASE_SLUG` 一样，但**两者没有关系**：`BASE_SLUG` 是目录名的一段，
+`BASE_GROUP` 是组的身份。别在代码里互相当对方用 —— 哪天其中一个要改名，另一个不该跟着动。
+"""
+
 AXIS_SLUG_SEP = "__"
 """轴之间的分隔符。**双下划线** —— 单下划线已经被温度占用（`-40.0` → `-40_0`）。"""
 
@@ -303,8 +322,14 @@ RUNS_CSV_COLUMNS: tuple[str, ...] = (
     "converged",
     "sparam",
     "message",
+    "group",
 )
-"""`runs.csv` 的表头。**冻结** —— 下游（v2 的批量对比）按列名读，加列只许往后追加。"""
+"""`runs.csv` 的表头。**冻结** —— 下游（v2 的批量对比）按列名读，加列只许往后追加。
+
+`group` 是 2026-08-19 追加的最后一列（run group，D14）。追加在最末尾是有意的：
+按列名读的下游一个字都不用改，按列号读的下游读到的仍是原来那几列。
+没有 `groups:` 的批次这一列恒为 `base`。
+"""
 
 
 # --------------------------------------------------------------------------
@@ -328,7 +353,9 @@ class PortSpec:
 
     def __post_init__(self) -> None:
         if self.mode is PortMode.EXPLICIT and not self.mapping:
-            raise SpecError("PortSpec(EXPLICIT) 必须给 mapping —— 否则 ewave 一个端口都不会有")
+            raise SpecError(
+                "PortSpec(EXPLICIT) needs a mapping - otherwise ewave gets no ports at all"
+            )
 
 
 @dataclass(frozen=True)
@@ -375,9 +402,11 @@ class Axis:
 
     def __post_init__(self) -> None:
         if not self.name:
-            raise SpecError("Axis.name 不能为空")
+            raise SpecError("Axis.name must not be empty")
         if not self.values:
-            raise SpecError(f"Axis {self.name!r} 一个取值都没有 —— 笛卡尔积会塌成空集")
+            raise SpecError(
+                f"Axis {self.name!r} has no values - the cartesian product collapses to nothing"
+            )
 
 
 @dataclass
@@ -414,7 +443,35 @@ class Design:
     def __post_init__(self) -> None:
         missing = [n for n, v in (("library", self.library), ("cell", self.cell), ("view", self.view)) if not v]
         if missing:
-            raise SpecError(f"Design 缺字段: {', '.join(missing)}（三元组必须齐，view 尤其不能省）")
+            raise SpecError(
+                f"Design is missing: {', '.join(missing)} "
+                "(the (library, cell, view) triple must be complete; view especially "
+                "cannot be omitted - a cellview derived for EM extraction is not 'layout')"
+            )
+
+
+@dataclass
+class RunGroup:
+    """一组设定 = base 轴上的一层覆盖。批次 = 一列 `RunGroup`，run 取各组展开结果的**并集**。
+
+    存在的理由（用户 2026-08-19 拍板）：全批次一个笛卡尔积表达不了「一条基线 + 几个单点变体」。
+    `typical @ {-40, 55, 125}` 再加「55 度那点单独关掉 equalCurrent」和「55 度那点单独开 fullWave」
+    一共 5 个 run；笛卡尔积最接近的写法 `{typical}×{3 温度}×{eqI on/off}×{fw on/off}` 是 12 个，
+    7 个是废的 —— 而一个 run 的量级是 10 核 / 100GB / 35 分钟（BRIEF §12），这是硬成本。
+
+    **组是 delta，不是重写一遍**：只列它覆盖的轴，其余继承 base。于是 base 有多少根轴，
+    一个组永远只占两行，写得进 spec 文件、能 diff、能带注释。
+
+    形状为什么长得和 `Design.axis_overrides` 一模一样：合并操作 `matrix.axes_for_design`
+    已经有了且已有测试，`matrix.axes_for_group` 是同一个函数换个主人，不引入任何新语义。
+    """
+
+    name: str
+    """组名，批次内唯一且非空。`BASE_GROUP`（`"base"`）是保留名，指的就是顶层 `axes:` 那组。"""
+    axis_overrides: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    """轴名 → 这个组单独用的取值列表。**没写的轴继承 base**（这就是「delta 不是重写」）。"""
+    label: str = ""
+    """界面上显示的名字。空 = 用 `name`。"""
 
 
 @dataclass
@@ -484,6 +541,10 @@ class BatchSpec:
     batch_root: str = ""
     designs: list[Design] = field(default_factory=list)
     axes: list[Axis] = field(default_factory=list)
+    """base 组的轴。没有 `groups` 时它就是全批次唯一的笛卡尔积。"""
+    groups: list[RunGroup] = field(default_factory=list)
+    """base 之外的 run group（每组 = base 上的一层覆盖）。**空 = 只有 base，行为与加这个字段之前
+    逐字相同**。这里**不含** base 组自己 —— base 的轴就是上面的 `axes`，重复存一份必然漂移。"""
     defaults: FlagDict = field(default_factory=dict)
     """默认表的覆盖。留空 = 全部从官方 run 目录学（§11 规则 1）。"""
     extra_flags: FlagDict = field(default_factory=dict)
@@ -837,6 +898,10 @@ class Run:
     design_key: str
     axis_values: dict[str, str] = field(default_factory=dict)
     """轴名 → 取值（用户可读的那个字面量，不是渲染后的 flag）。"""
+    group: str = BASE_GROUP
+    """这个 run 出自哪个 `RunGroup`。跨组重复的 run 只留第一个 ⇒ 这里记的是**第一个**产出它的组
+    （base 排在最前，所以基线永远归 base）。只是出身标签，**不进 `run_id`** ——
+    进了就会让「两个组算出同一组轴取值」变成两个目录，等于把去重取消掉。"""
     axes_slug: str = BASE_SLUG
     """除 corner/temperature 之外的轴拼出来的 slug；没有额外轴时是 `base`。"""
     ewave_dir: str = ""
@@ -860,6 +925,23 @@ class Run:
     log_facts: LogFacts | None = None
     message: str = ""
     """失败原因 / 跳过原因。空字符串 = 没话说。"""
+
+
+@dataclass(frozen=True)
+class RunExpansion:
+    """`core.matrix.expand_runs_detailed` 的完整结果：run 列表 + 「跨组合并掉了几个」。
+
+    为什么要有这个结构而不是让 `expand_runs` 多返回一个值：**折叠掉的重复必须让人看见**。
+    界面上写「5 runs (1 duplicate merged)」和写「5 runs」是两回事 —— 后者会让用户以为
+    自己那条组写错了、少展开了一个。而 `expand_runs` 的返回类型是冻结面，不能改成元组。
+    """
+
+    runs: tuple[Run, ...] = ()
+    merged: int = 0
+    """跨组撞了 `run_id`、被静默折叠掉的 run 数（同一组内部撞是 `SpecError`，不进这个数）。"""
+    per_group: tuple[tuple[str, int], ...] = ()
+    """`(组名, 该组最终贡献的 run 数)`，顺序 = base 在最前、其余按定义顺序。
+    数的是**折叠之后**的：一个组的 run 全被 base 吃掉时它就是 0，界面照样要显示这一行。"""
 
 
 @dataclass
@@ -888,6 +970,8 @@ class BatchState:
     """`<batch_root>/<batch_name>` 的绝对路径。"""
     designs: list[Design] = field(default_factory=list)
     axes: list[Axis] = field(default_factory=list)
+    groups: list[RunGroup] = field(default_factory=list)
+    """base 之外的 run group（同 `BatchSpec.groups`）。空 = 只有 base。"""
     runs: list[Run] = field(default_factory=list)
     streamout: list[StreamoutTask] = field(default_factory=list)
     options: BatchOptions = field(default_factory=BatchOptions)
@@ -1108,12 +1192,21 @@ def ewave_dir_name(corner: str, temperature: str) -> str:
     raise NotImplementedError
 
 
-def varying_axes(axes: Sequence[Axis], *, designs: Sequence[Design] = ()) -> list[Axis]:
+def varying_axes(
+    axes: Sequence[Axis],
+    *,
+    designs: Sequence[Design] = (),
+    groups: Sequence[RunGroup] = (),
+) -> list[Axis]:
     """挑出**真正在变**的轴（取值 > 1 个的）。
 
     slug 只编码变的那些：只扫 corner+temp 时目录名与官方逐字一致，设计师才认得（BRIEF §5）。
     给了 `designs` 就把 per-design 的 `axis_overrides` 也算进去（某个 design 上多出来的取值
-    同样算"在变"）。
+    同样算"在变"）；给了 `groups` 同理。
+
+    🚨 **口径必须是全批次的**：漏算 groups 的取值 ⇒ 某根轴明明在变却判成不变 ⇒ 它不进
+    `<axes-slug>` ⇒ 两个组的同一个 corner/temp 落进**同一个目录**、第二个静默覆盖第一个。
+    静默覆盖正是本工具存在要消灭的东西，所以这是本函数唯一真正危险的地方。
     """
     raise NotImplementedError
 
@@ -1137,6 +1230,16 @@ def axes_for_design(design: Design, axes: Sequence[Axis]) -> list[Axis]:
     raise NotImplementedError
 
 
+def axes_for_group(group: RunGroup, axes: Sequence[Axis]) -> list[Axis]:
+    """把 `group.axis_overrides` 套到 base 轴上，返回这个组实际要扫的轴。
+
+    与 `axes_for_design` **同构**（同一个合并语义，换个主人）—— 刻意不写成一个通用函数：
+    两边的报错要说清是「design 覆盖错了」还是「组覆盖错了」，用户才知道去改哪一段。
+    override 里出现未知轴名 → `SpecError`（消息里列出这个批次有哪些轴）。
+    """
+    raise NotImplementedError
+
+
 def builtin_axis_catalog() -> dict[str, Axis]:
     """内置轴目录：轴名 → `Axis`（取值列表为**该轴的合法取值样例**，实际取值由 spec 给）。
 
@@ -1155,15 +1258,36 @@ def expand_runs(
     axes: Sequence[Axis],
     *,
     options: BatchOptions | None = None,
+    groups: Sequence[RunGroup] = (),
 ) -> list[Run]:
     """展开笛卡尔积 → `list[Run]`，每个 Run 带好 `run_id` / `axes_slug` / `ewave_dir`。
 
     * design 本身是矩阵的一个轴（BRIEF §5「矩阵模型」）。
     * per-design 的 `axis_overrides` 生效（走 `axes_for_design`）。
+    * `groups` 非空时：批次 = base 组 + 这些组，**每组各自取笛卡尔积、结果取并集**。
+      组内先套 `axes_for_group`、再套 `axes_for_design`（design 覆盖压在组覆盖之上）。
+      `groups=()` 时行为与加这个参数之前**逐字相同**。
     * `options.native_multi_value=True` 时**不**展开 corner/temperature（交给 eWave 原生多值，D12）。
     * `work_dir` 这里不填（要 batch_dir 才知道），由 `core.layout.compute_run_paths` 补。
 
-    不写盘。重复的 (design, 取值组合) → `SpecError`。
+    不写盘。同一个组内重复的 (design, 取值组合) → `SpecError`；**跨组**重复静默折叠
+    （保留第一个，数量见 `expand_runs_detailed`）—— 两个组都写了 55 度是很自然的写法，
+    不该逼用户去手工排除。
+    """
+    raise NotImplementedError
+
+
+def expand_runs_detailed(
+    designs: Sequence[Design],
+    axes: Sequence[Axis],
+    *,
+    options: BatchOptions | None = None,
+    groups: Sequence[RunGroup] = (),
+) -> RunExpansion:
+    """`expand_runs` 的完整版：除 run 列表外还给出「跨组折叠掉了几个」和每组各贡献几个。
+
+    `expand_runs` 是它的薄封装（`.runs` 转成 list）。界面要显示
+    "5 runs (1 duplicate merged)" 和每组的 run 数，靠的就是这里。
     """
     raise NotImplementedError
 
@@ -1834,6 +1958,7 @@ FROZEN: dict[str, tuple[str, ...]] = {
         # 常量
         "TIMESTAMP_FORMAT",
         "BASE_SLUG",
+        "BASE_GROUP",
         "AXIS_SLUG_SEP",
         "TEMP_DECIMAL_REPLACEMENT",
         "MECHANISM_FLAGS",
@@ -1859,6 +1984,7 @@ FROZEN: dict[str, tuple[str, ...]] = {
         "AxisValue",
         "Axis",
         "Design",
+        "RunGroup",
         "BatchOptions",
         "Provenance",
         "BatchSpec",
@@ -1878,6 +2004,7 @@ FROZEN: dict[str, tuple[str, ...]] = {
         "Job",
         "RunResult",
         "Run",
+        "RunExpansion",
         "StreamoutTask",
         "BatchState",
         "PlanContext",
@@ -1901,8 +2028,10 @@ FROZEN: dict[str, tuple[str, ...]] = {
         "varying_axes",
         "compute_axes_slug",
         "axes_for_design",
+        "axes_for_group",
         "builtin_axis_catalog",
         "expand_runs",
+        "expand_runs_detailed",
         # P1 实做时长出来的跨模块 helper（`core.spec` 在用）。冻结面补登记，
         # 否则 self-test 不认识它们 = 不替它们盯签名漂移。
         "axis_with_values",

@@ -206,24 +206,32 @@ def _check_values(values: Mapping[str, str]) -> None:
     for name, value in sorted(values.items()):
         if not value or not value.strip():
             raise SpecError(
-                f"gdsout_setup 字段 {name!r} 是空的。"
-                "空值会生成一份语法正确、语义错误的 setup（例如 layerMap 空 = 不做层映射，"
-                "导出的 GDS 层号全错，而 strmout 照样退 0）—— 拒绝渲染。"
+                f"gdsout_setup field {name!r} is empty. "
+                "An empty value produces a setup that is syntactically fine and semantically wrong "
+                "(e.g. an empty layerMap means no layer mapping at all, so every GDS layer number is "
+                "wrong while strmout still exits 0) - refusing to render."
                 + (
-                    "\nlayerMap 是站点坐标：由 core.discover 从官方 gdsout_setup 解析出来"
-                    "（退路 $PDK_LAYER_MAP_FILE），不写死在源码里，也别手抄。"
+                    "\n  Next: layerMap is a site coordinate - core.discover parses it out of the "
+                    "official gdsout_setup (fallback $PDK_LAYER_MAP_FILE). Never hardcode it, "
+                    "never copy it by hand."
                     if name == "layerMap"
                     else ""
                 )
             )
         if '"' in value:
-            raise SpecError(f"gdsout_setup 字段 {name!r} 的值里有双引号，会把 setup 的字段截断: {value!r}")
+            raise SpecError(
+                f"gdsout_setup field {name!r} has a double quote in its value, "
+                f"which truncates the setup field: {value!r}"
+            )
         if "\n" in value or "\r" in value:
-            raise SpecError(f"gdsout_setup 字段 {name!r} 的值里有换行 —— 那会凭空多出一个字段: {value!r}")
+            raise SpecError(
+                f"gdsout_setup field {name!r} has a newline in its value - "
+                f"that conjures up an extra field: {value!r}"
+            )
         if "@@" in value:
             raise SpecError(
-                f"gdsout_setup 字段 {name!r} 的值里有 `@@`，渲染结果会像"
-                f"还有没换完的占位符: {value!r}"
+                f"gdsout_setup field {name!r} has `@@` in its value; the rendered result "
+                f"would look like it still carries an unsubstituted placeholder: {value!r}"
             )
 
 
@@ -236,9 +244,9 @@ def _strmout_program(ctx: PlanContext) -> str:
     program = ctx.facts.strmout_bin
     if not program:
         raise ToolMissingError(
-            "SiteFacts.strmout_bin 是空的 —— 不知道该执行哪个 strmout。"
-            "先跑 core.discover.discover_site_facts(<官方 run 目录>)，"
-            "或确认 `strmout` 在 PATH 上（硬约束 1b：工具绝对路径不写进源码）"
+            "SiteFacts.strmout_bin is empty - no idea which strmout to execute.\n"
+            "  Next: run core.discover.discover_site_facts(<official run dir>), "
+            "or make sure `strmout` is on PATH (hard constraint 1b: absolute tool paths never go into the source)"
         )
     return program
 
@@ -312,9 +320,10 @@ def parse_gdsout_fields(text: str) -> dict[str, str]:
             value = value[1:-1]
         if key in fields:
             raise SpecError(
-                f"gdsout_setup 第 {lineno} 行：字段 {key!r} 出现了两次。"
-                "重复字段谁赢由工具决定，而 D1c 那 8 个字段里任何一个被悄悄覆盖，"
-                "mesh 就变了、L/Q 就变了，且不报错 —— 拒绝解析"
+                f"gdsout_setup line {lineno}: field {key!r} appears twice. "
+                "Which duplicate wins is up to the tool, and if any of the 8 fields named by D1c "
+                "gets silently overridden the mesh changes, L/Q change, and nothing complains - "
+                "refusing to parse"
             )
         fields[key] = value
     return fields
@@ -365,19 +374,19 @@ def render_gdsout_setup(template_text: str, fields: GdsoutFields) -> str:
     ]
     if missing:
         raise SpecError(
-            "模板里缺占位符: " + ", ".join(missing) + "。"
-            "缺哪个，渲染结果里那个字段就还是模板来源 design 的取值 —— "
-            "拿别人的 library/topCell/view 去导 GDS，strmout 不会报错。"
-            "模板应当由 core.discover.templatize_gdsout_setup 从官方 gdsout_setup 生成，"
-            f"或直接用 {__name__}.DEFAULT_GDSOUT_TEMPLATE"
+            "the template is missing placeholders: " + ", ".join(missing) + ". "
+            "Whichever is missing keeps the value of the design the template came from - "
+            "streaming out GDS with somebody else's library/topCell/view, and strmout will not complain.\n"
+            "  Next: let core.discover.templatize_gdsout_setup build the template from the official "
+            f"gdsout_setup, or use {__name__}.DEFAULT_GDSOUT_TEMPLATE directly"
         )
 
     rendered, unknown = substitute_placeholders(template_text, values)
     if unknown:
         raise SpecError(
-            "模板里还有没换完的占位符: "
+            "the template still carries unsubstituted placeholders: "
             + ", ".join(unknown)
-            + f"。本模块只认这 {len(GDSOUT_PLACEHOLDERS)} 个: "
+            + f". This module only knows these {len(GDSOUT_PLACEHOLDERS)}: "
             + ", ".join(GDSOUT_PLACEHOLDERS.values())
         )
 
@@ -385,8 +394,9 @@ def render_gdsout_setup(template_text: str, fields: GdsoutFields) -> str:
     after = parse_gdsout_fields(rendered)
     if len(after) != len(before):
         raise SpecError(
-            f"渲染前后字段条数不一致（{len(before)} → {len(after)}）—— 渲染只该替换占位符，"
-            "不该增删字段。丢掉一行照样导得出 GDS，但 mesh 会变、L/Q 会变，而且不报错（D1c）"
+            f"the field count changed while rendering ({len(before)} -> {len(after)}) - rendering "
+            "may only substitute placeholders, never add or drop fields. A dropped line still streams "
+            "out a GDS, but the mesh changes, L/Q change, and nothing complains (D1c)"
         )
     return rendered
 
@@ -410,17 +420,21 @@ def gdsout_fields_for_design(
       （`core.discover` 从官方 `gdsout_setup` 解析）。两个都空 → `SpecError`，绝不猜。
     """
     if not gds_path:
-        raise SpecError("gds_path 是空的 —— 不知道 GDS 该落在哪（权威是 layout.compute_run_paths().design_gds）")
+        raise SpecError(
+            "gds_path is empty - no idea where the GDS should land "
+            "(the authority is layout.compute_run_paths().design_gds)"
+        )
     run_dir = posixpath.dirname(gds_path)
     strm_file = posixpath.basename(gds_path)
     if not run_dir or not strm_file:
-        raise SpecError(f"gds_path 不是一个 <目录>/<文件名> 形状的路径: {gds_path!r}")
+        raise SpecError(f"gds_path is not a <dir>/<filename> shaped path: {gds_path!r}")
     resolved_layer_map = layer_map or ctx.facts.layer_map
     if not resolved_layer_map:
         raise SpecError(
-            "layerMap 拿不到。它是站点坐标（一条指进 PDK 的绝对路径），"
-            "源码里没有也不该有默认值 —— 先跑 core.discover.discover_site_facts(<官方 run 目录>) "
-            "把它从官方 gdsout_setup 里解析出来（退路：$PDK_LAYER_MAP_FILE）"
+            "layerMap is not available. It is a site coordinate (an absolute path into the PDK), "
+            "so the source has no default for it and must not have one.\n"
+            "  Next: run core.discover.discover_site_facts(<official run dir>) to parse it out of the "
+            "official gdsout_setup (fallback: $PDK_LAYER_MAP_FILE)"
         )
     stem = posixpath.splitext(strm_file)[0] or strm_file
     return GdsoutFields(
@@ -453,8 +467,9 @@ def build_strmout_plan(design: Design, ctx: PlanContext, *, setup_path: str) -> 
     """
     if not setup_path:
         raise SpecError(
-            "setup_path 是空的 —— strmout 的 -templateFile 必须指向我们渲染出来的那份 gdsout_setup。"
-            "没有它就退化成 Auto_ext 那种裸 argv，D1c 点名的 8 个字段全丢（BRIEF §4 D1c）"
+            "setup_path is empty - the -templateFile of strmout must point at the gdsout_setup we "
+            "rendered. Without it we fall back to bare argv (the Auto_ext style) and lose all 8 fields "
+            "named by D1c (BRIEF sec. 4 D1c)"
         )
     from ..core import cmd as _cmd  # 惰性：与 diff_gdsout_setup 同一个理由
     from ..core.matrix import design_key as _design_key

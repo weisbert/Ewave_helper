@@ -4,18 +4,22 @@ If yes, eWave's `--all` (which assigns P000.. "in lexicographical order") reprod
 GUI's mapping exactly -- meaning we need neither the GUI run dir nor any GDS parsing.
 """
 
-# Port names below are PLACEHOLDERS with the same shape as the real ones (13 upper-case
-# + 4 lower-case, two families differing only in a digit): the real pin names are
-# site-local and stay out of this repo.  The property under test survives the rename --
-# what matters is that upper- and lower-case names are interleaved under a
-# case-insensitive sort but cleanly separated under an ASCII one.
-# The real 17 names were checked in place (`LC_ALL=C sort` against the GUI's -p order,
-# 17/17); this script is the reproducible method, not the evidence itself.
+# The names below are INVENTED, not the real pin names and not a rename of them:
+# an earlier version kept the real suffixes and only swapped the prefixes, which leaks
+# exactly the thing that must not leak (a searchable net-naming family).  Neither the
+# names, their count, nor their family structure has anything to do with any real design.
+#
+# What the check needs from them is only this: some names are upper-case and some are
+# lower-case, so that a case-INsensitive sort interleaves them while an ASCII
+# (case-sensitive) sort keeps the two blocks apart.  That is the single property that
+# tells the two candidate orderings apart, and it survives any renaming.
+#
+# The real list was checked in place, on the machine that owns it (`LC_ALL=C sort`
+# against the GUI's own -p order, every position matched).  This script is the
+# reproducible method, not the evidence itself -- the evidence never leaves that machine.
 gui_order = [
-    "GND_A", "PORTN", "PORTP", "RAILN", "RAILP",
-    "XN_LINE1A", "XN_LINE1B", "XN_LINE1C", "XN_LINE2A", "XN_LINE2B",
-    "XP_LINE1A", "XP_LINE1B", "XP_LINE1C",
-    "amn", "amp", "ubn", "ubp",
+    "ALPHA", "CHARLIE", "ECHO", "GOLF",
+    "bravo", "delta", "foxtrot",
 ]
 
 ascii_sorted = sorted(gui_order)                       # case-SENSITIVE, ASCII
@@ -35,4 +39,4 @@ if gui_order != ascii_sorted:
 print("\nside by side (P00x / GUI / ascii-sorted / ci-sorted):")
 for i, name in enumerate(gui_order):
     mark = "" if name == ascii_sorted[i] else "   <-- ASCII differs"
-    print(f"  P{i:03d}  {name:<10} {ascii_sorted[i]:<10} {ci_sorted[i]:<10}{mark}")
+    print(f"  P{i:03d}  {name:<9} {ascii_sorted[i]:<9} {ci_sorted[i]:<9}{mark}")

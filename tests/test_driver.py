@@ -488,7 +488,7 @@ class TwelveRunFullChain(_TempRootTest):
         )
         for run in misjudged:
             self.assertTrue(run.message, "失败必须留一句话，不能只是一个状态字")
-            self.assertIn("退出码", run.message, "报告里要点明退出码不可信")
+            self.assertIn("exit code", run.message, "报告里要点明退出码不可信")
 
     def test_job_state_done_never_became_run_done_by_itself(self) -> None:
         """所有 12 个 job 都是 `JobState.DONE`（进程都退了 0），但只有 8 个 run 是 done。"""
@@ -705,7 +705,7 @@ class StageOneFailureSkipsTheWholeColumn(_TempRootTest):
         self.assertEqual(skipped, {rid for rid in RUN_IDS if rid.startswith("dB/")})
         for run in self.batch.state.runs:
             if run.status is RunStatus.SKIPPED:
-                self.assertIn("阶段 1", run.message)
+                self.assertIn("stage 1", run.message)
 
     def test_no_job_was_ever_submitted_for_that_design(self) -> None:
         """★ 计数断言：只为 dA 提交了 6 次，dB 一次都没有（提交必然失败的 job 是浪费配额）。"""
@@ -958,7 +958,9 @@ class StaleProductsAreClearedBeforeRerun(_TempRootTest):
         verdict = layout.verify_run_outputs(paths, run)
         self.assertFalse(verdict.ok)
         self.assertEqual(len(verdict.sparam_files), 2)
-        self.assertTrue(any("端口数不一致" in reason for reason in verdict.reasons), verdict.reasons)
+        self.assertTrue(
+            any("port counts disagree" in reason for reason in verdict.reasons), verdict.reasons
+        )
 
     def test_driver_clears_them_so_the_rerun_can_go_done(self) -> None:
         """★ 正向：第一次 3 端口（失败）→ resume 时换成 4 端口 ⇒ 清干净后判 done，
@@ -1109,7 +1111,7 @@ class CancelStopsTheBatch(_TempRootTest):
         for run_id in self.in_flight:
             run = next(r for r in self.batch.state.runs if r.run_id == run_id)
             self.assertIs(run.status, RunStatus.FAILED)
-            self.assertIn("取消", run.message)
+            self.assertIn("cancelled", run.message)
 
     def test_the_rest_is_skipped_and_nothing_more_is_submitted(self) -> None:
         submitted_before = self.batch.scheduler.submit_calls
@@ -1200,7 +1202,7 @@ class UnknownJobFallsBackToTheProducts(_TempRootTest):
         batch, driver = self._run_until_settled(write_products=False)
         self.assertEqual(driver.summary()["failed"], 1)
         run = batch.state.runs[0]
-        self.assertIn("查不到", run.message)
+        self.assertIn("could not find job", run.message)
 
     def test_it_waits_before_giving_up(self) -> None:
         """兜底不是第一拍就下手 —— 调度器短暂查不到是常事（`SchedulerProtocol.poll` 的原话）。"""

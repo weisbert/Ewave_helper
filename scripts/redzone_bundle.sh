@@ -584,7 +584,7 @@ elif [ "$DRY_RC" = "0" ]; then
     echo ""
     echo "  下一步："
     echo "    1) 生成一份 spec 样例，按你要扫的设定改："
-    echo "         $PY -c \"from ewave_batch.core.spec import EXAMPLE_SPEC; print(EXAMPLE_SPEC)\" > my_spec.yaml"
+    echo "         $PY -c \"import sys; from ewave_batch.core.spec import EXAMPLE_SPEC; sys.stdout.buffer.write(EXAMPLE_SPEC.encode('utf-8'))\" > my_spec.yaml"
     echo "    2) 带上它再跑一次这条命令（仍然只读）："
     echo "         bash scripts/redzone_bundle.sh <OFFDIR> --spec my_spec.yaml"
     echo "       ——**重点看每个 run 的落地目录互不相同**，那正是这个工具存在的理由；"

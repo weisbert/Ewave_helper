@@ -68,6 +68,15 @@ def _demo_spec() -> model.BatchSpec:
             matrix.axis_with_values(catalog["temperature"], ["-40.0", "125.0"]),
             matrix.axis_with_values(catalog["equalCurrent"], ["on", "off"]),
         ],
+        groups=[
+            # 组是 base 之上的 delta：只列它覆盖的轴。这里同时覆盖两根轴，
+            # 是为了让「组的 axes 整段没被序列化」和「只写了一根」两种漏法都能被抓到。
+            model.RunGroup(
+                name="eqcur-off",
+                axis_overrides={"temperature": ["125.0"], "equalCurrent": ["off"]},
+                label="one-off: equalCurrent off at 125C",
+            ),
+        ],
         defaults={"--viaMode": "1"},
         extra_flags={"--surface": True, "--someOff": False},
         options=model.BatchOptions(max_parallel=8),
@@ -132,9 +141,10 @@ class RoundTrip(unittest.TestCase):
         self.assertEqual(back.extra_flags, spec.extra_flags)
         self.assertEqual(back.options.max_parallel, spec.options.max_parallel)
 
-        # ★ 计数断言：design 数、轴数一个不少
+        # ★ 计数断言：design 数、轴数、组数一个不少
         self.assertEqual(len(back.designs), len(spec.designs))
         self.assertEqual(len(back.axes), len(spec.axes))
+        self.assertEqual(len(back.groups), len(spec.groups))
 
         self.assertEqual(
             [(d.library, d.cell, d.view, d.official_run_dir, d.resources, d.label)
@@ -158,6 +168,13 @@ class RoundTrip(unittest.TestCase):
         self.assertEqual(
             [(a.name, [v.value for v in a.values]) for a in back.axes],
             [(a.name, [v.value for v in a.values]) for a in spec.axes],
+        )
+        # 组：名字、label、以及**每根被覆盖的轴的取值**都要原样回来。
+        # 只比名字的话，「组的 axes 整段丢了」会静默通过 —— 那正是最坏的漏法：
+        # 组还在界面上列着，但它展开出来的 run 和 base 一模一样。
+        self.assertEqual(
+            [(g.name, g.label, _norm(g.axis_overrides)) for g in back.groups],
+            [(g.name, g.label, _norm(g.axis_overrides)) for g in spec.groups],
         )
 
     def test_a_changed_value_really_shows_up_negative(self) -> None:

@@ -56,7 +56,7 @@ def split_command_line(line: str) -> list[str]:
     try:
         tokens = shlex.split(head, posix=True)
     except ValueError as exc:  # 引号不配对之类
-        raise SpecError(f"这行命令拆不动（{exc}）: {head.strip()[:120]}") from exc
+        raise SpecError(f"cannot tokenize this command line ({exc}): {head.strip()[:120]}") from exc
     return _drop_redirections(tokens)
 
 
@@ -161,8 +161,8 @@ def parse_command_line(line: str) -> ParsedCommand:
         if token == "-p":
             if following is None or "=" not in following:
                 raise SpecError(
-                    f"`-p` 后面应当是 `P000=<pin>` 形状，实际是 {following!r} —— "
-                    "端口映射解析错了就是整条 .sNp 错位，不许猜"
+                    f"`-p` must be followed by a `P000=<pin>` pair, got {following!r} - "
+                    "a misparsed port map shifts the whole .sNp, so guessing is not allowed"
                 )
             port_id, _, pin = following.partition("=")
             mapping.append((port_id, pin))
@@ -170,7 +170,7 @@ def parse_command_line(line: str) -> ParsedCommand:
             continue
         if token == "-i":
             if following is None:
-                raise SpecError("`-i` 后面什么都没有 —— 这条命令不完整")
+                raise SpecError("`-i` is followed by nothing - this command line is incomplete")
             signal_ports.append(following)
             index += 2
             continue

@@ -25,12 +25,13 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tkinter as tk
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from ewave_batch.core import spec as spec_module
-from ewave_batch.model import EwaveBatchError, Run
+from ewave_batch.model import BASE_GROUP, EwaveBatchError, Run
 
 from . import state as gui_state
 from .app import SMOKE_ENV, smoke_enabled
@@ -60,16 +61,108 @@ STATUS_STYLE: dict[str, tuple[str, str]] = {
 而"没颜色"看起来就像"ready"）。"""
 
 RUN_COLS: tuple[tuple[str, str, int], ...] = (
-    ("n", "#", 40),
-    ("design", "Design", 150),
-    ("corner", "Corner", 78),
+    ("n", "#", 36),
+    ("design", "Design", 240),
+    ("group", "Group", 96),
+    ("corner", "Corner", 80),
     ("temp", "Temp", 60),
-    ("mode", "Mode", 92),
-    ("extra", "Extra axes", 150),
+    ("mode", "Mode", 120),
+    ("extra", "Extra axes", 120),
     ("status", "Status", 86),
-    ("wall", "Wall time", 74),
-    ("job", "Job id", 84),
+    ("wall", "Wall time", 90),
+    ("job", "Job id", 100),
 )
+"""Runs 表的列。第三个数是**下限**，不是最终宽度。
+
+⚠️ 2026-08-19 实拍：这里原来那一套宽度（design 150、mode 92、wall 74）比内容窄一大截 ——
+两个不同的 design 都显示成同一串前缀（看不出是哪个）、表头 `Wall time` 自己被切成
+`Wall tim`、九列合起来比表还宽于是 `Job id` 整列在右边界外。所以现在有两道防线：
+
+1. 这里的数字管"再空的表也不许比表头窄"；
+2. `_fit_tree_columns()` 建完/每次重画之后**按内容 + 表头现算**一次，只涨不缩。
+
+为什么必须现算而不是把数字调大一点了事：红区是 Linux，默认字体度量与开发机不同，
+同样的字符串在那边更宽 —— 任何写死的像素到气隙对面都会重新变成一个裁剪 bug
+（`gui/frames/split.py` 的 `LEFT_WIDTH` 已经在这件事上栽过一次）。写死的数字只当下限，
+真实宽度由 `tkfont.measure` 在**运行的那台机器上**说了算。
+
+`Group` 那一列说的是这个 run **出自哪个组**（`Run.group`）。
+
+它与 `Extra axes` 是两回事，两列都得在：`Extra axes`（= `axes_slug`）是「这个 run 的
+落地目录里编了哪几根轴」，`Group` 是「用户在哪一行配出来的」。两个组写了同一个
+温度时它们会**折叠成一个 run**（保留先出现的那个组），于是 `Group` 也是"我那条组
+为什么只贡献了 0 个 run"的唯一现场解释。
+"""
+
+RUNS_VIEWPORT_WIDTH = 660
+"""Runs 表**请求**多宽（不是"最多多宽"）。见 `_scrolled_tree_grid` 的 `viewport_width`。
+
+十列的下限加起来是 1000 出头，而"下限"是逐条量出来的（design 装得下两个不同的
+design key、`Wall time` 表头不被切成 `Wall tim`…）。让这个和去决定窗口的最小宽度，
+等于说"这个工具在 1000px 以下没法用" —— 而它明明有横向滚动条。
+660 的口径是"最少要一眼看见 # / Design / Group / Corner / Temp 这几列"。
+"""
+
+RUN_STRETCH_COLS: frozenset[str] = frozenset({"design", "extra"})
+"""窗口变宽时把多出来的空间分给哪几列。
+
+`extra` 一个人 stretch 是个坏选择：它的内容是 `axes_slug`，短的时候只要 93px，
+而窗口一宽它能白占 459px —— 与此同时 `design`（内容 278px）被钉在 150px 上裁着。
+"""
+
+RUN_COL_CAP_CHARS: dict[str, int] = {"design": 46, "extra": 38}
+"""这两列最多显示多少个**等宽字符**（不是多少像素）。
+
+内容长度没有上界（design key 是三段拼的，`axes_slug` 随轴数增长），不封顶就是让表格
+宽度由最长的一条数据决定 —— 见 `GROUP_SUMMARY_CAP_CHARS` 的同一条理由。
+
+⚠️ 口径是**字符数**而不是像素数，这一条是 2026-08-19 视觉复验改的：原来写的是
+`{"design": 340, "extra": 280}`，而把 Tk 具名字体放大 30%（模拟红区 Linux 的字体度量）
+之后，design 那一列的内容要 349px、上限还钉在 340px ⇒ 最长的那个 design key **末尾被
+静默切掉一个字符**。写死的像素到气隙对面就是另一个裁剪 bug，这正是 `LEFT_WIDTH`
+栽过的那一跤 —— 上限也得跟着字走。字符数由 `_cap_px()` 在**运行的那台机器上**换算成像素。
+"""
+
+GROUP_COLS: tuple[tuple[str, str, int], ...] = (
+    ("name", "Group", 108),
+    ("summary", "Settings", 240),
+    ("runs", "Runs", 54),
+)
+"""Run groups 表的三列：组名 / 这个组改了什么 / 它贡献几个 run。
+
+第三列是**去重之后**的数（`bridge.group_run_counts()`）—— 显示展开前的数字会让
+"两个组都写了 55 度"看起来像跑了两遍，而实际只跑一遍。
+"""
+
+GROUP_SUMMARY_CAP_CHARS = 43
+"""组的「Settings」那一列最多显示多少个等宽字符。
+
+它装的是 `bridge.group_summary()` 的自由文本，长度**没有上界**（base 组会把每一根
+轴都写进去）。不封顶就等于让这一块面板的宽度由文字长度决定，整个左栏会被顶到窗口外。
+封顶之后靠横向滚动条够得着 —— "够得着"和"全塞进来"是两回事。
+
+口径是字符数不是像素数，理由同 `RUN_COL_CAP_CHARS`。
+"""
+
+GROUP_ROW_AXES: dict[str, tuple[str, ...]] = {
+    "corner": ("corner",),
+    "temperature": ("temperature",),
+    "fullWave": ("fullWave",),
+    "mesh": ("mesh",),
+    "advanced": ("equalCurrent",),
+}
+"""Settings 里**一行**对应哪几根轴 —— 那个"覆盖"勾选框是按行给的，不是按轴给的。
+
+⚠️ **三根轴故意不在这里**（= 它们只属于 base，编辑别的组时整块置灰）：
+
+* `freq`：界面上它不是一个取值列表而是一整排格子（模式 + start/stop/step/points），
+  一个组要换扫频等于换四个格子的组合，塞进"勾一下就覆盖"的模型里表达不了。
+* `relativeTolerance` / `relativeCurrentTolerance`：它们与 equalCurrent 挤在同一个
+  Advanced 折叠块里，一度是跟着那个勾选框一起覆盖的 —— 但那样一勾就会把**当前的**
+  tolerance 值钉成这个组的显式取值，之后用户改 base 的 tolerance，这个组会**静默**
+  留在老值上（用户从来没要求过覆盖它）。收敛容差本来也是整批的性质而不是变体的轴，
+  所以宁可少一个能力，也不留这种"看起来跟着变、其实没跟着变"的坑。
+"""
 
 MENU_ITEMS: tuple[str, ...] = (
     "Open output dir",
@@ -81,6 +174,42 @@ MENU_ITEMS: tuple[str, ...] = (
 """右键菜单。「Open log」在草图里也有，这里合进 `Open output dir`
 （日志就在那个目录里，多一条只是多一次会走空的路径）。"""
 
+NOT_IMPLEMENTED_SUFFIX = " (not implemented)"
+"""接不上的菜单项后面加这个，并且**置灰**。
+
+2026-08-19 之前它们是能点的，点下去弹一个写着「Not wired yet」的对话框。
+那比没有还糟：一个能按的按钮就是一句"这件事我能做"的承诺，而它做不到 ——
+用户得按一次才知道。置灰 + 写清楚，一眼就看得出来。
+"""
+
+DISABLED_MENU_ITEMS: frozenset[str] = frozenset(
+    {
+        # bridge 没有"只重跑某一个 run"这条路（`resume()` 的粒度是整批里没成的那些），
+        # 界面自己拼一条出来就是第二份调度逻辑。
+        "Re-run this one",
+        # `core.layout.set_run_as_current` 是有的，但它要往设计师的 spine 里写
+        # （硬约束 4：覆盖前备份 + 记日志），而 bridge 一个口子都没开出来。
+        "Set as current",
+        # doctor 是部署包里的一个 shell 脚本，红区才有；从界面里起一个子进程去跑它
+        # 属于另一条分工线上的活。
+        "Check environment (doctor)",
+    }
+)
+"""**确实接不上**的那几项。名单在这儿是为了让"为什么灰"有个能读的答案 ——
+每一条后面都写了理由，将来谁接上了就从这里删掉。"""
+
+CMD_ROWS_MIN = 2
+CMD_ROWS_MAX = 8
+"""`Selected run -> Command` 那个框的行数区间。见 `show_detail`。"""
+
+CMD_TREE_FLOOR_ROWS = 3
+"""Command 框长高时，Runs 表至少得留下几行。见 `BaseApp._cmd_rows_within_budget`。
+
+`CMD_ROWS_MAX = 8` 那句「上限 8 行是为了不把 Runs 表挤瘦」在**窗口装得下**的时候是对的，
+在装不下的时候是空话：stacked 那棵树本来就比屏幕高，8 行里多出来的 6 行**全从 Runs 表扣**。
+所以真正的上限不是一个常数，而是"表里还富余几行"。
+"""
+
 _DASH = "-"
 """空值的占位符。**用 ASCII 的连字符**，不是 em dash —— 红区 `LANG` 常是 `C`，
 界面字符串走的又是 Tk 不是 stdout，一个非 ASCII 字符在那边多半渲染成方块。"""
@@ -89,6 +218,308 @@ _DASH = "-"
 def _label(text: str) -> str:
     """空字符串 → 占位符。"""
     return text if text else _DASH
+
+
+# --------------------------------------------------------------------------
+# 「不让内容被裁掉」的几个小工具。
+#
+# 它们都刻意**不写死像素**：部署目标是红区的 Linux，字体度量与开发机不同，同一串字
+# 在那边更宽。`tkfont.measure` 在**运行的那台机器上**量，量出来多少就是多少。
+# --------------------------------------------------------------------------
+
+ELLIPSIS = "..."
+"""省略号用三个 ASCII 句点，不用 U+2026 —— 红区 `LANG` 常是 `C`。"""
+
+
+def _elide(text: str, font: object, budget: int, middle: bool = True) -> str:
+    """把 `text` 截到 `budget` 像素以内。`middle=True` 时保头保尾（路径要的就是这个）。
+
+    二分搜索留几个字符，不是从长到短一个个试：这个函数挂在 `<Configure>` 上，
+    拖一次窗口能被调用几十次，而 `font.measure` 不是免费的。
+    """
+    if budget <= 0 or not text:
+        return ""
+    measure = font.measure  # type: ignore[attr-defined]
+    if measure(text) <= budget:
+        return text
+    if measure(ELLIPSIS) > budget:
+        return ""
+
+    def render(keep: int) -> str:
+        if not middle:
+            return text[:keep] + ELLIPSIS
+        head = (keep + 1) // 2
+        tail = keep - head
+        return text[:head] + ELLIPSIS + (text[len(text) - tail:] if tail else "")
+
+    low, high = 0, len(text) - 1
+    while low < high:
+        mid = (low + high + 1) // 2
+        if measure(render(mid)) <= budget:
+            low = mid
+        else:
+            high = mid - 1
+    return render(low)
+
+
+class _ElideLabel(ttk.Label):
+    """一条**按实际可用宽度中间省略**的标签。给长路径和长提示语用。
+
+    为什么不是普通 `ttk.Label`：普通标签"需要多宽"由文字长度决定，于是
+    ①一条批次目录路径（实测要 1336px）会把整条动作栏撑到窗口外，②窗口一窄，
+    文字就从中间断掉、连头带尾一起丢。两种都发生过（2026-08-19 实拍 B1/B2）。
+
+    做法：`width=` 给一个很小的字符数把**请求宽度**钉住（这样它撑不大窗口），
+    `pack(fill=X, expand=True)` 让它拿到剩下的空间，再在 `<Configure>` 里把文字
+    截到那个实际宽度。于是"请求"永远小于"给到"—— 也就永远不会被裁。
+    """
+
+    def __init__(self, master: object, *, font: object, chars: int = 10, **kwargs: object) -> None:
+        super().__init__(master, width=chars, **kwargs)  # type: ignore[arg-type]
+        self._full = ""
+        self._font = font
+        self._shown: str | None = None
+        self.bind("<Configure>", self._refit, add="+")
+
+    def set_text(self, text: str) -> None:
+        self._full = text or ""
+        self._refit()
+
+    def full_text(self) -> str:
+        return self._full
+
+    def _refit(self, _event: object = None) -> None:
+        available = self.winfo_width()
+        # 还没映射时 `winfo_width()` 是 1 —— 那时候显示全文，反正 `width=` 已经把请求
+        # 宽度钉住了，撑不大谁。第一次 <Configure> 到了自然会截。
+        text = self._full if available <= 1 else _elide(self._full, self._font, available - 4)
+        if text != self._shown:
+            self._shown = text
+            # 改文字会再触发一次 <Configure>。上面那个 `!=` 就是收敛条件，
+            # 去掉它就是一个无限重排（界面表现为窗口"抖"）。
+            self.configure(text=text)
+
+
+class _Tooltip:
+    """悬停提示。内容**惰性取**（`text` 可以是个函数，悬停时才调），路径变了不用重挂。
+
+    自己写而不是找个库：硬约束 2，只用 stdlib。
+    """
+
+    DELAY_MS = 500
+
+    def __init__(self, widget: object, text: object) -> None:
+        self.widget = widget
+        self.text = text
+        self._after: str | None = None
+        self._win: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._schedule, add="+")  # type: ignore[attr-defined]
+        widget.bind("<Leave>", self._hide, add="+")  # type: ignore[attr-defined]
+        widget.bind("<ButtonPress>", self._hide, add="+")  # type: ignore[attr-defined]
+
+    def _schedule(self, _event: object = None) -> None:
+        self._hide()
+        if smoke_enabled():
+            return
+        try:
+            self._after = self.widget.after(self.DELAY_MS, self._show)  # type: ignore[attr-defined]
+        except tk.TclError:  # pragma: no cover - 控件已经没了
+            self._after = None
+
+    def _show(self) -> None:
+        self._after = None
+        content = self.text() if callable(self.text) else str(self.text)
+        if not content or content == _DASH:
+            return
+        try:
+            win = tk.Toplevel(self.widget)  # type: ignore[arg-type]
+            win.wm_overrideredirect(True)
+            x = self.widget.winfo_rootx() + 12  # type: ignore[attr-defined]
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4  # type: ignore[attr-defined]
+            win.wm_geometry("+%d+%d" % (x, y))
+            tk.Label(
+                win,
+                text=content,
+                justify=tk.LEFT,
+                background="#ffffe0",
+                relief=tk.SOLID,
+                borderwidth=1,
+                wraplength=520,
+            ).pack()
+            self._win = win
+        except tk.TclError:  # pragma: no cover
+            self._win = None
+
+    def _hide(self, _event: object = None) -> None:
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)  # type: ignore[attr-defined]
+            except tk.TclError:  # pragma: no cover
+                pass
+            self._after = None
+        if self._win is not None:
+            try:
+                self._win.destroy()
+            except tk.TclError:  # pragma: no cover
+                pass
+            self._win = None
+
+
+HEAD_PAD = 26
+"""表头文字之外还要留多少像素（排序箭头 + 左右内边距 + 列分隔线）。"""
+
+CELL_PAD = 16
+"""单元格文字之外还要留多少像素。"""
+
+
+def _fit_tree_columns(
+    tree: ttk.Treeview,
+    columns: Sequence[str],
+    *,
+    head_font: object,
+    cell_font: object,
+    floors: dict,
+    caps: dict | None = None,
+) -> None:
+    """按**表头 + 当前所有行的内容**现算每一列该多宽。只涨不缩。
+
+    三条不显然的规矩：
+
+    1. **任何一列都不许比自己算出来的宽度窄** —— `minwidth` 给的就是 `want`，不是表头宽。
+       这一条 2026-08-19 复验时改过口径，理由是踩到了：原来 `minwidth=head_width`，
+       而 `stretch=True` 的列（`design` / `extra`）在**视口比列宽和窄**的时候会被 ttk
+       一路压回 `minwidth` —— 实测 split 版 `design` 算出来 277px、被压成 78px，
+       于是两个不同的 design key 又双双显示成同一串前缀（正是这个函数要修的那个缺陷，
+       从另一扇门走回来了）。更糟的是**横向滚动条对它们不起作用**：列本身变窄了，
+       不是被推到视口外，滚过去看到的还是被切的字，而 Treeview 不画省略号。
+       `minwidth=want` 之后 ttk 压不动它们，横向滚动条才真的接得住 ——
+       而那正是它当初被加进来的理由。
+       （表头宽度仍是下限的一部分：`want` 本身就是从 `head_width` 起步的。）
+    2. **不回读 `tree.column(key, "width")` 当下限。** 那个值对 `stretch=True` 的列是
+       "已经被拉伸之后"的宽度；拿它当下一轮的下限，下一轮拉伸会在它上面再加一次剩余
+       空间 —— 列一轮比一轮宽、永不收敛。所以自己在 `tree` 上挂一份缓存。
+    3. 只涨不缩：内容短了就把列缩回去，会让表格在每次刷新时**跳一下**（run 跑完
+       Wall time 从 `-` 变成 `12:34`，整张表的列就集体位移）。宁可留点空。
+
+    `caps` 给几列一个上限。有些列的内容长度**没有上界**（组的设定摘要、`axes_slug`），
+    让它们自由生长会把整块面板顶到窗口外 —— 那是把一个裁剪问题换成另一个。
+    有上限的那几列靠横向滚动条够得着，而不是靠把表撑到屏幕外。
+    """
+    cache = getattr(tree, "_ewb_col_widths", None)
+    if cache is None:
+        cache = {}
+        tree._ewb_col_widths = cache  # type: ignore[attr-defined]
+    rows = [tree.item(iid, "values") for iid in tree.get_children("")]
+    for index, key in enumerate(columns):
+        head_width = head_font.measure(tree.heading(key, "text")) + HEAD_PAD  # type: ignore[attr-defined]
+        want = max(head_width, int(floors.get(key, 0)), int(cache.get(key, 0)))
+        for values in rows:
+            if index < len(values):
+                want = max(want, cell_font.measure(str(values[index])) + CELL_PAD)  # type: ignore[attr-defined]
+        limit = (caps or {}).get(key)
+        if limit is not None:
+            want = max(head_width, min(want, int(limit)))
+        cache[key] = want
+        # minwidth 必须是 want 而不是 head_width，否则 stretch 列会被 ttk 压回去 ——
+        # 见本函数 docstring 的规矩 1。
+        tree.column(key, width=want, minwidth=want)
+
+
+def _scrolled_tree_grid(wrap: object, tree: ttk.Treeview, *, viewport_width: int = 0) -> None:
+    """把一个 Treeview 连同**纵横两条**滚动条摆进 `wrap`（用 grid，不是 pack）。
+
+    横向那条是 2026-08-19 补的：九列合起来比表宽，`Job id` 整列在右边界外，
+    而只有纵向滚动条时那一列**根本够不着** —— 不是难看，是拿不到 job id。
+
+    `viewport_width` 解决横向滚动条带来的**第二个**问题：`ttk.Treeview` 的"请求宽度"
+    就是各列宽度之和，于是列一加宽，`gui/frames/*.py` 里那个"按内容现算 minsize"
+    的窗口下限就跟着涨（实测 Runs 表一家把 split 的最小宽度顶到 1855px，
+    比 0.85 屏宽还大 -> 被夹住 -> 窗口打开就是横着滚的）。既然内容已经有滚动条够得着，
+    表就不该替整个窗口定下限：把 `wrap` 的请求尺寸钉在一个够用的视口宽度上
+    （`grid_propagate(False)`），表照样随窗口变大而变宽，只是不再往上顶。
+
+    ⚠️ 这**不是** `LEFT_WIDTH` 那种"硬钉死"：钉的是"我最少要这么宽"，不是"我最多这么宽"。
+    `wrap` 仍然 `fill=BOTH, expand=True`，窗口给多少就占多少；给不够的部分靠滚动条。
+    """
+    wrap.rowconfigure(0, weight=1)  # type: ignore[attr-defined]
+    wrap.columnconfigure(0, weight=1)  # type: ignore[attr-defined]
+    vertical = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=tree.yview)  # type: ignore[arg-type]
+    horizontal = ttk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=tree.xview)  # type: ignore[arg-type]
+    tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vertical.grid(row=0, column=1, sticky="ns")
+    horizontal.grid(row=1, column=0, sticky="ew")
+    if viewport_width:
+        wrap.update_idletasks()  # type: ignore[attr-defined]
+        # 高度照抄现在算出来的（= `height=rows` 那几行 + 表头 + 横向滚动条）；
+        # 只有宽度是我们替它定的。
+        wrap.configure(width=viewport_width, height=wrap.winfo_reqheight())  # type: ignore[attr-defined]
+        wrap.grid_propagate(False)  # type: ignore[attr-defined]
+
+
+def _center_on_parent(dialog: object, parent: object) -> None:
+    """把对话框摆到父窗口正中偏上。
+
+    2026-08-19 实拍：`Extraction defaults` 直接落到屏幕**左边界外**，左半截看不见。
+    Tk 不会替你居中对话框，谁建谁自己放 —— 不放就是落在 (0,0) 附近碰运气。
+    算完还要夹进屏幕范围：父窗口自己贴着屏幕边缘时，居中算出来的坐标可以是负的。
+    """
+    try:
+        dialog.update_idletasks()  # type: ignore[attr-defined]
+        width = dialog.winfo_reqwidth()  # type: ignore[attr-defined]
+        height = dialog.winfo_reqheight()  # type: ignore[attr-defined]
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()  # type: ignore[attr-defined]
+        pw, ph = parent.winfo_width(), parent.winfo_height()  # type: ignore[attr-defined]
+        if pw <= 1 or ph <= 1:  # 父窗口还没映射 -> 退回屏幕中心
+            px, py = 0, 0
+            pw = dialog.winfo_screenwidth()  # type: ignore[attr-defined]
+            ph = dialog.winfo_screenheight()  # type: ignore[attr-defined]
+        x = max(0, min(px + (pw - width) // 2, dialog.winfo_screenwidth() - width))  # type: ignore[attr-defined]
+        y = max(0, min(py + (ph - height) // 3, dialog.winfo_screenheight() - height))  # type: ignore[attr-defined]
+        dialog.wm_geometry("+%d+%d" % (x, y))  # type: ignore[attr-defined]
+    except tk.TclError:  # pragma: no cover - 窗口已经关掉的竞态
+        pass
+
+
+def _open_in_file_manager(path: str) -> str:
+    """用系统文件管理器打开一个目录。返回空串 = 成功，非空 = 失败原因（给用户看）。
+
+    **两条路都要有**：红区是 Linux（`xdg-open`），开发机是 Windows（`os.startfile`）。
+    只做 Windows 那条就等于这个按钮在唯一真正要用它的机器上是死的。
+    macOS 的 `open` 顺手带上，反正只是名单里多一个名字。
+
+    `subprocess` 惰性 import：本模块只在 GUI 分支里被 import，但一个纯 CLI 会话
+    没必要为一个按钮多加载一个模块。
+    """
+    if not path:
+        return "no path yet"
+    if not os.path.isdir(path):
+        return "no such directory yet (nothing has been written there)"
+    if smoke_enabled():  # 冒烟时不真去起一个文件管理器
+        return ""
+    startfile = getattr(os, "startfile", None)
+    if startfile is not None:  # Windows
+        try:
+            startfile(path)
+            return ""
+        except OSError as exc:
+            return str(exc)
+    import subprocess
+
+    for name in ("xdg-open", "open"):
+        opener = shutil.which(name)
+        if opener is None:
+            continue
+        try:
+            subprocess.Popen(
+                [opener, path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return ""
+        except OSError as exc:
+            return str(exc)
+    return "no xdg-open (or open) on PATH"
 
 
 class BaseApp:
@@ -120,8 +551,22 @@ class BaseApp:
         self.dir_lbl: ttk.Label | None = None
         self.right_lbl: ttk.Label | None = None
         self.detail_box: ttk.LabelFrame | None = None
-        self.show_formula_in_title = False
+        self.settings_title = " Settings "
+        self.gtree: ttk.Treeview | None = None
+        self.groups_box: ttk.Widget | None = None
+        self.groups_hint: ttk.Label | None = None
+        self.groups_warn: tk.Label | None = None
+        self.sw_combo: ttk.Combobox | None = None
         self._runs: tuple[Run, ...] = ()
+
+        # bridge 喂不喂得饱 run group 面板 —— **当判据用，不当假设用**。
+        # `gui/frames/*.py` 的 `SHARED_LAYER_BRIDGE_EXTRAS` 是那边写死的一份名单，
+        # 里面没有这些方法（它不许悄悄扩张），所以一个"满足冻结面 + 那 6 样"的
+        # bridge 照样可能一个组方法都没有。缺了就退成"只有 base"，界面照样建得起来。
+        self.groups_ok = all(
+            callable(getattr(bridge, name, None))
+            for name in ("groups", "active_group", "set_active_group", "group_override")
+        )
 
         try:
             self.top.geometry(self.GEOMETRY)  # type: ignore[attr-defined]
@@ -165,6 +610,13 @@ class BaseApp:
         self.eq_off = tk.BooleanVar(value=("off" in selection.get("equalCurrent", ())))
         self.tol_r = tk.StringVar(value=(selection.get("relativeTolerance") or ("",))[0])
         self.tol_c = tk.StringVar(value=(selection.get("relativeCurrentTolerance") or ("",))[0])
+        # 每一行 Settings 的「这个组覆盖这根轴」勾选框。键 = `GROUP_ROW_AXES` 的行名。
+        # 建在 `_srow` 里（那时才知道有哪几行），这里只把容器备好 —— `push()` 在
+        # `build_settings` 之前就可能跑不到，但 `_push_axis` 拿不到勾选框时按"覆盖"
+        # 处理，也就是加组之前的行为。
+        self.ovr_vars: dict[str, tk.BooleanVar] = {}
+        self.ovr_boxes: dict[str, ttk.Checkbutton] = {}
+        self.srow_boxes: dict[str, ttk.Frame] = {}
         self.dsub = tk.StringVar(value=self.bridge.submit_command)
         self.extra = tk.StringVar(value=self.bridge.extra_flags_text())
         self.batch = tk.StringVar(value=self.bridge.batch_name)
@@ -180,10 +632,19 @@ class BaseApp:
         self.f_mono_b = tkfont.nametofont("TkFixedFont").copy()
         self.f_mono_b.configure(weight="bold")
 
+        # 行高按**这台机器上的字体度量**现算，写死的 21 / 20 只当下限。
+        # 与列宽同一条道理（见 `_fit_tree_columns`）：红区是 Linux，同一号字的
+        # linespace 比开发机大，行高一旦比字还矮，表格里的文字就被上下切掉 ——
+        # 那是最难自查的一类裁剪，因为字还在、只是缺了一截。
+        # 取 mono / ui 两者的较大值：单元格用 f_mono，但行里也可能落到 UI 字体上。
+        line_px = max(self.f_mono.metrics("linespace"), self.f_ui.metrics("linespace"))
+        self.runs_rowheight = max(21, line_px + 4)
+        """Runs 表的行高（px）。`show_detail` 拿它算「表里还剩得下几行」。"""
+
         st = ttk.Style()
-        st.configure("Runs.Treeview", font=self.f_mono, rowheight=21)
+        st.configure("Runs.Treeview", font=self.f_mono, rowheight=self.runs_rowheight)
         st.configure("Runs.Treeview.Heading", font=self.f_ui_b)
-        st.configure("Designs.Treeview", font=self.f_mono, rowheight=20)
+        st.configure("Designs.Treeview", font=self.f_mono, rowheight=max(20, line_px + 3))
         st.configure("Designs.Treeview.Heading", font=self.f_ui_b)
         st.configure("Count.TLabel", font=self.f_mono, foreground=BLUE)
         st.configure("Off.TLabel", font=self.f_mono, foreground=GREY)
@@ -192,6 +653,18 @@ class BaseApp:
         st.configure("Warn.TLabel", font=self.f_ui, foreground=RED)
         st.configure("Mono.TLabel", font=self.f_mono)
         st.configure("Accent.TButton", font=self.f_ui_b)
+
+    def _cap_px(self, chars: dict) -> dict:
+        """「最多几个字符」→「最多几像素」，用**这台机器上**的等宽字体量。
+
+        列宽上限存在的理由是"内容长度没有上界"，而不是"340 这个数字有什么道理"。
+        写成像素就等于假定一个字符有多宽 —— 红区是 Linux，同一号字更宽，于是上限
+        在那边偷偷变成了"少显示几个字"（实测：放大 30% 之后 design 列内容要 349px、
+        上限还是 340px，最长的 design key 末尾被切掉一个字符，而 Treeview 不画省略号，
+        看起来就像那个 key 本来就长这样）。换算成像素这件事只能在运行时做。
+        """
+        unit = max(1, self.f_mono.measure("0"))
+        return {key: unit * int(count) + CELL_PAD for key, count in chars.items()}
 
     # -------------------------------------------------------------- menubar
     def build_menubar(self) -> None:
@@ -202,11 +675,16 @@ class BaseApp:
             "Open spec...": self.do_open_spec,
             "Save spec as...": self.do_save_spec,
             "Exit": self.do_exit,
+            "Duplicate batch...": self.do_duplicate_batch,
+            "Rename...": self.do_rename_batch,
             "Open batch dir": self.do_open_batch_dir,
             "Dry-run": self.do_dry_run,
             "Submit": self.do_submit,
             "Cancel": self.do_cancel,
             "Resume": self.do_resume,
+            # 「只重跑没成的」**就是** resume 的语义（D7：判据来自磁盘上的产物，
+            # done 的一个都不重跑）。给它另起一条路等于第二份调度逻辑。
+            "Re-run failed only": self.do_resume,
             "Extraction defaults...": self.show_defaults,
             "About": self.show_about,
         }
@@ -222,11 +700,7 @@ class BaseApp:
                 if item == "-":
                     menu.add_separator()
                     continue
-                handler = actions.get(item)
-                if handler is None:
-                    menu.add_command(label=item, command=lambda t=item: _todo(t))
-                else:
-                    menu.add_command(label=item, command=handler)  # type: ignore[arg-type]
+                _add_menu_item(menu, item, actions.get(item))
             bar.add_cascade(label=name, menu=menu)
         try:
             self.top.config(menu=bar)  # type: ignore[attr-defined]
@@ -252,15 +726,18 @@ class BaseApp:
         off.pack(side=tk.LEFT, padx=(6, 4))
         off.bind("<KeyRelease>", lambda _e: self.recompute())
         ttk.Button(f, text="Browse...", width=9, command=self.do_pick_offdir).pack(side=tk.LEFT)
-        ttk.Label(
-            f,
-            text="site coordinates are parsed from it, never typed",
-            style="Hint.TLabel",
-        ).pack(side=tk.LEFT, padx=8)
+        # 这句提示和下面那条批次目录都是 `_ElideLabel`：普通标签会按全文要宽度，
+        # 而这一整条是一行 pack 的 —— 实测这一行要 1516px、窗口只有 1180，于是
+        # 提示语被切成 "site coordinates are parsed f"（2026-08-19 实拍 B1）。
+        hint = _ElideLabel(f, font=self.f_ui, chars=12, style="Hint.TLabel")
+        hint.pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
+        hint.set_text("site coordinates are parsed from it, never typed")
+        _Tooltip(hint, hint.full_text)
 
         if show_dir:
-            self.dir_lbl = ttk.Label(f, text="", style="Mono.TLabel")
-            self.dir_lbl.pack(side=tk.RIGHT)
+            self.dir_lbl = _ElideLabel(f, font=self.f_mono, chars=12, style="Mono.TLabel")
+            self.dir_lbl.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(8, 0))
+            _Tooltip(self.dir_lbl, self.dir_lbl.full_text)
         return f
 
     # -------------------------------------------------------------- designs
@@ -281,20 +758,29 @@ class BaseApp:
         inner = ttk.Frame(box)
         inner.pack(fill=tk.BOTH, expand=True)
 
+        wrap = ttk.Frame(inner)
+        wrap.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.dtree = ttk.Treeview(
-            inner,
+            wrap,
             columns=("lib", "cell", "view"),
             show="headings",
             height=rows,
             style="Designs.Treeview",
             selectmode="browse",
         )
+        # `widths` 现在只是**下限**：真宽度由 `_fit_tree_columns` 按内容现算
+        # （2026-08-19 实拍 B3：Library 给 120 要 138 -> 库名被切掉末尾，
+        #  而同一张表里 Cell 被 stretch 撑到 392px 去装 192px 的内容）。
+        self.design_floors = dict(zip(("lib", "cell", "view"), widths))
         for (key, head), width in zip(
             (("lib", "Library"), ("cell", "Cell"), ("view", "View")), widths
         ):
             self.dtree.heading(key, text=head)
             self.dtree.column(key, width=width, anchor=tk.W, stretch=(key == "cell"))
-        self.dtree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        _scrolled_tree_grid(wrap, self.dtree)
+        # 双击一行 = 改这一行（A6）。在这之前只有 Add / Remove：打错一个字母就得
+        # 删掉重敲三个字段。
+        self.dtree.bind("<Double-1>", self.on_design_edit)
 
         side = ttk.Frame(inner)
         side.pack(side=tk.LEFT, padx=(6, 0), fill=tk.Y)
@@ -314,37 +800,124 @@ class BaseApp:
         self.dtree.delete(*self.dtree.get_children())
         for row in self.bridge.design_rows():
             self.dtree.insert("", tk.END, values=row)
+        _fit_tree_columns(
+            self.dtree,
+            ("lib", "cell", "view"),
+            head_font=self.f_ui_b,
+            cell_font=self.f_mono,
+            floors=getattr(self, "design_floors", {}),
+        )
 
-    def add_design(self) -> None:
-        """三个输入框的小对话框。三元组必须齐 —— **view 不是常量**（BRIEF §5）。"""
+    DESIGN_FIELDS: tuple[str, ...] = ("Library", "Cell", "View")
+
+    def _design_dialog(
+        self, title: str, initial: Sequence[str], apply: Callable[[tuple[str, str, str]], None]
+    ) -> object:
+        """Add / Edit design 共用的那一个对话框。三元组必须齐 —— **view 不是常量**（BRIEF §5）。
+
+        2026-08-19 之前这里有四个坑，全在 `ok()` 那五行里：少填一格 -> `if all(values)`
+        不成立 -> 什么也没加，然后**无条件** `destroy()` -> 框关了、没有任何提示，
+        用户以为加上了。另外没有 Cancel、没有 Enter/Escape、打开时焦点不在输入框。
+        现在：缺哪一格就说哪一格、框不关、焦点跳到那一格。
+        """
         dlg = tk.Toplevel(self.top)
-        dlg.title("Add design")
+        dlg.title(title)
         dlg.transient(self.top)
+        dlg.columnconfigure(1, weight=1)
         variables: list[tk.StringVar] = []
-        for index, label in enumerate(("Library", "Cell", "View")):
+        entries: list[ttk.Entry] = []
+        for index, label in enumerate(self.DESIGN_FIELDS):
             ttk.Label(dlg, text=label).grid(row=index, column=0, sticky=tk.W, padx=8, pady=4)
-            var = tk.StringVar()
-            ttk.Entry(dlg, textvariable=var, width=30, font=self.f_mono).grid(
-                row=index, column=1, padx=8, pady=4
-            )
+            var = tk.StringVar(value=initial[index] if index < len(initial) else "")
+            entry = ttk.Entry(dlg, textvariable=var, width=34, font=self.f_mono)
+            entry.grid(row=index, column=1, sticky="ew", padx=8, pady=4)
             variables.append(var)
+            entries.append(entry)
         ttk.Label(
             dlg,
             text="All three are required; the view is not a constant.",
             style="Hint.TLabel",
         ).grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=8)
+        # 用 tk.Label 而不是 ttk：前景色走 style 会污染别的标签（照 `extra_warn` 的做法）。
+        problem = tk.Label(
+            dlg, font=self.f_ui, fg=RED, anchor=tk.W, justify=tk.LEFT, wraplength=340
+        )
+        problem.grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=8)
 
-        def ok() -> None:
+        def ok(_event: object = None) -> None:
             values = tuple(v.get().strip() for v in variables)
-            if all(values):
-                self.bridge.add_design(*values)
-                self.refresh_designs()
-                self.recompute()
+            missing = [
+                name for name, value in zip(self.DESIGN_FIELDS, values) if not value
+            ]
+            if missing:
+                problem.config(text="Fill in: %s" % ", ".join(missing))
+                entries[list(values).index("")].focus_set()
+                return
+            try:
+                apply(values)  # type: ignore[arg-type]
+            except EwaveBatchError as exc:
+                problem.config(text=str(exc))
+                return
+            dlg.destroy()
+            self.refresh_designs()
+            self.recompute()
+
+        def cancel(_event: object = None) -> None:
             dlg.destroy()
 
-        ttk.Button(dlg, text="OK", command=ok).grid(row=4, column=1, sticky=tk.E, padx=8, pady=8)
+        bar = ttk.Frame(dlg)
+        bar.grid(row=5, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
+        ttk.Button(bar, text="Cancel", width=9, command=cancel).pack(side=tk.RIGHT)
+        ttk.Button(bar, text="OK", width=9, command=ok).pack(side=tk.RIGHT, padx=(0, 6))
+        dlg.bind("<Return>", ok)
+        dlg.bind("<Escape>", cancel)
+        entries[0].focus_set()
+        entries[0].selection_range(0, tk.END)
+        _center_on_parent(dlg, self.top)
         if not smoke_enabled():
             dlg.grab_set()
+        return dlg
+
+    def _selected_design_row(self) -> tuple[str, str, str] | None:
+        """designs 表里选中的那一行的三元组；没选中返回 None。"""
+        rows = self.bridge.design_rows()
+        for iid in self.dtree.selection():
+            index = self.dtree.index(iid)
+            if 0 <= index < len(rows):
+                return tuple(rows[index])  # type: ignore[return-value]
+        return None
+
+    def add_design(self) -> None:
+        """加一行 design。**有选中行时预填它** —— "复制再改"于是变成一个动作。"""
+        initial = self._selected_design_row() or ("", "", "")
+        self._design_dialog(
+            "Add design", initial, lambda values: self.bridge.add_design(*values)
+        )
+
+    def on_design_edit(self, event: object) -> None:
+        """双击 designs 的一行 = 改这一行（**替换**，不是追加）。
+
+        走 `bridge.set_designs()`：它一次收下整张表，所以"改第 2 行"就是把第 2 行
+        换掉再整张交回去。remove + add 那条路会把行**挪到表尾**，而顺序在这里是有
+        意义的（design 的先后决定 run 的先后）。bridge 没有 `set_designs` 时不接
+        双击（老 bridge 兼容），Add/Remove 照旧能用。
+        """
+        setter = getattr(self.bridge, "set_designs", None)
+        if not callable(setter):
+            return
+        iid = self.dtree.identify_row(event.y)  # type: ignore[attr-defined]
+        if not iid:
+            return
+        rows = [list(row) for row in self.bridge.design_rows()]
+        index = self.dtree.index(iid)
+        if not (0 <= index < len(rows)):
+            return
+
+        def apply(values: tuple[str, str, str]) -> None:
+            rows[index] = list(values)
+            setter(rows)
+
+        self._design_dialog("Edit design", tuple(rows[index]), apply)
 
     def del_design(self) -> None:
         for iid in self.dtree.selection():
@@ -361,17 +934,323 @@ class BaseApp:
         self.refresh_designs()
         self.recompute()
 
+    # ---------------------------------------------------------- run groups
+    # 模型见 `docs/INTERFACES.md`「run group」一节：批次 = 一列组，每组在 base 之上
+    # 覆盖几根轴、各自取笛卡尔积、结果取并集。这个面板是那个模型在界面上的**全部**
+    # 出口；轴的取值仍然在 Settings 里改，只是改的是"当前选中的那个组"。
+
+    def build_groups(
+        self, parent: object, compact: bool = False, rows: int = 3, titled: bool = True
+    ) -> ttk.Widget:
+        """第 9 个 section —— 一列 run group，选中一行就等于"接下来改的是这个组"。
+
+        为什么必须有这块地方：笛卡尔积表达不了「一条基线 + 几个单点变体」
+        （typical @ 3 个温度 + typical @ 55 关 equalCurrent + typical @ 55 全波 = 5 个
+        run，写成笛卡尔积是 12 个、7 个是废的，而一个 run 可能 10 核 100GB 跑 35 分钟）。
+
+        只有 base 一个组时**照样显示**（那是常态）：一张只有一行的表看起来像"还没配"，
+        一块空白看起来像"坏了"，前者好得多。
+
+        ⚠️ `compact` 现在**什么都不管**：它曾经把 Settings 那一列缩窄 30px，而那一列的
+        内容长度没有上界，缩 30px 治不了它（真正管用的是 `GROUP_SUMMARY_CAP` + 横向
+        滚动条）。参数留着的理由同 `build_resources`：布局传了共用层不认识的 hint 会被
+        测试记成 `dropped_hints`。
+        """
+        box: ttk.Widget
+        if titled:
+            box = ttk.LabelFrame(parent, text=" Run groups ", padding=7)  # type: ignore[arg-type]
+        else:
+            box = ttk.Frame(parent, padding=2)  # type: ignore[arg-type]
+        self.groups_box = box
+
+        head = ttk.Frame(box)
+        head.pack(fill=tk.X, pady=(0, 4))
+        # 按钮从右往左 pack，所以这里的顺序是反的（屏幕上是 + Add / Duplicate / Remove）。
+        for text, width, command in (
+            ("Remove", 9, self.do_remove_group),
+            ("Duplicate", 11, self.do_duplicate_group),
+            ("+ Add", 8, self.do_add_group),
+        ):
+            ttk.Button(head, text=text, width=width, command=command).pack(side=tk.RIGHT, padx=1)
+        self.groups_hint = ttk.Label(head, text="", style="Hint.TLabel")
+        self.groups_hint.pack(side=tk.LEFT)
+
+        wrap = ttk.Frame(box)
+        wrap.pack(fill=tk.BOTH, expand=True)
+        self.gtree = ttk.Treeview(
+            wrap,
+            columns=tuple(col[0] for col in GROUP_COLS),
+            show="headings",
+            height=rows,
+            style="Designs.Treeview",
+            selectmode="browse",
+        )
+        for key, head_text, width in GROUP_COLS:
+            self.gtree.heading(key, text=head_text)
+            self.gtree.column(
+                key,
+                width=width,
+                anchor=(tk.E if key == "runs" else tk.W),
+                stretch=(key == "summary"),
+            )
+        # `compact` 不再缩窄 summary 列：那一列的内容长度没有上界，缩 30px 治不了它，
+        # 真正管用的是 `GROUP_SUMMARY_CAP` + 横向滚动条（够得着，而不是全塞进来）。
+        _scrolled_tree_grid(wrap, self.gtree)
+        # 选中一行 = 切到那个组（`bridge.set_active_group`），Settings 整块跟着换。
+        self.gtree.bind("<<TreeviewSelect>>", lambda _e: self.on_group_select())
+        self.gtree.bind("<Double-1>", self.on_group_rename)
+
+        # 「加组会改掉基线的目录名」那句话的家。用 tk.Label 而不是 ttk：前景色走 style
+        # 会污染别的标签，而这是一条一次性的告警（照 `extra_warn` 的做法）。
+        self.groups_warn = tk.Label(
+            box, font=self.f_ui, fg=RED, anchor=tk.W, justify=tk.LEFT, wraplength=420
+        )
+        self.refresh_groups()
+        return box
+
+    def refresh_groups(self) -> None:
+        """重画组表。**当前组前面打一个 `*`** —— 选中高亮在表失焦时看不出来。"""
+        if self.gtree is None:
+            return
+        active = self._active_group()
+        counts = dict(self.bridge.group_run_counts()) if self.groups_ok else {}
+        self.gtree.delete(*self.gtree.get_children())
+        for group in self._groups():
+            name = group.name
+            self.gtree.insert(
+                "",
+                tk.END,
+                iid=name,
+                values=(
+                    ("* " if name == active else "  ") + name,
+                    self._group_summary(name),
+                    "-> %d" % counts.get(name, 0),
+                ),
+            )
+        if self.gtree.exists(active):
+            # ⚠️ 这一行会触发 `<<TreeviewSelect>>`。`refresh_groups` 只在 `recompute()`
+            #    里（`_syncing=True`）跑，而 `on_group_select` 在 `_syncing` 时直接返回 ——
+            #    那条重入保护就是为这里存在的。
+            self.gtree.selection_set(active)
+        _fit_tree_columns(
+            self.gtree,
+            tuple(col[0] for col in GROUP_COLS),
+            head_font=self.f_ui_b,
+            cell_font=self.f_mono,
+            floors={key: width for key, _head, width in GROUP_COLS},
+            caps=self._cap_px({"summary": GROUP_SUMMARY_CAP_CHARS}),
+        )
+        if self.groups_hint is not None:
+            merged = self.bridge.merged_run_count() if self.groups_ok else 0
+            if merged:
+                word = "duplicate" if merged == 1 else "duplicates"
+                self.groups_hint.config(text="%d %s merged across groups" % (merged, word))
+            else:
+                self.groups_hint.config(text="double-click a name to rename")
+
+    def on_group_select(self) -> None:
+        """用户点了组表的一行。`_syncing` 时是我们自己在重画，不当成用户操作。"""
+        if self._syncing or self.gtree is None:
+            return
+        selection = self.gtree.selection()
+        if not selection:
+            return
+        self.switch_group(selection[0])
+
+    def switch_group(self, name: str) -> None:
+        """切到另一个组编辑。**顺序是本方法存在的全部理由。**
+
+        必须先把界面上现在的值落到**旧组**、再切、再把界面变量重灌成新组的值，
+        最后才 `recompute()`。反过来（先切再 recompute）就是把 A 组的取值当成用户
+        刚配的东西写进 B 组 —— 而且看起来完全正常（B 组"继承"了一份 A 的取值），
+        直到跑出一批莫名其妙的 run 才会发现。
+        """
+        if not self.groups_ok or name == self._active_group():
+            return
+        if not self.bridge.is_running() and not self.bridge.has_started():
+            self._guard(self.push)
+        try:
+            self.bridge.set_active_group(name)
+        except EwaveBatchError as exc:
+            _error("Cannot switch run group", str(exc))
+            return
+        self._reload_group_vars()
+        self.recompute()
+
+    def _reload_group_vars(self) -> None:
+        """把界面变量重灌成 active group 的有效取值。**必须在下一次 `push()` 之前。**"""
+        self._syncing = True
+        try:
+            self._apply_axis_selection(self.bridge.axis_selection())
+            self._sync_override_vars()
+        finally:
+            self._syncing = False
+
+    def on_override_toggle(self, _key: str) -> None:
+        """勾/取消一根轴的"这个组自己定" —— 值本身由 `push()` 落进 bridge。
+
+        勾上时写进去的是**界面上此刻显示的（继承来的）取值**：从基线出发改一根，
+        比先清空再从头填一遍自然得多。取消勾选时 `push()` 撤掉覆盖，
+        `_sync_group_rows()` 随即把控件重新灌成 base 的值并置灰。
+        """
+        self.recompute()
+
+    def do_add_group(self) -> None:
+        """加一个空组并切过去。名字先自动取，双击改。
+
+        新组一根轴都不覆盖 ⇒ 展开出来与 base 逐字相同 ⇒ 全被跨组去重吃掉 ⇒ 贡献
+        0 个 run。表里那个 `-> 0` 不是 bug，是"还没配"—— 勾一根轴上去它就变了。
+        """
+        if not self.groups_ok:
+            return
+        if not self.bridge.is_running() and not self.bridge.has_started():
+            self._guard(self.push)
+        try:
+            self.bridge.add_group()
+        except EwaveBatchError as exc:
+            _error("Cannot add run group", str(exc))
+            return
+        self._reload_group_vars()
+        self.recompute()
+
+    def do_duplicate_group(self) -> None:
+        """复制选中的组（base 也能复制 —— 那会把当前勾选写成一份显式覆盖）。"""
+        if not self.groups_ok:
+            return
+        if not self.bridge.is_running() and not self.bridge.has_started():
+            self._guard(self.push)
+        try:
+            self.bridge.duplicate_group(self._selected_group())
+        except EwaveBatchError as exc:
+            _error("Cannot duplicate run group", str(exc))
+            return
+        self._reload_group_vars()
+        self.recompute()
+
+    def do_remove_group(self) -> None:
+        if not self.groups_ok:
+            return
+        name = self._selected_group()
+        if name == BASE_GROUP:
+            _info(
+                "Cannot remove the base group",
+                "The base group is the top-level settings themselves - every batch has one.\n"
+                "Remove one of the other groups instead.",
+            )
+            return
+        try:
+            self.bridge.remove_group(name)
+        except EwaveBatchError as exc:
+            _error("Cannot remove run group", str(exc))
+            return
+        self._reload_group_vars()
+        self.recompute()
+
+    def on_group_rename(self, event: object) -> None:
+        """双击组名那一列 = 改名。别的列双击什么都不做（免得误触）。"""
+        if not self.groups_ok or self.gtree is None:
+            return
+        iid = self.gtree.identify_row(event.y)  # type: ignore[attr-defined]
+        column = self.gtree.identify_column(event.x)  # type: ignore[attr-defined]
+        if not iid or column != "#1":
+            return
+        if iid == BASE_GROUP:
+            _info(
+                "Cannot rename the base group",
+                "%r is a reserved name: it means the top-level settings." % BASE_GROUP,
+            )
+            return
+
+        dlg = tk.Toplevel(self.top)
+        dlg.title("Rename run group")
+        dlg.transient(self.top)
+        var = tk.StringVar(value=iid)
+        ttk.Label(dlg, text="Group name").grid(row=0, column=0, sticky=tk.W, padx=8, pady=6)
+        ttk.Entry(dlg, textvariable=var, width=26, font=self.f_mono).grid(
+            row=0, column=1, padx=8, pady=6
+        )
+        ttk.Label(
+            dlg,
+            text="The name shows up in the Runs table and in every message about this group.",
+            style="Hint.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=8)
+
+        def ok() -> None:
+            try:
+                self.bridge.rename_group(iid, var.get().strip())
+            except EwaveBatchError as exc:
+                dlg.destroy()
+                _error("Cannot rename run group", str(exc))
+                return
+            dlg.destroy()
+            self.recompute()
+
+        ttk.Button(dlg, text="OK", command=ok).grid(row=2, column=1, sticky=tk.E, padx=8, pady=8)
+        if not smoke_enabled():
+            dlg.grab_set()
+
+    # ---- run group：bridge 缺席时的兜底（见 `__init__` 里的 `groups_ok`）
+    def _groups(self) -> tuple[object, ...]:
+        return self.bridge.groups() if self.groups_ok else ()
+
+    def _active_group(self) -> str:
+        return self.bridge.active_group() if self.groups_ok else BASE_GROUP
+
+    def _active_is_base(self) -> bool:
+        return self._active_group() == BASE_GROUP
+
+    def _group_summary(self, name: str) -> str:
+        try:
+            return self.bridge.group_summary(name)
+        except (AttributeError, EwaveBatchError):
+            return ""
+
+    def _selected_group(self) -> str:
+        """组表里选中的那一行；没选中就用 active group（表可能没焦点）。"""
+        if self.gtree is not None:
+            selection = self.gtree.selection()
+            if selection:
+                return selection[0]
+        return self._active_group()
+
+    def _new_override_var(self, key: str) -> tk.BooleanVar:
+        """给 `GROUP_ROW_AXES` 的一行造"覆盖"勾选变量（`_srow` 之外的那一行用）。"""
+        var = tk.BooleanVar(value=True)
+        self.ovr_vars[key] = var
+        return var
+
     # ------------------------------------------------------------- settings
-    def _srow(self, parent: object, row: int, label: str, width: int = 14) -> tuple[ttk.Frame, ttk.Label]:
+    def _srow(
+        self, parent: object, row: int, label: str, width: int = 14, key: str = ""
+    ) -> tuple[ttk.Frame, ttk.Label]:
+        """Settings 的一行：`[覆盖勾选框] 标签 | 控件 | -> N`。
+
+        第 0 列是**组感知**那一列：勾上 = 当前这个组自己定这根轴，不勾 = 继承 base
+        （控件置灰、显示继承来的值）。编辑 base 时它恒选中且点不动 —— base 是继承链的
+        源头，"base 继承谁"这个问题没有答案，所以那个勾选框不该是可点的。
+        `key` 空（扫频那一行）= 这一行不参与组覆盖，第 0 列留空占位保持对齐。
+        """
+        if key:
+            var = tk.BooleanVar(value=True)
+            self.ovr_vars[key] = var
+            check = ttk.Checkbutton(
+                parent,  # type: ignore[arg-type]
+                variable=var,
+                command=lambda k=key: self.on_override_toggle(k),
+            )
+            check.grid(row=row, column=0, sticky=tk.W)
+            self.ovr_boxes[key] = check
         ttk.Label(parent, text=label, width=width, anchor=tk.W).grid(  # type: ignore[arg-type]
-            row=row, column=0, sticky=tk.W, pady=2
+            row=row, column=1, sticky=tk.W, pady=2
         )
         box = ttk.Frame(parent)  # type: ignore[arg-type]
-        box.grid(row=row, column=1, sticky=tk.W)
+        box.grid(row=row, column=2, sticky=tk.W)
+        if key:
+            self.srow_boxes[key] = box
         count = ttk.Label(parent, text="-> 1", style="Count.TLabel", anchor=tk.E, width=6)  # type: ignore[arg-type]
-        count.grid(row=row, column=2, sticky=tk.E, padx=(10, 0))
+        count.grid(row=row, column=3, sticky=tk.E, padx=(10, 0))
         ttk.Separator(parent, orient=tk.HORIZONTAL).grid(  # type: ignore[arg-type]
-            row=row, column=0, columnspan=3, sticky="sew"
+            row=row, column=0, columnspan=4, sticky="sew"
         )
         return box, count
 
@@ -384,37 +1263,43 @@ class BaseApp:
     ) -> ttk.LabelFrame:
         box = ttk.LabelFrame(parent, text=title, padding=7)  # type: ignore[arg-type]
         self.settings_box = box
-        self.show_formula_in_title = show_formula
+        self.settings_title = title
         grid = ttk.Frame(box)
         grid.pack(fill=tk.X)
-        grid.columnconfigure(1, weight=1)
-        lw = 11 if compact else 15
+        # 第 0 列是"覆盖"勾选框，给它一个固定的最小宽度：没有它的那几行（扫频、
+        # 以及 base 组下被藏起来的时候）会让标签整列跳一下。
+        grid.columnconfigure(0, minsize=20)
+        grid.columnconfigure(2, weight=1)
+        # ⚠️ `compact` **不再缩写任何标签**（2026-08-19，D2）。它当初是为一个钉死在
+        #    452px 的左栏做的妥协：Temperature -> Temp、Frequency sweep -> Freq sweep、
+        #    vertical distance -> vert、via merge space -> via merge、
+        #    "degC, comma separated" -> "degC, comma sep."。而那个左栏现在是
+        #    `ttk.PanedWindow` 的一格，宽度由内容决定、还能拖 —— 宽度本来就不紧张，
+        #    缩写换不到任何东西，只留下"via merge 到底是什么"这个问题。
+        #    `compact` 保留下来只管两样：输入框窄一点、勾选框之间的间距小一点。
+        lw = 15
 
-        box_c, self.cnt_corner = self._srow(grid, 0, "Corner", lw)
+        box_c, self.cnt_corner = self._srow(grid, 0, "Corner", lw, key="corner")
         for name in gui_state.CORNER_VALUES:
             ttk.Checkbutton(
                 box_c, text=name, variable=self.corner_vars[name], command=self.recompute
             ).pack(side=tk.LEFT, padx=(0, 6 if compact else 11))
 
-        box_t, self.cnt_temp = self._srow(grid, 1, "Temp" if compact else "Temperature", lw)
+        box_t, self.cnt_temp = self._srow(grid, 1, "Temperature", lw, key="temperature")
         entry = ttk.Entry(box_t, textvariable=self.temp, font=self.f_mono, width=20 if compact else 32)
         entry.pack(side=tk.LEFT)
         entry.bind("<KeyRelease>", lambda _e: self.recompute())
-        ttk.Label(
-            box_t,
-            text="degC, comma sep." if compact else "degC, comma separated",
-            style="Hint.TLabel",
-        ).pack(side=tk.LEFT, padx=5)
+        ttk.Label(box_t, text="degC, comma separated", style="Hint.TLabel").pack(
+            side=tk.LEFT, padx=5
+        )
 
-        box_m, self.cnt_mode = self._srow(grid, 2, "Mode", lw)
+        box_m, self.cnt_mode = self._srow(grid, 2, "Mode", lw, key="fullWave")
         for name in ("Quasi-static", "Full wave"):
             ttk.Checkbutton(
                 box_m, text=name, variable=self.mode_vars[name], command=self.recompute
             ).pack(side=tk.LEFT, padx=(0, 12))
 
-        box_f, self.cnt_freq = self._srow(
-            grid, 3, "Freq sweep" if compact else "Frequency sweep", lw
-        )
+        box_f, self.cnt_freq = self._srow(grid, 3, "Frequency sweep", lw)
         combo = ttk.Combobox(
             box_f,
             textvariable=self.sw_mode,
@@ -425,6 +1310,7 @@ class BaseApp:
         )
         combo.pack(side=tk.LEFT)
         combo.bind("<<ComboboxSelected>>", lambda _e: self.recompute())
+        self.sw_combo = combo
         self.freq_entries: dict[str, tuple[ttk.Label, ttk.Entry]] = {}
         for key, var in (
             ("start", self.f_start),
@@ -440,44 +1326,57 @@ class BaseApp:
             self.freq_entries[key] = (label, entry)
         ttk.Label(box_f, text="GHz", style="Hint.TLabel").pack(side=tk.LEFT, padx=4)
 
-        box_h, self.cnt_mesh = self._srow(grid, 4, "Mesh", lw)
-        for long_label, short_label, var in (
-            ("edge distance", "edge", self.m_edge),
-            ("vertical distance", "vert", self.m_vert),
-            ("via merge space", "via merge", self.m_via),
+        box_h, self.cnt_mesh = self._srow(grid, 4, "Mesh", lw, key="mesh")
+        for label_text, var in (
+            ("edge distance", self.m_edge),
+            ("vertical distance", self.m_vert),
+            ("via merge space", self.m_via),
         ):
-            ttk.Label(box_h, text=short_label if compact else long_label).pack(
-                side=tk.LEFT, padx=(0, 3)
-            )
+            ttk.Label(box_h, text=label_text).pack(side=tk.LEFT, padx=(0, 3))
             entry = ttk.Entry(box_h, textvariable=var, width=5, font=self.f_mono)
             entry.pack(side=tk.LEFT, padx=(0, 10))
             entry.bind("<KeyRelease>", lambda _e: self.recompute())
 
         # Advanced：收起来是一行摘要，展开是真控件（第 3 层「逃生口」住在这儿）
+        adv_check = ttk.Checkbutton(
+            grid,
+            variable=self._new_override_var("advanced"),
+            command=lambda: self.on_override_toggle("advanced"),
+        )
+        adv_check.grid(row=5, column=0, sticky=tk.W)
+        self.ovr_boxes["advanced"] = adv_check
         adv_head = ttk.Frame(grid)
-        adv_head.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        adv_head.grid(row=5, column=1, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.adv_btn = ttk.Button(adv_head, text="+ Advanced", width=13, command=self.toggle_adv)
         self.adv_btn.pack(side=tk.LEFT)
         self.adv_summary = ttk.Label(adv_head, text="", style="Off.TLabel")
         self.adv_summary.pack(side=tk.LEFT, padx=8)
         self.cnt_adv = ttk.Label(grid, text="-> 1", style="Off.TLabel", anchor=tk.E, width=6)
-        self.cnt_adv.grid(row=5, column=2, sticky=tk.E, padx=(10, 0))
+        self.cnt_adv.grid(row=5, column=3, sticky=tk.E, padx=(10, 0))
 
         self.adv_body = ttk.Frame(grid)
         row = ttk.Frame(self.adv_body)
         row.pack(anchor=tk.W, pady=(3, 0))
+        # ★ Advanced 那一行的"覆盖"勾选框只管 **equalCurrent 这一小块**：
+        #   两个 tolerance 跟扫频一样只属于 base（见 `GROUP_ROW_AXES`），
+        #   Extra flags 更不是轴（整批共用），编辑某个组时照样得能改。
+        eq_box = ttk.Frame(row)
+        eq_box.pack(side=tk.LEFT)
+        self.srow_boxes["advanced"] = eq_box
         ttk.Checkbutton(
-            row, text="equalCurrent on", variable=self.eq_on, command=self.recompute
+            eq_box, text="equalCurrent on", variable=self.eq_on, command=self.recompute
         ).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Checkbutton(row, text="off", variable=self.eq_off, command=self.recompute).pack(
+        ttk.Checkbutton(eq_box, text="off", variable=self.eq_off, command=self.recompute).pack(
             side=tk.LEFT, padx=(0, 18)
         )
+        self.tol_box = ttk.Frame(row)
+        self.tol_box.pack(side=tk.LEFT)
         for label, var in (
             ("relative tolerance", self.tol_r),
             ("relative current tolerance", self.tol_c),
         ):
-            ttk.Label(row, text=label).pack(side=tk.LEFT, padx=(0, 3))
-            entry = ttk.Entry(row, textvariable=var, width=9, font=self.f_mono)
+            ttk.Label(self.tol_box, text=label).pack(side=tk.LEFT, padx=(0, 3))
+            entry = ttk.Entry(self.tol_box, textvariable=var, width=9, font=self.f_mono)
             entry.pack(side=tk.LEFT, padx=(0, 14))
             entry.bind("<KeyRelease>", lambda _e: self.recompute())
 
@@ -514,7 +1413,7 @@ class BaseApp:
             self.adv_btn.config(text="+ Advanced")
             self.adv_summary.pack(side=tk.LEFT, padx=8)
         else:
-            self.adv_body.grid(row=6, column=0, columnspan=3, sticky=tk.W + tk.E)
+            self.adv_body.grid(row=6, column=0, columnspan=4, sticky=tk.W + tk.E)
             self.adv_btn.config(text="- Advanced")
             self.adv_summary.pack_forget()
         self.adv_open = not self.adv_open
@@ -526,12 +1425,18 @@ class BaseApp:
         改完之后 `-R` 里的 `cpu=` 仍然要能读回去同步 `--parallel` ——
         那一步走 `core.cmd.parse_resource_string`（`GuiState.parallel()`），
         本文件不再解析第二遍。
+
+        ⚠️ `compact` 现在**什么都不管**（D3：它曾经把 "Submit command" 那个标签整个藏掉）。
+        参数留着是因为 `gui/frames/split.py` 在传它，而"布局传了一个共用层不认识的
+        hint"会被 `tests/test_gui_frames.py` 记成 `dropped_hints`（那是三版分岔的信号）。
         """
         box = ttk.LabelFrame(parent, text=" Resources ", padding=7)  # type: ignore[arg-type]
         top = ttk.Frame(box)
         top.pack(fill=tk.X)
-        if not compact:
-            ttk.Label(top, text="Submit command", width=15, anchor=tk.W).pack(side=tk.LEFT)
+        # ⚠️ `compact` 曾经把这个标签整个藏掉，于是 split 版的 Resources 里只剩一个
+        #    **没有任何标签的空输入框**（2026-08-19 实拍 D3）—— 一个空框不告诉任何人
+        #    它想要什么，省下那 100px 换不到这个代价。标签一律显示。
+        ttk.Label(top, text="Submit command", width=15, anchor=tk.W).pack(side=tk.LEFT)
         entry = ttk.Entry(top, textvariable=self.dsub, font=self.f_mono)
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         entry.bind("<KeyRelease>", lambda _e: self.recompute())
@@ -576,13 +1481,13 @@ class BaseApp:
         )
         for key, head, width in RUN_COLS:
             self.tree.heading(key, text=head)
-            self.tree.column(key, width=width, anchor=tk.W, stretch=(key == "extra"))
+            # `design` 和 `extra` 一起 stretch。原来只有 `extra` 会伸 —— 于是在
+            # stacked 那种宽窗口里它白占 459px（内容只要 93px），而同一张表里
+            # `design` 被钉在 150px、两个不同的 design 显示成同一串前缀。
+            self.tree.column(key, width=width, anchor=tk.W, stretch=(key in RUN_STRETCH_COLS))
         for key in ("n", "temp", "wall"):
             self.tree.column(key, anchor=tk.E)
-        scroll = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll.pack(side=tk.LEFT, fill=tk.Y)
+        _scrolled_tree_grid(wrap, self.tree, viewport_width=RUNS_VIEWPORT_WIDTH)
         for name, (background, foreground) in STATUS_STYLE.items():
             self.tree.tag_configure(name, background=background, foreground=foreground)
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self.show_detail())
@@ -606,7 +1511,11 @@ class BaseApp:
             if item == "-":
                 self.menu.add_separator()
             else:
-                self.menu.add_command(label=item, command=lambda t=item: self.on_row_action(t))
+                _add_menu_item(
+                    self.menu,
+                    item,
+                    None if item in DISABLED_MENU_ITEMS else (lambda t=item: self.on_row_action(t)),
+                )
         return box
 
     def build_detail(self, parent: object) -> ttk.LabelFrame:
@@ -626,13 +1535,16 @@ class BaseApp:
             fg="#222222",
         )
         out.grid(row=0, column=1, sticky="ew", pady=1)
+        # 单行输入框装绝对路径，窗口一窄就只看得见开头一截。只读 Entry 本来就能用
+        # 方向键/拖选横向滚动，缺的只是"完整的那一份在哪" —— 悬停给出全文（B4）。
+        _Tooltip(out, self.out_var.get)
 
         ttk.Label(box, text="Command", width=9, anchor=tk.NW).grid(row=1, column=0, sticky=tk.NW)
         holder = ttk.Frame(box)
         holder.grid(row=1, column=1, sticky="ew", pady=1)
         self.cmd_text = tk.Text(
             holder,
-            height=4,
+            height=CMD_ROWS_MIN,
             wrap="none",
             font=self.f_mono,
             relief=tk.SOLID,
@@ -672,14 +1584,20 @@ class BaseApp:
         ttk.Button(f, text="Open batch dir", width=15, command=self.do_open_batch_dir).pack(
             side=tk.LEFT, padx=(8, 2)
         )
+        # C5：「N / M done」原来在这里也有一份，与状态栏右下角那份逐字相同。
+        # 两份同一个数字唯一的作用是让人怀疑它们会不会不一样。留状态栏那份
+        # （状态栏就是干这个的），这里空出来的宽度全给批次目录。
+        self.right_lbl = None
         if show_dir:
             ttk.Label(f, text="Batch dir", style="Hint.TLabel").pack(side=tk.LEFT, padx=(10, 4))
-            self.batchdir_lbl = ttk.Label(f, text="", style="Mono.TLabel")
-            self.batchdir_lbl.pack(side=tk.LEFT)
+            # B2：批次目录实测要 1336px、给到 927px，于是路径**从中间断掉**——
+            # 一条只剩前半截的路径比没有更坏（看起来像一条完整的、错的路径）。
+            # `_ElideLabel` 保头保尾：`/home/.../<batch_name>/`，全文在 tooltip 里。
+            self.batchdir_lbl = _ElideLabel(f, font=self.f_mono, chars=16, style="Mono.TLabel")
+            self.batchdir_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            _Tooltip(self.batchdir_lbl, self.batchdir_lbl.full_text)
         else:
             self.batchdir_lbl = None
-        self.right_lbl = ttk.Label(f, text="", style="Mono.TLabel")
-        self.right_lbl.pack(side=tk.RIGHT)
         return f
 
     def build_statusbar(self, parent: object) -> ttk.Frame:
@@ -692,16 +1610,25 @@ class BaseApp:
 
     # -------------------------------------------------------------- compute
     def push(self) -> None:
-        """GUI 变量 → bridge。**这是唯一往核心写值的地方**（别在回调里各写一份）。"""
+        """GUI 变量 → bridge。**这是唯一往核心写值的地方**（别在回调里各写一份）。
+
+        轴的取值一律经 `_push_axis()`：它按当前那一行的"覆盖"勾选框决定写进 base
+        还是写进 active group 的覆盖。active = base 时逐字等于加组之前。
+        """
         b = self.bridge
         b.set_batch_name(self.batch.get())
         if self.offdir.get().strip() != b.official_run_dir:
             b.set_official_run_dir(self.offdir.get())
-        b.set_axis_values(
-            "corner", [name for name in gui_state.CORNER_VALUES if self.corner_vars[name].get()]
+        self._push_axis(
+            "corner",
+            "corner",
+            [name for name in gui_state.CORNER_VALUES if self.corner_vars[name].get()],
         )
-        b.set_axis_values("temperature", gui_state.parse_value_list(self.temp.get()))
-        b.set_axis_values(
+        self._push_axis(
+            "temperature", "temperature", gui_state.parse_value_list(self.temp.get())
+        )
+        self._push_axis(
+            "fullWave",
             "fullWave",
             [
                 value
@@ -710,16 +1637,20 @@ class BaseApp:
                 if var.get()
             ],
         )
-        b.set_axis_values(
+        self._push_axis(
+            "advanced",
             "equalCurrent",
             [value for value, var in (("on", self.eq_on), ("off", self.eq_off)) if var.get()],
         )
-        b.set_axis_values(
+        self._push_axis(
+            "mesh",
             "mesh",
             [gui_state.mesh_axis_value(self.m_edge.get(), self.m_vert.get(), self.m_via.get())],
         )
-        b.set_axis_values("relativeTolerance", [self.tol_r.get()])
-        b.set_axis_values("relativeCurrentTolerance", [self.tol_c.get()])
+        self._push_base_axis("relativeTolerance", [self.tol_r.get()])
+        self._push_base_axis("relativeCurrentTolerance", [self.tol_c.get()])
+        # 扫频和两个 tolerance 一样只属于 base（见 `GROUP_ROW_AXES` 的注释）。
+        # 编辑别的组时那几行是置灰的，格子里还是 base 的值 ⇒ 这一步是个 no-op。
         b.set_sweep(
             mode=self.sw_mode.get(),
             start=self.f_start.get(),
@@ -729,6 +1660,126 @@ class BaseApp:
         )
         b.set_extra_flags(self.extra.get())
         b.set_submit_command(self.dsub.get())
+
+    def _push_axis(self, key: str, axis: str, values: Sequence[str]) -> None:
+        """一根轴的取值 → bridge，按那一行的"覆盖"勾选框分流。
+
+        * active = base（或 bridge 根本没有组这一说）：`set_axis_values` —— 与加组之前
+          **逐字相同**，这条路上一个新分支都没有。
+        * active 是别的组、这一行勾着："这个组自己定" ⇒ 写这个组的覆盖；
+        * active 是别的组、这一行没勾："继承 base" ⇒ **撤掉**覆盖。不撤的话，
+          用户每敲一个键都会把继承来的值原样写成一份显式覆盖，于是"继承"这件事
+          在存盘的 spec 里当场消失（组从两行变成把 base 抄了一遍）。
+
+        非 base 那条路各自过闸：组在一根 base 没勾过的轴上写覆盖是会被核心拒绝的
+        （消息很具体），而那不该把 `push()` 后面几条（扫频/Extra flags/提交命令）
+        一起吞掉 —— 半推半就的 push 比一条错误消息难查得多。
+        """
+        if self._active_is_base():
+            self.bridge.set_axis_values(axis, values)
+            return
+        var = self.ovr_vars.get(key)
+        if var is None or var.get():
+            self._guard(lambda: self.bridge.set_group_override(axis, values))
+        else:
+            self._guard(lambda: self.bridge.clear_group_override(axis))
+
+    def _push_base_axis(self, axis: str, values: Sequence[str]) -> None:
+        """只属于 base 的轴（两个 tolerance；扫频走 `set_sweep` 也是同一条规矩）。
+
+        编辑别的组时**什么都不做** —— 不是写、也不是清。不写是因为界面上那几个格子
+        是置灰的、里面本来就是 base 的值；不清是因为手写的 spec 文件里完全可以有一个
+        组覆盖了 tolerance，界面看不见它不代表可以替用户删掉它。
+        """
+        if self._active_is_base():
+            self.bridge.set_axis_values(axis, values)
+
+    def _sync_override_vars(self) -> None:
+        """"覆盖"勾选框 ← bridge。判据就是 `group_override()` 返不返回 None。
+
+        base 组恒选中（它是继承链的源头，没有"继承"可言）。
+        """
+        if not self.ovr_vars:
+            return
+        base = self._active_is_base()
+        for key, var in self.ovr_vars.items():
+            if base:
+                var.set(True)
+                continue
+            var.set(
+                any(
+                    self.bridge.group_override(axis) is not None
+                    for axis in GROUP_ROW_AXES.get(key, ())
+                )
+            )
+
+    def _sync_group_rows(self) -> None:
+        """Settings 整块的组感知：勾选框能不能点、控件灰不灰、继承的行显示什么。
+
+        跑在 `push()` **之后**（`recompute()` 的顺序），所以这里读到的覆盖就是刚写进去
+        的那份。继承的那几行顺手用 base 的值重灌一遍 —— 它们此刻是禁用的，用户不可能
+        正在里面打字，覆盖它们不会跟输入打架。
+        """
+        if not self.ovr_vars:
+            return
+        base = self._active_is_base()
+        self._sync_override_vars()
+        for key, check in self.ovr_boxes.items():
+            check.state(["disabled"] if base else ["!disabled"])
+        # 两个 tolerance 只属于 base（见 `GROUP_ROW_AXES`），跟扫频一样整块跟着走。
+        tol_box = getattr(self, "tol_box", None)
+        if tol_box is not None:
+            _set_enabled(tol_box, base)
+        if base:
+            for container in self.srow_boxes.values():
+                _set_enabled(container, True)
+            return
+        selection = self.bridge.axis_selection()
+        inherited = [key for key, var in self.ovr_vars.items() if not var.get()]
+        for key, container in self.srow_boxes.items():
+            _set_enabled(container, key not in inherited)
+        if inherited:
+            self._syncing_vars(lambda: self._apply_axis_selection(selection, only=inherited))
+
+    def _syncing_vars(self, step: object) -> None:
+        """在"这是我们自己在写变量、不是用户操作"的旗子下跑一步。"""
+        was = self._syncing
+        self._syncing = True
+        try:
+            step()  # type: ignore[operator]
+        finally:
+            self._syncing = was
+
+    def _formula_target(self) -> str:
+        """那条乘法公式该显示在**哪一个**地方。
+
+        C4：split 里它同时渲染两遍（Settings 的边框标题一份、Total 行一份，字一模一样）。
+        而 stacked 恰好相反 —— 它两个都没有（settings 传 `show_formula=False`、
+        actionbar 也不显示），公式在那一版**根本不出现**。两个 bug 是同一件事：
+        "在哪显示"被三个布局参数各自决定了一半。
+
+        所以改成在这里**统一挑一个**，优先级 = 离设定最近的那个：
+        Total 行 > 动作栏 > 边框标题。每一版都恰好有一处，一处不多、一处不少。
+        建控件的顺序不影响它 —— 本方法只在 `_sync_counts()` 里调，那时候三样都建完了。
+        """
+        if self.formula_lbl is not None:
+            return "total"
+        if self.bar_formula is not None:
+            return "bar"
+        return "title"
+
+    def _settings_title(self, formula: str) -> str:
+        """Settings 边框上的标题。**编辑的是哪个组必须写在这儿。**
+
+        只有一个 base 组时不写"editing: base"：那是最常见的场景，多一句
+        只会让人以为自己进了什么模式。组多于一个时它就是"我改的到底是哪一行"的答案。
+        """
+        title = self.settings_title.strip()
+        if len(self._groups()) > 1:
+            title += " - editing: %s" % self._active_group()
+        if self._formula_target() == "title":
+            title += "   -   %s" % formula
+        return " %s " % title
 
     def recompute(self) -> None:
         """勾选变了 → 推给 bridge → 重算矩阵 → 刷新整屏。**重入安全。**"""
@@ -745,10 +1796,12 @@ class BaseApp:
                 self._guard(self.bridge.plan)
             # 这四条也要各自过闸：用户把 Mesh 的某个格子清空、把温度写成一个词，
             # 核心会（正确地）拒绝，而**界面不该因此死掉**。理由写在 `_guard` 上。
+            self._guard(self._sync_group_rows)
             self._guard(self._sync_freq_fields)
             self._guard(self._sync_counts)
             self._guard(self._sync_resources)
             self._guard(self._sync_extra_warning)
+            self._guard(self._sync_groups_panel)
             self.refresh_tree()
             self.update_status()
             self.sync_buttons()
@@ -772,12 +1825,20 @@ class BaseApp:
             self._error = message if not self._error else self._error
 
     def _sync_freq_fields(self) -> None:
-        """扫描模式决定哪几个格子有意义 —— 其余置灰。"""
+        """扫描模式决定哪几个格子有意义 —— 其余置灰。
+
+        编辑 base 之外的组时**整行置灰**：扫频没有按组覆盖这一说（`GROUP_ROW_AXES`），
+        而这几个格子是直接写 base 的 —— 留着能编辑就等于"在 eqcur-off 组里改了扫频，
+        结果基线跟着变了"，那是最难查的一类界面谎话。
+        """
         live = self.bridge.sweep_live_fields()
+        editable = self._active_is_base()
         for key, (label, entry) in self.freq_entries.items():
-            on = key in live
+            on = editable and key in live
             entry.config(state="normal" if on else "disabled")
             label.config(foreground="#101010" if on else "#9c9c9c")
+        if self.sw_combo is not None:
+            self.sw_combo.config(state="readonly" if editable else "disabled")
 
     def _sync_counts(self) -> None:
         # ★ 批次名空着的时候 bridge 会现起一个 UTC 时间戳名。不灌回输入框的话，
@@ -814,18 +1875,20 @@ class BaseApp:
         self.adv_summary.config(text=summary)
 
         formula = self.bridge.formula()
+        target = self._formula_target()
         if self.formula_lbl is not None:
-            self.formula_lbl.config(text=formula)
+            self.formula_lbl.config(text=formula if target == "total" else "")
         if self.bar_formula is not None:
-            self.bar_formula.config(text=formula)
-        if self.show_formula_in_title:
-            self.settings_box.config(text=" Settings   -   %s " % formula)
+            self.bar_formula.config(text=formula if target == "bar" else "")
+        settings_box = getattr(self, "settings_box", None)
+        if settings_box is not None:
+            settings_box.config(text=self._settings_title(formula))
         self.on_counts(counts, self.bridge.run_count())
 
         batch_dir = self.bridge.batch_dir() + "/"
         for label in (self.batchdir_lbl, self.dir_lbl):
             if label is not None:
-                label.config(text=batch_dir)
+                label.set_text(batch_dir)
 
     def _sync_resources(self) -> None:
         # ★ 第一次 plan 时 bridge 会从 `SiteFacts` 里学出整条 dsub 提交前缀 ——
@@ -858,6 +1921,28 @@ class BaseApp:
             self.extra_warn.pack_forget()
             self.extra_entry.config(foreground="")
 
+    def _sync_groups_panel(self) -> None:
+        """重画组表 + 那条「加组会改掉基线的目录名」的红字。
+
+        为什么这条警告必须显示出来：`<axes-slug>` 只编码「全批次在变」的轴，而组的取值
+        也算在全批次里 ⇒ **加一个组会把基线自己的目录名也改掉**（`base/...` 变成
+        `eqI-on__fw-off/...`）。这是正确且不可避免的（否则两个组的 55 度落进同一个目录
+        = 静默覆盖 = 本工具存在的理由），但对一个已经跑过的批次来说，resume 靠 run_id
+        对号，老目录当场就认不出来了。措辞由 bridge 给（`groups_change_warning()`），
+        界面只负责让它看得见。
+        """
+        if self.gtree is None:
+            return
+        self.refresh_groups()
+        if self.groups_warn is None:
+            return
+        message = self.bridge.groups_change_warning() if self.groups_ok else ""
+        if message:
+            self.groups_warn.config(text="!  " + message)
+            self.groups_warn.pack(anchor=tk.W, fill=tk.X, pady=(4, 0))
+        else:
+            self.groups_warn.pack_forget()
+
     def refresh_tree(self) -> None:
         self._runs = self.bridge.runs()
         self.tree.delete(*self.tree.get_children())
@@ -869,6 +1954,9 @@ class BaseApp:
                 values=(
                     index + 1,
                     run.design_key,
+                    # `Run.group` 是出身标签，**不进 run_id**（进了就等于把跨组去重
+                    # 取消掉）。老 batch.json 读回来时它可能是空的 —— 那就当 base。
+                    _label(getattr(run, "group", "") or BASE_GROUP),
                     _label(run.axis_values.get("corner", "")),
                     _label(run.axis_values.get("temperature", "")),
                     _mode_text(run),
@@ -879,10 +1967,52 @@ class BaseApp:
                 ),
                 tags=(run.status.value,),
             )
+        _fit_tree_columns(
+            self.tree,
+            tuple(col[0] for col in RUN_COLS),
+            head_font=self.f_ui_b,
+            cell_font=self.f_mono,
+            floors={key: width for key, _head, width in RUN_COLS},
+            caps=self._cap_px(RUN_COL_CAP_CHARS),
+        )
         if self._runs:
             self.empty_lbl.place_forget()
         else:
             self.empty_lbl.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+
+    def _cmd_rows_within_budget(self, want: int) -> int:
+        """把 Command 框想要的行数夹到「Runs 表还剩得下 `CMD_TREE_FLOOR_ROWS` 行」为止。
+
+        2026-08-19 复验实拍（stacked，**默认字号**，1180x979 窗口）：点一条 run 看它的
+        命令，Command 框从 2 行长到 8 行；而 stacked 的整棵树本来就比屏幕高
+        （要 1107px、0.85 屏高只给得起 979px），多出来的 6 行**全部从 Runs 表身上扣** ——
+        表从 87px 掉到 30px，一行 run 都看不见，连它自己的纵向滚动条都被裁掉一截。
+        也就是说「点一条 run 看它的命令」这个动作会把你刚点的那张表弄没。
+        split / tabbed 装得下，所以那两版一点事都没有 —— 这正是"上限写成常数"的破绽：
+        同一个数字在一版是保护、在另一版是伤害。
+
+        规矩两条：
+        1. 只往**当前行数**上加表里真正富余出来的那几行，富余是负的就一行都不加；
+        2. **不因为空间不够而缩**（缩由文本变短触发，那是另一回事）——
+           每次选中都缩一下会让表格上下跳，理由同 `_fit_tree_columns` 的「只涨不缩」。
+
+        表还没映射（`winfo_height() <= 1`，headless 冒烟就是这样）→ 原样返回；
+        拿 1px 当"没地方"会让冒烟跑出一个和真界面不一样的形状。
+        """
+        tree = getattr(self, "tree", None)
+        if tree is None:
+            return want
+        try:
+            tree_px = tree.winfo_height()
+            current = int(self.cmd_text.cget("height"))
+        except (tk.TclError, ValueError):  # pragma: no cover - 窗口已经关掉的竞态
+            return want
+        if tree_px <= 1:
+            return want
+        line_px = max(1, self.f_mono.metrics("linespace") + 2)
+        floor_px = CMD_TREE_FLOOR_ROWS * getattr(self, "runs_rowheight", 21)
+        spare = (tree_px - floor_px) // line_px
+        return max(CMD_ROWS_MIN, min(want, current + max(0, spare)))
 
     def show_detail(self) -> None:
         selection = self.tree.selection()
@@ -890,9 +2020,17 @@ class BaseApp:
             return
         run_id = selection[0]
         self.out_var.set(_label(self.bridge.out_dir(run_id)))
+        text = self.bridge.command_text(run_id) or _DASH
         self.cmd_text.config(state="normal")
         self.cmd_text.delete("1.0", tk.END)
-        self.cmd_text.insert("1.0", self.bridge.command_text(run_id) or _DASH)
+        self.cmd_text.insert("1.0", text)
+        # 随内容长高（C6）。原来恒占 4 行：还没选中 run 的时候那 4 行全是空的，
+        # 而真选中了一条命令又有二十多行、4 行照样不够。上限 8 行是为了不把
+        # Runs 表挤瘦 —— 再长的靠这个框自己的纵向滚动条。
+        want = max(CMD_ROWS_MIN, min(CMD_ROWS_MAX, text.count("\n") + 1))
+        rows = self._cmd_rows_within_budget(want)
+        if int(self.cmd_text.cget("height")) != rows:
+            self.cmd_text.config(height=rows)
         self.cmd_text.config(state="disabled")
         run = self.bridge.run(run_id)
         if self.detail_box is not None and run is not None:
@@ -941,8 +2079,20 @@ class BaseApp:
         """
         running = self.bridge.is_running()
         started = self.bridge.has_started()
+        # A7：一个 run 都没有时按下去会起一个**空批次**（建目录、写 batch.json、
+        # 状态栏报 "0 runs"），而用户按它是因为以为自己配好了。没得跑就不许按。
+        # `run_count()` 会因为设定不合法而抛 —— 那种时候同样不该能提交。
+        off = running or started
+        if not off:
+            # `run_count()` 每次都重算一遍笛卡尔积 —— 已经关掉的时候没必要再问一次。
+            # 设定不合法时 bridge 返回 0（它吞掉 `EwaveBatchError`），那种情况同样
+            # 不该能提交，所以这里不需要区分"没配"和"配错了"。
+            try:
+                off = self.bridge.run_count() == 0
+            except EwaveBatchError:
+                off = True
         for name in ("Dry-run", "Submit"):
-            self.btn[name].state(["disabled"] if (running or started) else ["!disabled"])
+            self.btn[name].state(["disabled"] if off else ["!disabled"])
         self.btn["Cancel"].state(["!disabled"] if running else ["disabled"])
         self.btn["Resume"].state(["!disabled"] if (started and not running) else ["disabled"])
 
@@ -1027,6 +2177,96 @@ class BaseApp:
         self.recompute()
 
     # ----------------------------------------------------------- 菜单动作
+    def _ask_text(self, title: str, label: str, initial: str, hint: str = "") -> str | None:
+        """一个输入框的模态小对话框。取消 / 空输入 -> None。
+
+        `EWB_SMOKE=1` 时直接返回 None：冒烟要建完整棵控件树就退，
+        而 `wait_window()` 会在那儿一直等下去。
+        """
+        if smoke_enabled():
+            return None
+        dlg = tk.Toplevel(self.top)
+        dlg.title(title)
+        dlg.transient(self.top)
+        dlg.columnconfigure(1, weight=1)
+        var = tk.StringVar(value=initial)
+        ttk.Label(dlg, text=label).grid(row=0, column=0, sticky=tk.W, padx=8, pady=6)
+        entry = ttk.Entry(dlg, textvariable=var, width=32, font=self.f_mono)
+        entry.grid(row=0, column=1, sticky="ew", padx=8, pady=6)
+        if hint:
+            ttk.Label(dlg, text=hint, style="Hint.TLabel", wraplength=340, justify=tk.LEFT).grid(
+                row=1, column=0, columnspan=2, sticky=tk.W, padx=8
+            )
+        answer: dict[str, str | None] = {"value": None}
+
+        def ok(_event: object = None) -> None:
+            answer["value"] = var.get().strip() or None
+            dlg.destroy()
+
+        def cancel(_event: object = None) -> None:
+            dlg.destroy()
+
+        bar = ttk.Frame(dlg)
+        bar.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
+        ttk.Button(bar, text="Cancel", width=9, command=cancel).pack(side=tk.RIGHT)
+        ttk.Button(bar, text="OK", width=9, command=ok).pack(side=tk.RIGHT, padx=(0, 6))
+        dlg.bind("<Return>", ok)
+        dlg.bind("<Escape>", cancel)
+        entry.focus_set()
+        entry.selection_range(0, tk.END)
+        _center_on_parent(dlg, self.top)
+        dlg.grab_set()
+        self.top.wait_window(dlg)  # type: ignore[attr-defined]
+        return answer["value"]
+
+    def do_rename_batch(self) -> None:
+        """改批次名。**跑过之后不许改** —— 名字就是目录名。
+
+        改一个已经落过盘的批次的名字，等于让界面指向一个空目录，而磁盘上那批产物
+        还在老名字底下、resume 也跟着找不着。要另起一个名字走 Duplicate batch。
+        """
+        if self.bridge.has_started():
+            _error(
+                "Cannot rename this batch",
+                "This batch has already been submitted, and its name is its directory "
+                "name on disk.\nUse Batch -> Duplicate batch... to start a new one, or "
+                "File -> New batch.",
+            )
+            return
+        name = self._ask_text(
+            "Rename batch",
+            "Batch name",
+            self.batch.get(),
+            "This is the directory name under the batch root. Leave it empty to let the "
+            "tool pick a UTC timestamp.",
+        )
+        if name is None:
+            return
+        self.batch.set(name)
+        self.recompute()
+
+    def do_duplicate_batch(self) -> None:
+        """同样的设定、新的名字、新的目录，**结果不带过去**。
+
+        与 `New batch` 的区别只有一个：那个保留名字（于是接着往同一个目录里写），
+        这个换一个名字。想拿一批跑完的设定再跑一遍（换个 corner、改个 mesh）时，
+        它是唯一不会覆盖上一批产物的路。
+        """
+        suggested = (self.batch.get().strip() or "batch") + "-copy"
+        name = self._ask_text(
+            "Duplicate batch",
+            "New batch name",
+            suggested,
+            "Every setting on this window is kept; the results of the current batch are "
+            "not carried over.",
+        )
+        if name is None:
+            return
+        self.bridge.reset()
+        self._stop_timer()
+        self.batch.set(name)
+        self.recompute()
+
     def do_open_spec(self) -> None:
         path = filedialog.askopenfilename(
             title="Open batch spec",
@@ -1043,36 +2283,59 @@ class BaseApp:
         self.refresh_designs()
         self.recompute()
 
+    def _apply_axis_selection(
+        self, selection: dict, only: Sequence[str] | None = None
+    ) -> None:
+        """轴的取值 → 界面变量。`only` 限定只灌 `GROUP_ROW_AXES` 的哪几行。
+
+        `only` 存在的理由是"继承"：编辑一个组时，没被覆盖的那几行要一直显示 base 的值，
+        而被覆盖的那几行**不能**被重灌（用户正在里面打字）。整份重灌是 load_spec /
+        切组时才做的事（那时候界面上的值本来就该整个换掉）。
+        """
+
+        def want(key: str) -> bool:
+            return only is None or key in only
+
+        if want("corner"):
+            for name, var in self.corner_vars.items():
+                var.set(name in selection.get("corner", ()))
+        if want("temperature"):
+            self.temp.set(", ".join(selection.get("temperature", ())))
+        if want("fullWave"):
+            modes = selection.get("fullWave", ())
+            self.mode_vars["Quasi-static"].set("off" in modes)
+            self.mode_vars["Full wave"].set("on" in modes)
+        if want("mesh"):
+            mesh = (selection.get("mesh") or ("0.4",))[0].split(gui_state.MESH_SEP)
+            if len(mesh) == 1:
+                mesh = mesh * 3
+            self.m_edge.set(mesh[0])
+            self.m_vert.set(mesh[1])
+            self.m_via.set(mesh[2])
+        if want("advanced"):
+            eq = selection.get("equalCurrent", ())
+            self.eq_on.set("on" in eq)
+            self.eq_off.set("off" in eq)
+            self.tol_r.set((selection.get("relativeTolerance") or ("",))[0])
+            self.tol_c.set((selection.get("relativeCurrentTolerance") or ("",))[0])
+
     def _init_vars_from_bridge(self) -> None:
         """load_spec 之后把界面变量重新灌一遍（界面要显示文件里的东西）。"""
-        selection = self.bridge.axis_selection()
         sweep = self.bridge.sweep()
-        for name, var in self.corner_vars.items():
-            var.set(name in selection.get("corner", ()))
-        modes = selection.get("fullWave", ())
-        self.mode_vars["Quasi-static"].set("off" in modes)
-        self.mode_vars["Full wave"].set("on" in modes)
-        self.temp.set(", ".join(selection.get("temperature", ())))
+        self._apply_axis_selection(self.bridge.axis_selection())
         self.sw_mode.set(sweep.get("mode", "adaptive"))
         self.f_start.set(sweep.get("start", ""))
         self.f_stop.set(sweep.get("stop", ""))
         self.f_step.set(sweep.get("step", ""))
         self.f_pts.set(sweep.get("points", ""))
-        mesh = (selection.get("mesh") or ("0.4",))[0].split(gui_state.MESH_SEP)
-        if len(mesh) == 1:
-            mesh = mesh * 3
-        self.m_edge.set(mesh[0])
-        self.m_vert.set(mesh[1])
-        self.m_via.set(mesh[2])
-        eq = selection.get("equalCurrent", ())
-        self.eq_on.set("on" in eq)
-        self.eq_off.set("off" in eq)
-        self.tol_r.set((selection.get("relativeTolerance") or ("",))[0])
-        self.tol_c.set((selection.get("relativeCurrentTolerance") or ("",))[0])
         self.extra.set(self.bridge.extra_flags_text())
         self.batch.set(self.bridge.batch_name)
         self.offdir.set(self.bridge.official_run_dir)
         self.dsub.set(self.bridge.submit_command)
+        # spec 文件里的组也要显示出来 —— 组表不刷新的话，读进来的组只在核心里存在，
+        # 而界面上看起来这份 spec 一个组都没有（然后用户按 New batch 把它们丢了）。
+        self._sync_override_vars()
+        self.refresh_groups()
 
     def do_save_spec(self) -> None:
         """把界面上当前的设定写成一份 spec 文件 —— 这就是本工具的「工程文件」。
@@ -1106,8 +2369,20 @@ class BaseApp:
             self.offdir.set(path)
             self.recompute()
 
+    def _reveal(self, what: str, path: str) -> str:
+        """真去开一个文件管理器；开不了才退回那个只写着路径的对话框。
+
+        原来这两个按钮**只**弹一个写着路径的 messagebox —— 那不是"打开目录"，
+        那是"把路径念给你听"。红区是 Linux，所以 `xdg-open` 那条路必须有，
+        只做 Windows 的 `os.startfile` 等于这个按钮在唯一要用它的机器上是死的。
+        """
+        problem = _open_in_file_manager(path)
+        if problem:
+            _info(what, "%s\n\n(could not open a file manager: %s)" % (path or _DASH, problem))
+        return problem
+
     def do_open_batch_dir(self) -> None:
-        _info("Batch dir", self.bridge.batch_dir())
+        self._reveal("Batch dir", self.bridge.batch_dir())
 
     def do_exit(self) -> None:
         self._stop_timer()
@@ -1130,12 +2405,31 @@ class BaseApp:
                 pass
             return
         if action == "Open output dir":
-            _info("Output dir", self.bridge.out_dir(run_id) or _DASH)
+            self._reveal("Output dir", self.bridge.out_dir(run_id))
             return
-        _todo("%s (%s)" % (action, run_id))
+
+    DEFAULTS_COLS: tuple[tuple[str, str, int], ...] = (
+        ("flag", "Flag", 200),
+        ("value", "Value", 110),
+        ("src", "Where the default came from", 330),
+    )
+    """`Extraction defaults` 那张表的三列。第三个数是下限，真宽度按内容现算。"""
+
+    DEFAULTS_ROWS_MAX = 16
+    """表最多显示几行 —— 再多靠纵向滚动条。默认表会随 PDK 长，不封顶就会长出屏幕。"""
 
     def show_defaults(self) -> None:
-        """第 2 层：有默认值、不上主界面的 flag。一个对话框，主界面零成本（§11）。"""
+        """第 2 层：有默认值、不上主界面的 flag。一个对话框，主界面零成本（§11）。
+
+        2026-08-19 之前这个框**自称可编辑其实只读**：正文写着 "Editing here applies
+        to the whole batch"，而 `bridge.set_default_override()` 在整个 `gui/` 里一次
+        都没被调用过。现在双击 Value 单元格就地改，清空 = 撤销这一条覆盖
+        （bridge 那边本来就是这么定义的）。
+
+        另外三样也在这一趟里：三列全按内容算宽（原来 `--relativeCurrentToler`、
+        `(explicitly`、`builtin fallback (no official run di` 全被切掉，而且没有滚动条
+        够不着）、补纵横两条滚动条、居中于父窗口（原来直接落到屏幕左边界外，B5）。
+        """
         dlg = tk.Toplevel(self.top)
         dlg.title("Extraction defaults")
         dlg.transient(self.top)
@@ -1148,29 +2442,90 @@ class BaseApp:
                 "These flags have defaults and do not take up room on the main window.\n"
                 "The values are NOT hard-coded: they are learned from the official run\n"
                 "dir the first time a batch is planned, so they follow the PDK version.\n"
-                "Editing here applies to the whole batch; to change a single run use\n"
-                "Extra ewave flags under Advanced."
+                "Double-click a Value to change it for the whole batch; clear it to drop\n"
+                "the override and go back to the learned value. To change a single run\n"
+                "use Extra ewave flags under Advanced."
             ),
         ).pack(anchor=tk.W)
 
-        rows = self.bridge.defaults_table()
+        wrap = ttk.Frame(dlg)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=8)
+        columns = tuple(col[0] for col in self.DEFAULTS_COLS)
         tree = ttk.Treeview(
-            dlg,
-            columns=("flag", "value", "src"),
+            wrap,
+            columns=columns,
             show="headings",
-            height=max(len(rows) + 1, 6),
+            height=min(max(len(self.bridge.defaults_table()) + 1, 6), self.DEFAULTS_ROWS_MAX),
             style="Designs.Treeview",
+            selectmode="browse",
         )
-        for key, head, width in (
-            ("flag", "Flag", 200),
-            ("value", "Value", 110),
-            ("src", "Where the default came from", 330),
-        ):
+        for key, head, width in self.DEFAULTS_COLS:
             tree.heading(key, text=head)
-            tree.column(key, width=width, anchor=tk.W)
-        for row in rows:
-            tree.insert("", tk.END, values=row)
-        tree.pack(fill=tk.BOTH, expand=True, padx=8)
+            tree.column(key, width=width, anchor=tk.W, stretch=(key == "src"))
+        _scrolled_tree_grid(wrap, tree)
+
+        def reload_rows() -> None:
+            """重画整张表。改一格会同时改掉那一行的第三列（"哪来的"），所以整行重画。"""
+            keep = tree.selection()
+            tree.delete(*tree.get_children())
+            for row in self.bridge.defaults_table():
+                tree.insert("", tk.END, iid=row[0], values=row)
+            for iid in keep:
+                if tree.exists(iid):
+                    tree.selection_set(iid)
+            _fit_tree_columns(
+                tree,
+                columns,
+                head_font=self.f_ui_b,
+                cell_font=self.f_mono,
+                floors={key: width for key, _head, width in self.DEFAULTS_COLS},
+            )
+
+        def start_edit(event: object) -> None:
+            """双击 Value 那一列 -> 把一个 Entry 盖在那个单元格上就地编辑。
+
+            只认 `#2`（Value）。flag 名不许改 —— 改了就不是"覆盖这个默认值"而是
+            "凭空多一个 flag"，那条路是主界面上的 Extra ewave flags，有冲突检查。
+            """
+            iid = tree.identify_row(event.y)  # type: ignore[attr-defined]
+            column = tree.identify_column(event.x)  # type: ignore[attr-defined]
+            if not iid or column != "#2":
+                return
+            cell = tree.bbox(iid, column)
+            if not cell:  # 行被滚出了可视区
+                return
+            x, y, width, height = cell
+            var = tk.StringVar(value=tree.set(iid, "value"))
+            editor = ttk.Entry(tree, textvariable=var, font=self.f_mono)
+            editor.place(x=x, y=y, width=width, height=height)
+            editor.focus_set()
+            editor.selection_range(0, tk.END)
+            done = {"yes": False}
+
+            def finish(commit: bool) -> None:
+                # <FocusOut> 和 <Return> 会一前一后都到，Escape 之后 <FocusOut> 也会到。
+                # 没有这个闩就是往一个已经 destroy 掉的控件上再写一次（TclError）。
+                if done["yes"]:
+                    return
+                done["yes"] = True
+                value = var.get()
+                editor.destroy()
+                if not commit:
+                    return
+                try:
+                    self.bridge.set_default_override(tree.set(iid, "flag"), value)
+                except EwaveBatchError as exc:
+                    _error("Cannot change this default", str(exc))
+                    return
+                reload_rows()
+                self.recompute()
+
+            editor.bind("<Return>", lambda _e: finish(True))
+            editor.bind("<FocusOut>", lambda _e: finish(True))
+            editor.bind("<Escape>", lambda _e: finish(False))
+
+        tree.bind("<Double-1>", start_edit)
+        reload_rows()
 
         ttk.Label(
             dlg,
@@ -1189,9 +2544,10 @@ class BaseApp:
         ttk.Button(
             bar,
             text="Reset to learned values",
-            command=lambda: (self.bridge.reset_defaults(), dlg.destroy(), self.recompute()),
+            command=lambda: (self.bridge.reset_defaults(), reload_rows(), self.recompute()),
         ).pack(side=tk.LEFT)
         ttk.Button(bar, text="Close", command=dlg.destroy).pack(side=tk.RIGHT)
+        _center_on_parent(dlg, self.top)
         if not smoke_enabled():
             dlg.grab_set()
 
@@ -1215,6 +2571,24 @@ class BaseApp:
 # --------------------------------------------------------------------------
 # 模块级小工具
 # --------------------------------------------------------------------------
+
+
+def _set_enabled(widget: object, on: bool) -> None:
+    """把一棵子树整体置灰/放开（"这一行继承 base" 的可视化）。
+
+    逐个 `configure(state=…)` 而不是 `state([...])`：容器（`ttk.Frame`）和分隔线根本
+    没有这个选项，`TclError` 是**正常路径**而不是异常情况。组合框要单独处理 —— 给它
+    `normal` 会把只读的下拉框变成可自由输入的，那是另一个 bug。
+    """
+    for child in widget.winfo_children():  # type: ignore[attr-defined]
+        try:
+            if isinstance(child, ttk.Combobox):
+                child.configure(state="readonly" if on else "disabled")
+            else:
+                child.configure(state="normal" if on else "disabled")
+        except tk.TclError:
+            pass
+        _set_enabled(child, on)
 
 
 def _mode_text(run: Run) -> str:
@@ -1246,8 +2620,20 @@ def _error(title: str, message: str) -> None:
     messagebox.showerror(title, message)
 
 
-def _todo(what: str) -> None:
-    _info("Not wired yet", "This will: %s" % what)
+def _add_menu_item(menu: object, label: str, command: object) -> None:
+    """加一条菜单项。**没有 handler 就置灰并写明白**（E1/E2）。
+
+    在这之前，接不上的那六项（Duplicate batch / Rename / Re-run failed only /
+    Check environment / Re-run this one / Set as current）点下去会弹一个写着
+    "Not wired yet - this will: ..." 的对话框。一个能按的菜单项就是一句"这件事我
+    能做"的承诺，而它做不到 —— 用户得按一次才知道，而且下次还会再按一次。
+    """
+    if command is None or label in DISABLED_MENU_ITEMS:
+        menu.add_command(  # type: ignore[attr-defined]
+            label=label + NOT_IMPLEMENTED_SUFFIX, state=tk.DISABLED
+        )
+        return
+    menu.add_command(label=label, command=command)  # type: ignore[attr-defined]
 
 
 def build(app_cls: type, parent: object, bridge: object) -> object:

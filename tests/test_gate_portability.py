@@ -87,6 +87,85 @@ class AsciiLocale(unittest.TestCase):
         self.assertNotIn("UnicodeEncodeError", out)
 
 
+class ExampleSpecOneLiner(unittest.TestCase):
+    """文档里那条「把示例 spec 倒出来」的命令必须在 LANG=C 下也能用。
+
+    出处：2026-08-19 复核实测。当时六份文档 + 两处源码里逐字相同的那条是
+    ``python -c "... print(EXAMPLE_SPEC)"``，而 ``EXAMPLE_SPEC`` 整块是中文注释、
+    这条裸 ``python -c`` **不经过** ``ascii_safe_stdio`` ⇒ 红区 LANG=C 下
+    ``UnicodeEncodeError`` 退 1，重定向留下一个 **0 字节**的 spec 文件，
+    接着 ``dry-run`` 报「file is empty」。取模板是新用户的第一步，第一步就废了。
+
+    闸门第 4 步只覆盖 ``python -m ewave_batch dry-run --self-test``（那条进了防护所以绿），
+    这条路径原本无人守。修法是写 bytes 而不是 ``print``。
+    """
+
+    #: 与 docs/{HANDOFF,REDZONE_DRYRUN,REDZONE_FIRST_RUN}.md、core/spec.py、cli.py、
+    #: redzone_dryrun.py、scripts/redzone_bundle.sh 里那条**逐字相同**。
+    #: 改这里就要一起改那六处（下面 test_the_docs_quote_this_exact_command 盯着）。
+    ONE_LINER = (
+        "import sys; from ewave_batch.core.spec import EXAMPLE_SPEC; "
+        "sys.stdout.buffer.write(EXAMPLE_SPEC.encode('utf-8'))"
+    )
+
+    def test_writes_the_whole_template_under_ascii_stdout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "my_spec.yaml"
+            full_env = dict(os.environ)
+            full_env["PYTHONIOENCODING"] = "ascii"
+            with open(target, "wb") as fh:
+                proc = subprocess.run(
+                    [sys.executable, "-c", self.ONE_LINER],
+                    cwd=str(REPO),
+                    env=full_env,
+                    stdout=fh,
+                    stderr=subprocess.PIPE,
+                    timeout=180,
+                )
+            err = proc.stderr.decode("utf-8", "replace")
+            self.assertEqual(proc.returncode, 0, "LANG=C 下取模板崩了：\n" + err)
+            self.assertNotIn("UnicodeEncodeError", err)
+            written = target.read_bytes()
+            self.assertTrue(written, "spec 文件是 0 字节 —— 正是那个坑的样子")
+            from ewave_batch.core.spec import EXAMPLE_SPEC
+
+            self.assertEqual(written.decode("utf-8"), EXAMPLE_SPEC)
+
+    def test_the_old_print_form_still_dies_negative(self):
+        """反向：换回 ``print(EXAMPLE_SPEC)`` 必须在同样的环境下崩。
+
+        这条红了才说明上面那条测的是真东西，而不是这台机器的 locale 本来就宽容。
+        """
+        rc, out = _run(
+            [
+                sys.executable,
+                "-c",
+                "from ewave_batch.core.spec import EXAMPLE_SPEC; print(EXAMPLE_SPEC)",
+            ],
+            env={"PYTHONIOENCODING": "ascii"},
+        )
+        self.assertNotEqual(rc, 0, "print 形式竟然活下来了 —— 探针失效：\n" + out)
+        self.assertIn("UnicodeEncodeError", out)
+
+    def test_the_docs_quote_this_exact_command(self):
+        """文档里给的命令必须就是上面验过的那条 —— 验一条、文档里写另一条毫无意义。"""
+        quoted = [
+            "docs/HANDOFF.md",
+            "docs/REDZONE_DRYRUN.md",
+            "docs/REDZONE_FIRST_RUN.md",
+            "ewave_batch/cli.py",
+            "ewave_batch/core/spec.py",
+            "ewave_batch/redzone_dryrun.py",
+            "scripts/redzone_bundle.sh",
+        ]
+        for rel in quoted:
+            text = (REPO / rel).read_text(encoding="utf-8")
+            self.assertIn(self.ONE_LINER, text, "%s 里的取模板命令和验过的那条不一样" % rel)
+            self.assertNotIn(
+                "print(EXAMPLE_SPEC)", text, "%s 还留着会在 LANG=C 下崩的 print 形式" % rel
+            )
+
+
 class RedzoneScanFileSet(unittest.TestCase):
     """redzone_scan 必须扫到**未跟踪**文件，否则新代码带坐标也拦不住。
 

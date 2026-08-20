@@ -375,7 +375,7 @@ class FlagTables(unittest.TestCase):
     def test_flag_without_dash_is_rejected(self) -> None:
         with self.assertRaises(SpecError) as ctx:
             spec.parse_spec_mapping(self.base(extra_flags={"labelDepth": "0"}), source="t.yaml")
-        self.assertIn("横杠", str(ctx.exception))
+        self.assertIn("dash", str(ctx.exception))
 
 
 class Ports(unittest.TestCase):
@@ -427,7 +427,7 @@ class Ports(unittest.TestCase):
 
 class ErrorMessages(unittest.TestCase):
     def assert_actionable(self, message: str) -> None:
-        self.assertIn("下一步", message, f"报错里必须有「下一步怎么办」:\n{message}")
+        self.assertIn("Next:", message, f"报错里必须有「下一步怎么办」:\n{message}")
 
     def test_missing_designs(self) -> None:
         with self.assertRaises(SpecError) as ctx:
@@ -696,7 +696,7 @@ class LazyYamlImport(unittest.TestCase):
                     spec.load_spec(path)
         message = str(ctx.exception)
         self.assertIn("line 3", message, "解析器给的行号要透出来")
-        self.assertIn("下一步", message)
+        self.assertIn("Next:", message)
 
     def test_json_spec_works_without_pyyaml(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -723,19 +723,19 @@ class LazyYamlImport(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("PyYAML", message)
         self.assertIn("JSON", message, "要告诉用户可以改用 JSON spec")
-        self.assertIn("下一步", message)
+        self.assertIn("Next", message)
 
     def test_missing_file(self) -> None:
         with self.assertRaises(SpecError) as ctx:
             spec.load_spec(os.path.join("no", "such", "spec.yaml"))
-        self.assertIn("不存在", str(ctx.exception))
+        self.assertIn("not found", str(ctx.exception))
 
     def test_bad_json_reports_the_line(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write(tmp, "s.json", '{\n  "designs": [},\n}\n')
             with self.assertRaises(SpecError) as ctx:
                 spec.load_spec(path)
-        self.assertIn("行", str(ctx.exception))
+        self.assertIn("line", str(ctx.exception))
 
     def test_top_level_list_is_treated_as_designs(self) -> None:
         """抄 tasks.yaml 的手感：顶层直接写一个 design 列表也认。"""
@@ -744,6 +744,181 @@ class LazyYamlImport(unittest.TestCase):
             path = self.write(tmp, "s.json", json.dumps(payload))
             parsed = spec.load_spec(path)
         self.assertEqual(len(parsed.designs), 1)
+
+
+# ==========================================================================
+# groups —— base 之上的 run group（用户 2026-08-19 拍板）
+# ==========================================================================
+
+
+class Groups(unittest.TestCase):
+    def base(self, **extra):
+        data = {
+            "designs": [{"library": "MY_LIB", "cell": "CELL_A", "view": "layout"}],
+            "axes": {
+                "corner": ["typical"],
+                "temperature": ["-40.0", "55.0", "125.0"],
+                "fullWave": ["off"],
+                "equalCurrent": ["on"],
+            },
+        }
+        data.update(extra)
+        return data
+
+    PROTOTYPE = [
+        {"name": "eqcur-off", "axes": {"temperature": ["55.0"], "equalCurrent": ["off"]}},
+        {"name": "fullwave", "axes": {"temperature": ["55.0"], "fullWave": ["on"]}},
+    ]
+
+    def test_prototype_gives_five_runs(self) -> None:
+        """契约里那个原型：3 + 1 + 1 = 5。笛卡尔积最接近的写法是 12 个，7 个是废的。"""
+        parsed = spec.parse_spec_mapping(self.base(groups=self.PROTOTYPE), source="t.yaml")
+        self.assertEqual([g.name for g in parsed.groups], ["eqcur-off", "fullwave"])
+        runs = matrix.expand_runs(
+            parsed.designs, parsed.axes, options=parsed.options, groups=parsed.groups
+        )
+        self.assertEqual(len(runs), 5)
+        self.assertEqual(
+            [r.axes_slug for r in runs],
+            [
+                "fw-off__eqI-on",
+                "fw-off__eqI-on",
+                "fw-off__eqI-on",
+                "fw-off__eqI-off",
+                "fw-on__eqI-on",
+            ],
+            "加了组之后 fullWave/equalCurrent 全批次在变 ⇒ 它们对所有 run 进 slug",
+        )
+
+    def test_no_groups_key_keeps_the_old_behaviour(self) -> None:
+        """反向：不写 groups: ⇒ 只有 base ⇒ 两根单取值的轴不进 slug。"""
+        parsed = spec.parse_spec_mapping(self.base(), source="t.yaml")
+        self.assertEqual(parsed.groups, [])
+        runs = matrix.expand_runs(parsed.designs, parsed.axes, groups=parsed.groups)
+        self.assertEqual(len(runs), 3)
+        self.assertEqual({r.axes_slug for r in runs}, {"base"})
+
+    def test_spec_to_batch_carries_groups_into_the_state(self) -> None:
+        parsed = spec.parse_spec_mapping(self.base(groups=self.PROTOTYPE), source="t.yaml")
+        state = spec.spec_to_batch(parsed, batch_root="/tmp/ewb")
+        self.assertEqual([g.name for g in state.groups], ["eqcur-off", "fullwave"])
+        self.assertEqual(len(state.runs), 5)
+        self.assertEqual(
+            sorted({r.group for r in state.runs}), ["base", "eqcur-off", "fullwave"]
+        )
+
+    def test_group_named_base_is_merged_into_the_top_level_axes(self) -> None:
+        """`name: base` 指的就是顶层 axes:，合并进去而不是新建一个组。"""
+        data = self.base(groups=[{"name": "base", "axes": {"temperature": ["55.0"]}}])
+        parsed = spec.parse_spec_mapping(data, source="t.yaml")
+        self.assertEqual(parsed.groups, [], "base 不该变成一个独立的组")
+        temperature = [a for a in parsed.axes if a.name == "temperature"][0]
+        self.assertEqual([v.value for v in temperature.values], ["55.0"])
+
+    def test_group_overriding_an_undefined_axis(self) -> None:
+        data = self.base(groups=[{"name": "oops", "axes": {"conrer": ["cbest"]}}])
+        with self.assertRaises(SpecError) as ctx:
+            spec.parse_spec_mapping(data, source="t.yaml")
+        message = str(ctx.exception)
+        self.assertIn("conrer", message)
+        self.assertIn("oops", message)
+        self.assertIn("Next:", message)
+
+    def test_group_without_a_name(self) -> None:
+        data = self.base(groups=[{"axes": {"temperature": ["55.0"]}}])
+        with self.assertRaises(SpecError):
+            spec.parse_spec_mapping(data, source="t.yaml")
+
+    def test_group_that_overrides_nothing_is_rejected(self) -> None:
+        """空 delta 的组展开出来和 base 一模一样，会被去重整组吃掉 —— 看着像"没生效"。"""
+        data = self.base(groups=[{"name": "empty"}])
+        with self.assertRaises(SpecError) as ctx:
+            spec.parse_spec_mapping(data, source="t.yaml")
+        self.assertIn("Next:", str(ctx.exception))
+
+    def test_duplicate_group_names(self) -> None:
+        data = self.base(
+            groups=[
+                {"name": "same", "axes": {"temperature": ["55.0"]}},
+                {"name": "same", "axes": {"temperature": ["125.0"]}},
+            ]
+        )
+        with self.assertRaises(SpecError):
+            spec.parse_spec_mapping(data, source="t.yaml")
+
+    def test_groups_must_be_a_list(self) -> None:
+        data = self.base(groups={"eqcur-off": {"equalCurrent": ["off"]}})
+        with self.assertRaises(SpecError) as ctx:
+            spec.parse_spec_mapping(data, source="t.yaml")
+        self.assertIn("list", str(ctx.exception))
+
+    def test_round_trip_through_a_real_file(self) -> None:
+        """★ 手写文件 -> `load_spec` -> `save_spec` -> `load_spec`：组一个字不变。
+
+        `tests/test_spec_dump.py` 那条往返的起点是**代码里造的** `BatchSpec`，
+        走的只有「序列化 <-> 反序列化」这一段。这条的起点是**磁盘上一份人写的 spec**，
+        补上的正是"用户手写的 `groups:` 段读得进来吗"那一截 —— GUI 的
+        「Open spec…」+「Save spec as…」连起来就是这条路，中间掉一节就是
+        "用户配了、存了、下次打开没了"，而且无声。
+
+        文件后缀故意用 `.json`：本机没有 PyYAML，`.json` 那条路在**哪台机器上都一样**
+        （`load_spec` 对 `.yaml` 的 PyYAML 缺失有专门的报错，那是另一条测试的事）。
+        """
+        payload = {
+            "designs": [{"library": "MY_LIB", "cell": "CELL_A", "view": "layout"}],
+            "axes": {
+                "corner": ["typical"],
+                "temperature": ["-40.0", "55.0", "125.0"],
+                "fullWave": ["off"],
+                "equalCurrent": ["on"],
+            },
+            "groups": [
+                {
+                    "name": "eqcur-off",
+                    "axes": {"temperature": ["55.0"], "equalCurrent": ["off"]},
+                    "label": "one-off: equalCurrent off at 55C",
+                },
+                {"name": "fullwave", "axes": {"temperature": ["55.0"], "fullWave": ["on"]}},
+            ],
+        }
+        expected = [
+            # 手写字面量，不从 payload 现算 —— 现算的话"解析时把 axes 段丢了"照样绿。
+            ("eqcur-off", "one-off: equalCurrent off at 55C",
+             {"temperature": ("55.0",), "equalCurrent": ("off",)}),
+            ("fullwave", "", {"temperature": ("55.0",), "fullWave": ("on",)}),
+        ]
+
+        def shape(parsed):
+            return [
+                (g.name, g.label, {k: tuple(v) for k, v in g.axis_overrides.items()})
+                for g in parsed.groups
+            ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first_path = os.path.join(tmp, "hand_written.json")
+            with io.open(first_path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(payload, indent=2) + "\n")
+
+            first = spec.load_spec(first_path)
+            self.assertEqual(shape(first), expected, "人写的 groups: 段没被原样读进来")
+
+            saved = spec.save_spec(first, os.path.join(tmp, "saved.json"))
+            second = spec.load_spec(saved)
+
+        self.assertEqual(shape(second), shape(first), "存一遍再读回来，组变了")
+        self.assertEqual(shape(second), expected)
+        # 计数断言：2 个组 x 3 个字段 = 6 个值真的被比过（空列表的 diff 永远好看）。
+        self.assertEqual(sum(1 + 1 + len(o) for _n, _l, o in shape(second)), 8)
+        # 组还得真的展开成 5 个 run —— 往返之后"组还在但覆盖空了"同样是坏的。
+        self.assertEqual(
+            len(matrix.expand_runs(second.designs, second.axes, groups=second.groups)), 5
+        )
+
+    def test_unknown_key_inside_a_group(self) -> None:
+        data = self.base(groups=[{"name": "x", "axess": {"temperature": ["55.0"]}}])
+        with self.assertRaises(SpecError) as ctx:
+            spec.parse_spec_mapping(data, source="t.yaml")
+        self.assertIn("axess", str(ctx.exception))
 
 
 # ==========================================================================

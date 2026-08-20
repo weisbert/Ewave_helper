@@ -349,7 +349,7 @@ class ParseEwaveLogTests(unittest.TestCase):
         facts = logparse.parse_ewave_log(mutated)
         self.assertEqual(facts.port_count, 6)  # 显式那个数说了算
         self.assertEqual(len(facts.warnings), 1)
-        self.assertIn("自相矛盾", facts.warnings[0])
+        self.assertIn("contradicts itself", facts.warnings[0])
 
     def test_wall_seconds(self) -> None:
         # 期望值 111.0 = fixture 里 `Wall Clock Time: 111 s`（真实值另有其数，故意不用）。
@@ -669,7 +669,7 @@ class FilterRegressionTests(unittest.TestCase):
         facts = logparse.parse_ewave_log(text)
         self.assertEqual(facts.freq_points_calculated, 9)
         self.assertEqual(len(facts.warnings), 1)
-        self.assertIn("真算过的频点数", facts.warnings[0])
+        self.assertIn("frequency points actually solved", facts.warnings[0])
 
     def test_repeated_identical_values_do_not_warn_negative(self) -> None:
         """反向：值相同就不该报 —— 否则上一条只是"重复即告警"，没检查值。"""
@@ -823,14 +823,14 @@ class ParseRunLogsTests(unittest.TestCase):
         facts = logparse.parse_run_logs(os.path.join(self.root, "nope"))
         self.assertEqual(_populated(facts), {"warnings"})
         self.assertEqual(len(facts.warnings), 1)
-        self.assertIn("不存在", facts.warnings[0])
+        self.assertIn("does not exist", facts.warnings[0])
 
     def test_empty_directory_warns_instead_of_raising(self) -> None:
         empty = os.path.join(self.root, "empty")
         os.makedirs(empty)
         facts = logparse.parse_run_logs(empty)
         self.assertEqual(_populated(facts), {"warnings"})
-        self.assertIn("没有任何 eWave 日志", facts.warnings[0])
+        self.assertIn("no eWave log at all", facts.warnings[0])
 
     def test_unrelated_logs_are_not_picked_up(self) -> None:
         """`gds_out.log`（阶段 1 的）/ `ewaveOnVir.log`（官方 GUI 的）不该被算进这个 run。"""

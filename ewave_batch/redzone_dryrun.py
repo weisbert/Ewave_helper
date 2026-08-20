@@ -88,6 +88,7 @@ from .model import (
     PlanContext,
     PortDiff,
     Run,
+    RunGroup,
     RunPaths,
     SiteFacts,
 )
@@ -681,16 +682,26 @@ def build_report(
     options = BatchOptions(dry_run=True)
     designs: list[Design] = []
     axes: tuple[Axis, ...] = ()
+    groups: tuple[RunGroup, ...] = ()
 
     if spec_path:
         spec = spec_module.load_spec(spec_path)
         designs = list(spec.designs)
         axes = tuple(spec.axes)
+        groups = tuple(spec.groups)
         extra_flags = dict(spec.extra_flags)
         spec_defaults = dict(spec.defaults)
         options = replace(spec.options, dry_run=True)
         # spec 的 defaults 是**覆盖**（§11 规则 1：留空就全从官方目录学）。
         defaults.update(spec_defaults)
+        if groups:
+            names = ", ".join(group.name for group in groups)
+            notes.append(
+                f"spec 里有 {len(groups)} 个 run group（{names}）+ base。"
+                "组的取值算在「全批次在变的轴」里 ⇒ **基线自己的目录名也会跟着变**"
+                "（`base/...` 变成 `eqI-on/...` 之类）。下面每条 run 的 --workDir "
+                "就是真跑会落的那个，逐字比对。"
+            )
     else:
         designs = [official_design(facts)]
         axes = official_axes(facts)
@@ -707,7 +718,17 @@ def build_report(
     stage_one: list[StageOnePlan] = []
     stage_two: list[StageTwoPlan] = []
 
-    runs = matrix.expand_runs(designs, axes, options=options)
+    # groups 必须传进去。这趟 dry-run 是红区**唯一**能在真提交之前核对落点的手段
+    # （硬约束 3：本机没有 ewave/dsub），漏掉组的后果不是"少打印几行"：
+    # `<axes-slug>` 的口径是全批次的 ⇒ 组的取值会改掉**基线自己**的目录名，
+    # 于是预检打印的是 `base/...`、真跑落的是 `eqI-on/...` 外加一整组从没露过面的 run。
+    # 2026-08-19 复核实测到这条。
+    runs = matrix.expand_runs(designs, axes, options=options, groups=groups)
+    # `PlanContext.axes` 要的是**全批次并集**（`core.spec.spec_to_batch` 存进
+    # `BatchState.axes` 的也是这一份）：`cmd.build_flag_layers` 拿 run 的取值去轴的
+    # 取值表里查 flag，只给 base 那份的话，组独有的取值一个都查不到。
+    # 展开用的是 base 轴 + groups（上一行），两者不能混。
+    plan_axes = tuple(matrix._batch_axes(axes, designs, groups))
     by_key = {matrix.design_key(design): design for design in designs}
 
     for design in designs:
@@ -734,7 +755,7 @@ def build_report(
         ctx = plan_context(
             design,
             design_facts,
-            axes,
+            plan_axes,
             defaults=design_defaults,
             extra_flags=extra_flags,
             options=options,
@@ -1003,7 +1024,7 @@ def _conclusion_lines(report: DryRunReport) -> list[str]:
             lines.append(f"     ⚠ 但有 {len(comparison.warnings)} 条警告（在上面 [4/5]），值得看一眼。")
         lines.append("  下一步：")
         lines.append("    1) 把这个 OFFDIR 写进 spec 的 designs[].official_run_dir；")
-        lines.append("       样例：python -c \"from ewave_batch.core.spec import EXAMPLE_SPEC; print(EXAMPLE_SPEC)\" > my_spec.yaml")
+        lines.append("       样例：python -c \"import sys; from ewave_batch.core.spec import EXAMPLE_SPEC; sys.stdout.buffer.write(EXAMPLE_SPEC.encode('utf-8'))\" > my_spec.yaml")
         lines.append("    2) 带 --spec my_spec.yaml 再跑一次，确认整个矩阵的落地目录互不覆盖；")
         lines.append("    3) 把这份输出整段贴回给开发（里面有站点坐标 ⇒ **只在公司内部流转**）。")
         lines.append("    真跑不走这个命令 —— 本命令永远不提交任何 job。")

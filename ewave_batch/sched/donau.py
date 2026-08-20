@@ -301,8 +301,8 @@ def build_dsub_argv(
     """
     if not plan.argv:
         raise SchedulerError(
-            "CommandPlan.argv 是空的 —— 没有要提交的命令。"
-            "先用 tools.ewave.build_ewave_plan / tools.strmout.build_strmout_plan 拼出 plan"
+            "CommandPlan.argv is empty - there is no command to submit.\n"
+            "  Next: build the plan with tools.ewave.build_ewave_plan / tools.strmout.build_strmout_plan"
         )
     argv: list[str] = [DSUB]
     if account:
@@ -327,21 +327,21 @@ def build_djob_argv(job_ids: Sequence[str]) -> list[str]:
     """`djob <id> [<id> …]` —— 一次查一批（协议要求：别一个 job 一条命令）。"""
     ids = [str(j) for j in job_ids if str(j).strip()]
     if not ids:
-        raise SchedulerError("build_djob_argv: 一个 job id 都没有 —— 查什么？")
+        raise SchedulerError("build_djob_argv: not a single job id - query what, exactly?")
     return [DJOB, *ids]
 
 
 def build_dkill_argv(job_id: str) -> list[str]:
     """`dkill <id>` —— 取消一个 job。"""
     if not str(job_id).strip():
-        raise SchedulerError("build_dkill_argv: job id 是空的 —— 拒绝发一条没有目标的取消命令")
+        raise SchedulerError("build_dkill_argv: job id is empty - refusing to send a cancel with no target")
     return [DKILL, str(job_id)]
 
 
 def build_dpeek_argv(job_id: str) -> list[str]:
     """`dpeek <id>` —— tail 一个 job 的 stdout（失败时捞现场用）。"""
     if not str(job_id).strip():
-        raise SchedulerError("build_dpeek_argv: job id 是空的")
+        raise SchedulerError("build_dpeek_argv: job id is empty")
     return [DPEEK, str(job_id)]
 
 
@@ -372,29 +372,31 @@ def parse_dsub_prefix(text: str) -> list[str]:
     """
     tokens = shlex.split(text or "")
     if not tokens:
-        raise SchedulerError("dsub 命令是空的")
+        raise SchedulerError("the dsub command is empty")
     head = tokens[0]
     if head != DSUB and not head.endswith("/" + DSUB):
         raise SchedulerError(
-            f"这条命令不是以 {DSUB} 开头（第一个词是 {head!r}）。"
-            f"这里要的是提交前缀本身，形如 `{DSUB} {ACCOUNT_FLAG} <account> "
-            f"{QUEUE_FLAG} <queue> {RESOURCE_FLAG} cpu=…;mem=…`，"
-            "不是整个 remote 提交脚本"
+            f"this command does not start with {DSUB} (the first word is {head!r}). "
+            f"What is wanted here is the submit prefix itself, shaped like `{DSUB} {ACCOUNT_FLAG} <account> "
+            f"{QUEUE_FLAG} <queue> {RESOURCE_FLAG} cpu=...;mem=...`, "
+            "not the whole remote submit script"
         )
     for token in tokens:
         for meta in SHELL_METACHARS:
             if meta in token:
                 raise SchedulerError(
-                    f"命令里有 shell 元字符 {meta!r}（在 {token!r} 里）。"
-                    "本工具直接 exec argv，不经过 shell —— 管道 / 重定向 / 后台符号会被"
-                    "原样当成 dsub 的参数传下去。日志和后台由工具自己管，把它们删掉"
+                    f"the command carries a shell metacharacter {meta!r} (inside {token!r}). "
+                    "This tool execs argv directly, without a shell - pipes / redirections / background "
+                    "symbols would be passed to dsub verbatim as arguments.\n"
+                    "  Next: drop them; logging and backgrounding are handled by the tool itself"
                 )
         if token in BLOCKING_FLAGS:
             raise SchedulerError(
-                f"命令里有阻塞提交 flag {token!r}。官方那条 remote 脚本是人手工跑一个 run，"
-                "阻塞着看输出很合理；但本工具是有界并发 + 轮询，阻塞的提交会让调度循环"
-                "卡在这一次提交上再也回不来（界面从此不动，且看不出原因）。"
-                f"删掉它 —— 提交是异步的，状态由 {DJOB} 轮询"
+                f"the command carries a blocking submit flag {token!r}. The official remote script is a "
+                "human running one run by hand, where blocking on the output makes sense; this tool is "
+                "bounded concurrency plus polling, and a blocking submit makes the scheduling loop hang "
+                "on this one submit forever (the UI freezes, with no visible cause).\n"
+                f"  Next: drop it - submission is asynchronous and the state comes from {DJOB} polling"
             )
     return tokens
 
@@ -484,10 +486,11 @@ def parse_dsub_submit_output(text: str) -> str:
     raw = text or ""
     if not raw.strip():
         raise SchedulerError(
-            "dsub 没有任何输出，抠不出 job id。"
-            "退出码可能是 0（看起来提交成功），但没有 id 就没法轮询 —— "
-            "这个 run 会挂成僵尸，所以这里拒绝继续。"
-            f"确认提交命令带了 {JSON_FLAG}（JSON 回显），或检查 dsub 的输出是不是被谁吃掉了"
+            "dsub printed nothing, so no job id can be extracted. "
+            "The exit code may well be 0 (looking like a successful submit), but without an id there is "
+            "nothing to poll and this run would hang as a zombie, so we refuse to continue.\n"
+            f"  Next: make sure the submit command carries {JSON_FLAG} (JSON echo), "
+            "or check whether something swallowed the dsub output"
         )
 
     from_json = _job_id_from_json(raw)
@@ -503,9 +506,10 @@ def parse_dsub_submit_output(text: str) -> str:
             return match.group(1)
 
     raise SchedulerError(
-        "认不出 dsub 的提交回显，抠不出 job id（**不返回一个假 id** —— "
-        "拿假 id 去轮询会追着一个不存在的作业直到超时，整批次白等）。\n"
-        f"原文：{_trim(raw)}"
+        "cannot recognize the dsub submit echo, so no job id can be extracted (and no fake id is "
+        "returned - polling a fake id would chase a job that does not exist until timeout and waste "
+        "the whole batch).\n"
+        f"  Raw output: {_trim(raw)}"
     )
 
 
@@ -665,7 +669,7 @@ def _trim(text: str, limit: int = RAW_KEEP_CHARS) -> str:
     body = (text or "").strip()
     if len(body) <= limit:
         return body
-    return body[:limit] + f"…（截断，共 {len(body)} 字符）"
+    return body[:limit] + f"... (truncated, {len(body)} chars total)"
 
 
 def _utc_now() -> str:
@@ -798,12 +802,13 @@ class DonauScheduler:
             return argv
         if not (self.account or self.queue or effective):
             raise SchedulerError(
-                "dsub 的 -A / -q / -R 一个都没有 —— 站点坐标没解析到。\n"
-                "  本工具源码里不存任何账号/队列（硬约束 1b），它们只能来自：\n"
-                "    1) core.discover.discover_site_facts(<官方 run 目录>) 解析出的 SiteFacts；\n"
-                "    2) 用户在界面里改过的那条 dsub 命令（submit_prefix）。\n"
-                "  两条路都空着就不提交 —— 提交一条没有账号的作业，要么被拒，"
-                "要么进了一个谁也不知道的默认队列。"
+                "dsub has none of -A / -q / -R - the site coordinates were never resolved.\n"
+                "  This tool stores no account or queue in its source (hard constraint 1b); they can only\n"
+                "  come from one of two places:\n"
+                "    1) the SiteFacts parsed by core.discover.discover_site_facts(<official run dir>);\n"
+                "    2) the dsub command the user edited in the UI (submit_prefix).\n"
+                "  With both empty we do not submit - a job without an account is either rejected or\n"
+                "  lands in some default queue nobody knows about."
             )
         return build_dsub_argv(
             plan,
@@ -830,15 +835,15 @@ class DonauScheduler:
         result = self._execute(argv, cwd=plan.cwd or None)
         if result.timed_out:
             raise SchedulerError(
-                f"dsub 提交超时（{self.timeout} 秒）。作业**可能已经提交出去了** —— "
-                f"resume 之前先用 `{DJOB}` 看一眼，别重复提交。\n"
-                f"命令：{format_dsub_command(argv)}"
+                f"dsub submit timed out ({self.timeout} s). The job MAY already have been submitted.\n"
+                f"  Next: check with `{DJOB}` before resuming, do not submit twice.\n"
+                f"  Command: {format_dsub_command(argv)}"
             )
         if result.returncode != 0:
             raise SchedulerError(
-                f"dsub 提交失败（rc={result.returncode}）。\n"
-                f"命令：{format_dsub_command(argv)}\n"
-                f"输出：{_trim(result.stderr or result.stdout)}"
+                f"dsub submit failed (rc={result.returncode}).\n"
+                f"  Command: {format_dsub_command(argv)}\n"
+                f"  Output: {_trim(result.stderr or result.stdout)}"
             )
         job_id = parse_dsub_submit_output(_combined(result))
         return Job(
@@ -890,8 +895,8 @@ class DonauScheduler:
         result = self._execute(build_dkill_argv(job.job_id), cwd=None)
         if result.returncode != 0 or result.timed_out:
             job.raw = _trim(
-                f"{DKILL} {job.job_id} 失败（rc={result.returncode}"
-                f"{'，超时' if result.timed_out else ''}）：{result.stderr or result.stdout}"
+                f"{DKILL} {job.job_id} failed (rc={result.returncode}"
+                f"{', timed out' if result.timed_out else ''}): {result.stderr or result.stdout}"
             )
             return False
         job.state = JobState.CANCELLED
@@ -1007,7 +1012,7 @@ def _default_runner() -> RunnerProtocol:
         from .driver import SubprocessRunner
     except ImportError as exc:  # pragma: no cover - driver 缺失只可能发生在半成品树上
         raise SchedulerError(
-            "没有可用的 runner：既没给 DonauScheduler 注入，也 import 不到 "
-            f"ewave_batch.sched.driver.SubprocessRunner（{exc}）"
+            "no usable runner: none was injected into DonauScheduler and "
+            f"ewave_batch.sched.driver.SubprocessRunner cannot be imported either ({exc})"
         ) from exc
     return SubprocessRunner()
