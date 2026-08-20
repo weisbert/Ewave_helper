@@ -104,6 +104,9 @@ STATUS_ORDER: tuple[str, ...] = tuple(status.value for status in RunStatus)
 """6 个状态的显示顺序 = `RunStatus` 的声明顺序：ready / pending / running / done /
 failed / skipped（BRIEF §12，用户 2026-08-18 定的**恰好 6 个**）。"""
 
+MASK_MIN_CHARS = 4
+"""`redaction_map()` 收多长的串。比这短的一律不收 —— 见那个方法的第二条口径。"""
+
 DEFAULT_AXIS_SELECTION: dict[str, tuple[str, ...]] = {
     "corner": ("typical",),
     "temperature": ("-40.0", "55.0", "125.0"),
@@ -404,6 +407,25 @@ def wrap_command(argv: Sequence[str]) -> str:
     return "\n".join(lines)
 
 
+def redact(text: str, table: Mapping[str, str]) -> str:
+    """按 `GuiState.redaction_map()` 那张表把站点坐标换成占位符。
+
+    纯字符串替换、不碰结构 —— 换完的命令仍然一眼看得出 flag 和顺序，
+    只是 library / cell / ptxt / 路径变成了 `<lib1>` / `<ptxt>` / `<home>`。
+
+    表是**长的在前**（`redaction_map()` 排好序才返回），这里逐条 `str.replace`
+    就够了：先换掉长串，短串再来时那一段已经不在文本里了。
+
+    这个函数在 `gui/state.py` 而不是 `gui/_ui.py`：它不碰 tkinter，
+    所以纯 ssh 会话也能用、测试也不用起窗口（硬约束 5 的同一条理由）。
+    """
+    out = str(text)
+    for value, placeholder in table.items():
+        if value:
+            out = out.replace(value, placeholder)
+    return out
+
+
 def _dedup(values: Sequence[str]) -> tuple[str, ...]:
     """保序去重。笛卡尔积里出现两个一样的取值 = 两个 run 抢同一个目录。"""
     seen: list[str] = []
@@ -614,6 +636,14 @@ class GuiState:
         self._notes: list[str] = []
         self._events: list[DriverEvent] = []
         self._driver: DriverProtocol | None = None
+        self._result_state: BatchState | None = None
+        """driver 那份结果是**对着哪一份 `BatchState`** 跑出来的。
+
+        存它是因为 dry-run **不锁界面**（见 `has_submitted`）：跑完 dry-run 再动一个
+        勾选，`recompute()` 就会重新 `plan()` 出一份全新的 `BatchState`，而 `_driver`
+        还攥着上一份。少了这个身份比对，`summary()` 会拿**上一份矩阵**的计数去配
+        **这一份矩阵**的表格 —— 表上 5 行、状态栏说 3 个，而两边都振振有词。
+        """
         self._running = False
         self._dirty = True
         self._dry_run_only = True
@@ -754,6 +784,7 @@ class GuiState:
             self._make_runner(),
             on_event=self._record_event,
         )
+        self._result_state = state
         self._running = True
 
     def resume(self, *, dry_run: bool = False) -> None:
@@ -787,6 +818,7 @@ class GuiState:
         )
         self._driver = driver
         self._state = driver.state
+        self._result_state = driver.state
         self._plans = {}
         self._dry_run_only = dry_run
         self._running = True
@@ -835,8 +867,8 @@ class GuiState:
     def summary(self) -> dict[str, int]:
         """`RunStatus.value` → 条数。**6 个键恒在**（界面不用 `.get` 兜底）。"""
         counts = {name: 0 for name in STATUS_ORDER}
-        if self._driver is not None:
-            counts.update(self._driver.summary())
+        if self.result_is_current():
+            counts.update(self._driver.summary())  # type: ignore[union-attr]
             return counts
         for run in self.runs():
             counts[run.status.value] = counts.get(run.status.value, 0) + 1
@@ -1449,8 +1481,81 @@ class GuiState:
         return tuple(self._notes)
 
     def events(self) -> tuple[DriverEvent, ...]:
-        """driver 播过的全部事件（状态栏显示最后一条）。"""
+        """driver 播过的全部事件（状态栏显示最后一条，Log 窗口显示全部）。"""
         return tuple(self._events)
+
+    def redaction_map(self) -> dict[str, str]:
+        """站点身份 → 占位符。**只给「把日志 copy 出去」这条路用**（硬约束 1）。
+
+        日志里那些命令逐字带着 library / cell / view / ptxt / PDK 路径 / 队列 / home
+        路径 —— 全是红区标识符。而"拷出来贴给别人看"恰恰是 Log 窗口存在的理由，
+        两件事只能靠一层替换调和：这张表把**已经解析出来的**坐标换成 `<lib1>` /
+        `<ptxt>` / `<home>`，命令的结构、flag 名、数值一个字节都不动 ——
+        贴出去的东西仍然能拿来 debug，贴出去的坐标是零。
+
+        口径三条：
+
+        * 只读**已经缓存**的 `SiteFacts`（`self._facts`）—— 本方法不许触发磁盘解析
+          （它会被 Log 窗口在每次刷新时叫到）；
+        * 只收长度 >= `MASK_MIN_CHARS` 的取值：更短的（`vdd`、`in` 之类）会误伤 flag
+          名和普通英文，而误伤在这里是**静默改写命令**，比漏掉一条更难发现；
+        * 宁可多换不可少换 —— 多换只是让日志难读一点，少换是把坐标发出去。
+
+        ⚠️ **尽力而为，不是保证。** 它只认得"我们自己解析出来过"的那些串；用户手敲进
+        Extra flags 的路径、第三方报错里带的路径，它不知道。要贴给外部的东西，
+        贴之前自己再扫一眼。
+        """
+        pairs: list[tuple[str, str]] = []
+
+        def add(value: object, placeholder: str) -> None:
+            cleaned = str(value or "").strip()
+            if len(cleaned) < MASK_MIN_CHARS:
+                return
+            pairs.append((cleaned, placeholder))
+            # 同一条路径在同一份日志里会以**两种分隔符**出现：`os.path.join` 给的是
+            # 本地分隔符，我们自己拼 `--workDir=` 时给的是正斜杠。只收一种 =
+            # 另一种原样漏出去（2026-08-20 实测：`--gds=` 被换了，`--workDir=` 没换）。
+            # Linux 上这两个变体相同，多收一条只是多一次没命中的 replace。
+            for was, now in (("\\", "/"), ("/", "\\")):
+                if was in cleaned:
+                    pairs.append((cleaned.replace(was, now), placeholder))
+
+        for index, design in enumerate(self._designs, start=1):
+            add(design.library, f"<lib{index}>")
+            add(design.cell, f"<cell{index}>")
+            add(design.view, f"<view{index}>")
+            add(design.official_run_dir, f"<offdir{index}>")
+        add(self.official_run_dir, "<offdir>")
+        add(self.batch_dir(), "<batchdir>")
+        add(self.batch_root, "<batchroot>")
+        for facts in self._facts.values():
+            add(facts.official_run_dir, "<offdir>")
+            add(facts.library, "<lib>")
+            add(facts.top_cell, "<cell>")
+            add(facts.view, "<view>")
+            add(facts.layer_map, "<layermap>")
+            add(facts.ptxt, "<ptxt>")
+            add(facts.ptxt_dir, "<ptxtdir>")
+            add(facts.pdk_root, "<pdkroot>")
+            add(facts.key, "<key>")
+            add(facts.ewave_bin, "<ewave>")
+            add(facts.strmout_bin, "<strmout>")
+            add(facts.dsub_account, "<account>")
+            add(facts.dsub_queue, "<queue>")
+            add(facts.dsub_resources, "<resources>")
+            for pos, (_port_id, pin) in enumerate(facts.official_port_spec.mapping, start=1):
+                add(pin, f"<pin{pos}>")
+            for pos, pin in enumerate(facts.official_port_spec.signal_ports, start=1):
+                add(pin, f"<signal{pos}>")
+        env = self._env if self._env is not None else os.environ
+        for name in ("HOME", "USER", "LOGNAME", "USERNAME"):
+            add(env.get(name, ""), "<%s>" % name.lower())
+        # 长的先换。`<home>/proj/<lib>` 这种嵌套下，短串先换会把长串切碎，
+        # 剩下的半截照样是坐标（`/proj/x` 前面少了 home 也还是内网路径）。
+        table: dict[str, str] = {}
+        for value, placeholder in sorted(pairs, key=lambda item: -len(item[0])):
+            table.setdefault(value, placeholder)
+        return table
 
     def is_running(self) -> bool:
         return self._running
@@ -1518,6 +1623,7 @@ class GuiState:
         """New batch：把上一次的 driver / 状态 / 事件丢掉，**保留界面上的勾选**。"""
         self._dry_run_only = True
         self._driver = None
+        self._result_state = None
         self._state = None
         self._contexts = {}
         self._plans = {}
@@ -1529,18 +1635,70 @@ class GuiState:
     def is_planned(self) -> bool:
         return self._state is not None and not self._dirty
 
+    def result_is_current(self) -> bool:
+        """driver 摆在表上的那份结果，说的还是**现在这份矩阵**吗。
+
+        dry-run 之后界面是**不锁**的（那正是 2026-08-20 修的那条：dry-run 不写盘、
+        不提交，重按一次代价是零，所以不许把界面冻住）。于是"跑完 dry-run 再改一个
+        勾选"是完全正常的一步，而那一步之后 `recompute()` 会 `plan()` 出一份新的
+        `BatchState` —— 上一次的结论从这一刻起说的是**别的**东西。
+
+        没有这道门的症状不是报错，是**两个都对的数字互相打架**：表格来自新矩阵
+        （`runs()` 读 `_state`），计数来自旧 driver（`summary()` 读 `_driver`），
+        于是 5 行的表配一句"3 runs"。真提交过的批次到不了这里 —— 那时
+        `recompute()` 根本不会重新 plan（`has_submitted()` 那道闸门）。
+        """
+        return self._driver is not None and self._state is self._result_state
+
+    def dry_run_result(self) -> tuple[int, int] | None:
+        """上一次 dry-run 的结果 `(拼出来了几条命令, 拼不出来几条)`。不是 dry-run 的结果 → None。
+
+        ★ 为什么单独有这个方法：dry-run **一个 run 都不会变成 done** —— 它不提交、
+        不建目录，全部 run 原地留在 `ready`。于是通用的那句
+        「Finished - 0 / 3 done, 0 failed」逐字都对，读起来却是"什么都没发生"，
+        而实际含义是"3 条命令全拼出来了，可以提交了"（2026-08-20 用户实测反馈：
+        「点击 dry run 之后，我也不知道到底可以跑了不」）。
+
+        判据只能是 `failed` 的条数：dry-run 里唯一会改状态的就是"这条命令拼不出来"
+        （`Driver._plan_only` 把它置 FAILED）。`ready` 的那些 = 命令拼出来了。
+        这与 CLI 那条路的口径逐字相同（`cli.py` 的
+        `f"{len(state.runs)} runs planned, {built} commands built"`）。
+        """
+        if self._running or not self._dry_run_only or not self.result_is_current():
+            return None
+        counts = self.summary()
+        total = sum(counts.values())
+        if not total:
+            return None
+        failed = counts["failed"]
+        return total - failed, failed
+
     def status_line(self) -> str:
         """状态栏那一行英文。"""
         counts = self.summary()
         total = sum(counts.values())
         if not total:
             return "New batch - nothing configured"
-        if self._driver is None:
+        if not self.result_is_current():
+            # driver 没跑过，或者它那份结果已经过期（勾选改过了）—— 两种情况下
+            # 屏幕上摆的都是"还没跑的预览"，说成 Finished 就是在说谎。
             return f"Preview up to date - {total} runs ready to submit"
         if self._running:
             return (
                 f"Running - {counts['done']} done, {counts['running']} running, "
                 f"{counts['pending']} pending, {counts['failed']} failed"
+            )
+        result = self.dry_run_result()
+        if result is not None:
+            built, failed = result
+            if failed:
+                return (
+                    f"Dry-run finished - {built} of {total} commands built, "
+                    f"{failed} could not be built. Nothing was submitted; open Log for why."
+                )
+            return (
+                f"Dry-run OK - all {total} commands built, 0 files written, nothing "
+                "submitted. Press Submit to actually run them."
             )
         return f"Finished - {counts['done']} / {total} done, {counts['failed']} failed"
 
@@ -1739,9 +1897,17 @@ class GuiState:
 
         展不开在界面上是**常态**（一个 design 都没勾就是空矩阵），所以这里吞异常；
         真正会炸的地方是 `plan()`，那条路上错误有地方显示。
+
+        ⚠️ `_axes_and_groups()` **必须在 try 里面**：它自己就会抛（扫频选了 `step`
+        但格子是空的 → `sweep_axis_value` 抛 `SpecError`）。它原来在外面，于是
+        「展不开 -> None」这句承诺在最常见的那条出错路径上是假的，异常一路穿过
+        `group_run_counts()` / `merged_run_count()` / `run_count()` / `formula()`
+        打到界面上 —— 2026-08-20 实测后果：Run groups 那张表在 `refresh_groups()`
+        取计数那一步就抛了，**一行都没重画**，于是刚删掉的组还赖在表上（点它 →
+        "There is no run group called ..."），删了也像没删。
         """
-        axes, groups = self._axes_and_groups()
         try:
+            axes, groups = self._axes_and_groups()
             return matrix_module.expand_runs_detailed(
                 self._designs, axes, options=self._options, groups=groups
             )

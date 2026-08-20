@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tkinter as tk
 from collections.abc import Callable, Sequence
 from tkinter import filedialog, font as tkfont, messagebox, ttk
@@ -163,6 +164,66 @@ GROUP_ROW_AXES: dict[str, tuple[str, ...]] = {
   留在老值上（用户从来没要求过覆盖它）。收敛容差本来也是整批的性质而不是变体的轴，
   所以宁可少一个能力，也不留这种"看起来跟着变、其实没跟着变"的坑。
 """
+
+GROUP_EDIT_HINT = (
+    "editing group %r  -  a greyed row is not this group's: tick the box on its left to let "
+    "this group set that axis. Frequency sweep and the two tolerances are per batch "
+    "(base only) - switch to base to change them."
+)
+"""编辑 base 之外的组时 Settings 底下那行灰字。
+
+灰掉的控件必须说明自己为什么灰。用户 2026-08-20 报的「duplicate 出来的组有些输入框
+根本填不了」里，有一半根本不是 bug 而是这条规矩（继承的行不给编辑、扫频只属于 base），
+只是界面一个字都没说 —— 一个不解释自己的禁用状态，跟坏了没有区别。
+"""
+
+OVERRIDE_TIP = (
+    "%s\n"
+    "  ticked  : this run group sets it itself\n"
+    "  unticked: follow base (the row stays greyed)\n"
+    "Editing base? then there is nothing to inherit from - the box is fixed on."
+)
+"""Settings 第 0 列那个勾选框的悬停提示。
+
+那一列没有表头（加一行表头要把整张 grid 的行号全挪一遍），于是"这个小方块是干嘛的"
+在界面上无解 —— 而它恰好是新建的组里**唯一**能让那些灰格子活过来的开关。
+"""
+
+LOG_GEOMETRY = "1060x620"
+"""Log 窗口的起始大小。一条 ewave 命令 20 多个 flag、拼出来轻松过 300 字符 ——
+窄窗口把它折成一团，"拷出去给别人看"就得先滚三屏。"""
+
+LOG_ROWS = 24
+"""Log 窗口正文留几行。"""
+
+LOG_RULE = "-" * 78
+
+LOG_CONT_INDENT = " " * 27
+"""多行 message 的续行缩进 = `_log_line` 里定长前缀（序号+时刻+kind）的宽度。
+
+核心那些错误信息**自带换行**（一句"是什么坏了" + 一句 `Next:` 该怎么办），
+直接塞进一行会把整份日志的列对齐全带跑；而把换行吃掉又正好丢掉那句最有用的
+`Next:`。所以保留换行、把续行缩进到 run_id 那一列 —— 一眼看得出它属于上一条。
+"""
+
+LOG_EMPTY = (
+    "(nothing yet - press Dry-run to build every command without submitting anything, "
+    "or Submit to actually run them)"
+)
+
+LOG_HINT = (
+    "Read-only. Select with the mouse, Ctrl-A selects all, Ctrl-C copies. "
+    "'Copy for sharing' replaces site names (library / cell / ptxt / paths) with "
+    "placeholders first."
+)
+
+_LOG_NAV_KEYS: frozenset[str] = frozenset(
+    {
+        "Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
+        "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+    }
+)
+"""只读 Text 里**放行**的按键：移动光标和按住修饰键，一个都不改内容。"""
 
 MENU_ITEMS: tuple[str, ...] = (
     "Open output dir",
@@ -525,6 +586,286 @@ def _open_in_file_manager(path: str) -> str:
     return "no xdg-open (or open) on PATH"
 
 
+def _make_readonly(text: tk.Text) -> None:
+    """把一个 `tk.Text` 变成**只读但可选可拷**的。
+
+    为什么不是 `state="disabled"`：那样在一部分 Tk 版本里连鼠标选中都不给，
+    而"能选中、能 Ctrl-C"正是 Log 窗口存在的**全部理由**（用户 2026-08-20：
+    「我可以 copy，把结果粘贴给你 debug」）。部署目标是红区的 Linux，Tk 版本和
+    开发机不同 —— 赌"这个版本的 disabled 恰好还能选"就是赌一个只在气隙对面发作的 bug。
+
+    所以改成拦按键：会改内容的一律 `break`，导航键和 Ctrl-C / Ctrl-A 放行。
+
+    ⚠️ Ctrl-A 必须自己接：Tk 的 Text 默认把它绑成 emacs 的"行首"，
+    而这个窗口里 90% 的操作是"全选然后拷走"。
+    """
+
+    def guard(event: object) -> str | None:
+        keysym = str(getattr(event, "keysym", ""))
+        if keysym in _LOG_NAV_KEYS:
+            return None
+        if int(getattr(event, "state", 0)) & 0x4 and keysym.lower() in ("c", "a", "insert"):
+            return None
+        return "break"
+
+    def select_all(_event: object = None) -> str:
+        text.tag_add(tk.SEL, "1.0", "end-1c")
+        text.mark_set(tk.INSERT, "1.0")
+        return "break"
+
+    text.bind("<Key>", guard)
+    text.bind("<Control-a>", select_all)
+    text.bind("<Control-A>", select_all)
+
+
+def _log_line(index: int, event: object) -> str:
+    """一条 `DriverEvent` -> 一行。
+
+    `message` 放**最后**：run_id 和 kind 的宽度有上界，命令没有 —— 把变长的那一列
+    放中间，每一行的对齐都会被最长的那条命令带跑。
+
+    时间只留时分秒：`at` 是整串 UTC ISO，日期在同一个批次里逐行相同，白占 11 格宽度。
+    """
+    stamp = str(getattr(event, "at", "") or "")
+    clock = stamp[11:19] if len(stamp) >= 19 else (stamp or _DASH)
+    kind = str(getattr(getattr(event, "kind", None), "value", "") or "?")
+    who = str(getattr(event, "run_id", "") or getattr(event, "design_key", "") or _DASH)
+    message = str(getattr(event, "message", "") or "")
+    lines = message.splitlines() or [""]
+    out = ["%4d  %8s  %-9s  %s  %s" % (index, clock, kind, who, lines[0])]
+    out.extend(LOG_CONT_INDENT + line for line in lines[1:])
+    return _NL.join(out)
+
+
+class _LogWindow:
+    """独立的 Log 窗口：driver 播过的**全部**事件，一条一行，可选、可拷、可存盘。
+
+    ★ 为什么值得单独一扇窗（用户 2026-08-20：「LOG 窗口页做的不太好，应该有个专门
+    打印 log 窗口的页面，我可以 copy」）：在这之前"日志"只有状态栏最后那一行。
+    而 **dry-run 的全部产出就是那些命令** —— 一条 300 多字符、一批十几条，
+    状态栏一条都装不下，`Selected run -> Command` 一次也只看得见一个 run。
+    于是"我按了 dry-run，到底能不能跑"这个问题在界面上**没有地方**能回答。
+
+    三个按钮对应三条真实用途：
+
+    | 按钮 | 给谁 |
+    |---|---|
+    | Copy all | 自己贴进工单 / 邮件 / 另一个终端 |
+    | Copy for sharing | 贴到**红区外面**去（问人、贴给助手）-> 走 `state.redact()` |
+    | Save as... | 存成文件，跟着批次一起归档 |
+
+    🚨 `Copy for sharing` 不是装饰。日志里逐字带着 library / cell / ptxt / 队列 /
+    home 路径，CLAUDE.md 硬约束 1 说那些一个字都不许出红区。而"拷出来问人"是个真实
+    且合理的需求 —— 不给一条**合规的**路，就会有人走那条不合规的。
+    脱敏表和它的口径在 `gui.state.GuiState.redaction_map`（含"尽力而为"的交代）。
+    """
+
+    def __init__(self, app: "BaseApp") -> None:
+        self.app = app
+        self._doc = ""
+        self.top = tk.Toplevel(app.top)
+        self.top.title("eWave Batch - Log")
+        try:
+            self.top.geometry(LOG_GEOMETRY)
+        except tk.TclError:  # pragma: no cover - 嵌进别人的窗口时
+            pass
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
+        self.follow = tk.BooleanVar(value=True)
+
+        bar = ttk.Frame(self.top, padding=(8, 6))
+        bar.pack(side=tk.TOP, fill=tk.X)
+        ttk.Button(bar, text="Copy all", width=10, command=lambda: self._copy(False)).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(
+            bar, text="Copy for sharing", width=17, command=lambda: self._copy(True)
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bar, text="Save as...", width=11, command=self._save).pack(side=tk.LEFT)
+        ttk.Checkbutton(bar, text="Follow", variable=self.follow).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(bar, text="Close", width=8, command=self.close).pack(side=tk.RIGHT)
+        self.count_lbl = ttk.Label(bar, text="", style="Hint.TLabel")
+        self.count_lbl.pack(side=tk.RIGHT, padx=8)
+
+        # 结论那一行。事件流回答"发生了什么"，这一行回答用户真正问的那句
+        # 「到底可以跑了不」—— 所以它在最上面、有颜色、是个完整的句子。
+        self.verdict = tk.Label(
+            self.top,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            font=app.f_ui_b,
+            padx=8,
+            pady=4,
+            wraplength=1000,
+        )
+        self.verdict.pack(side=tk.TOP, fill=tk.X)
+
+        self.hint = ttk.Label(self.top, text=LOG_HINT, style="Hint.TLabel", wraplength=1000)
+        self.hint.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(2, 6))
+        # `wraplength` 的单位是**像素**，写死等于假定窗口有多宽 —— 用户把窗口拖窄，
+        # 那句结论就在 1000px 处才折行，也就是右半句直接看不见。跟着窗口走。
+        self.top.bind("<Configure>", self._refit_wraps, add="+")
+
+        wrap = ttk.Frame(self.top, padding=(8, 0))
+        wrap.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.text = tk.Text(
+            wrap,
+            height=LOG_ROWS,
+            wrap="none",
+            font=app.f_mono,
+            relief=tk.SOLID,
+            bd=1,
+            background="#fbfbfb",
+            foreground="#222222",
+        )
+        yscroll = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.text.yview)
+        xscroll = ttk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=self.text.xview)
+        self.text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.text.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        _make_readonly(self.text)
+
+        # headless 冒烟/测试里**建得起来但不露脸**：这扇窗是 dry-run 跑完自动弹的，
+        # 而测试要能验"它确实弹了"。`smoke_enabled()` 时整个不建的话，那条断言就只能
+        # 去验一个中间布尔（= 验我们自己写的 if），验不到窗口本身。
+        if smoke_enabled():
+            self.top.withdraw()
+
+    def _refit_wraps(self, _event: object = None) -> None:
+        """两条整句的标签跟着窗口宽度折行。"""
+        try:
+            width = max(200, self.top.winfo_width() - 24)
+        except tk.TclError:  # pragma: no cover - 窗口已经关掉
+            return
+        self.verdict.config(wraplength=width)
+        self.hint.config(wraplength=width)
+
+    # ------------------------------------------------------------- 生命周期
+    def alive(self) -> bool:
+        """窗口还在不在（用户可能已经关掉了）。"""
+        try:
+            return bool(self.top.winfo_exists())
+        except tk.TclError:  # pragma: no cover - 解释器收尾时
+            return False
+
+    def close(self) -> None:
+        try:
+            self.top.destroy()
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    def present(self) -> None:
+        """提到最前。已经开着时按 Log 就走这条 —— 不开第二扇。"""
+        if not self.alive() or smoke_enabled():
+            return
+        try:
+            self.top.deiconify()
+            self.top.lift()
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    # --------------------------------------------------------------- 内容
+    def document(self) -> str:
+        """整份日志的文本。Copy / Save 拿的就是它，屏幕上显示的也是它 —— **一份**。"""
+        bridge = self.app.bridge
+        head = [
+            "# eWave Batch log",
+            "# batch      %s" % (getattr(bridge, "batch_name", "") or _DASH),
+            "# batch dir  %s" % (bridge.batch_dir() or _DASH),
+            "# official   %s"
+            % (getattr(bridge, "official_run_dir", "") or "<empty - no site coordinates>"),
+            "# python     %s on %s" % (sys.version.split()[0], sys.platform),
+            "# state      %s" % bridge.status_line(),
+            LOG_RULE,
+        ]
+        events = bridge.events()
+        body = [_log_line(index, event) for index, event in enumerate(events, start=1)]
+        if not body:
+            body = [LOG_EMPTY]
+        return _NL.join(head + body) + _NL
+
+    def verdict_text(self) -> tuple[str, str, str]:
+        """(那句话, 前景色, 背景色)。dry-run 之外的情况照抄状态栏那一句。"""
+        bridge = self.app.bridge
+        result = bridge.dry_run_result()
+        if result is None:
+            return bridge.status_line(), "#222222", "#f0f0f0"
+        built, failed = result
+        total = built + failed
+        if failed:
+            return (
+                "Dry-run: %d of %d commands could NOT be built (%d were). Nothing was "
+                "submitted. The reason is on the 'failed' lines below." % (failed, total, built),
+                RED,
+                "#f6d8d8",
+            )
+        return (
+            "Dry-run OK: all %d commands were built. No files written, no jobs submitted "
+            "- press Submit to actually run them." % total,
+            "#1a5c26",
+            "#dcecdc",
+        )
+
+    def refresh(self, force: bool = False) -> None:
+        """重画。内容没变就**什么都不做** —— 否则用户刚选中的那一段每一拍都被清掉。"""
+        if not self.alive():
+            return
+        doc = self.document()
+        message, foreground, background = self.verdict_text()
+        self.verdict.config(text=message, fg=foreground, bg=background)
+        self.count_lbl.config(text="%d events" % len(self.app.bridge.events()))
+        if doc == self._doc and not force:
+            return
+        self._doc = doc
+        first, _last = self.text.yview()
+        self.text.delete("1.0", tk.END)
+        self.text.insert("1.0", doc)
+        self.text.yview_moveto(1.0 if self.follow.get() else first)
+
+    # --------------------------------------------------------------- 动作
+    def _copy(self, masked: bool) -> None:
+        """整份日志进剪贴板。`masked` = 先过一遍脱敏表（硬约束 1）。"""
+        doc = self._doc or self.document()
+        note = "copied %d lines" % doc.count(_NL)
+        if masked:
+            table = self.app.bridge.redaction_map()
+            doc = gui_state.redact(doc, table)
+            note = "copied %d lines, %d site names masked" % (doc.count(_NL), len(table))
+        try:
+            self.top.clipboard_clear()
+            self.top.clipboard_append(doc)
+            # 有的窗口管理器要等一次 update 才真把剪贴板交出去 —— 少了这句，窗口一关
+            # 内容就没了（X11 上剪贴板归**进程**所有，不归系统）。
+            self.top.update()
+        except tk.TclError as exc:  # pragma: no cover - 没有剪贴板的环境
+            note = "could not copy: %s" % exc
+        self.count_lbl.config(text=note)
+
+    def _save(self) -> None:
+        """存盘。存的是**原文**（没脱敏）：文件留在这台机器上，脱敏是"发出去"才要的。"""
+        if smoke_enabled():
+            return
+        name = (getattr(self.app.bridge, "batch_name", "") or "ewave-batch").strip() or "log"
+        path = filedialog.asksaveasfilename(
+            parent=self.top,
+            title="Save log",
+            defaultextension=".log",
+            initialfile="%s.log" % name,
+            filetypes=[("Log file", "*.log"), ("Text file", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline=_NL) as handle:
+                handle.write(self.document())
+        except OSError as exc:
+            _error("Cannot save the log", str(exc))
+            return
+        self.count_lbl.config(text="saved to %s" % os.path.basename(path))
+
+
 class BaseApp:
     """三版布局共用的状态 + section builder。子类只实现 `layout()`。
 
@@ -559,7 +900,13 @@ class BaseApp:
         self.groups_box: ttk.Widget | None = None
         self.groups_hint: ttk.Label | None = None
         self.groups_warn: tk.Label | None = None
+        self.group_hint: tk.Label | None = None
+        self.settings_grid: ttk.Frame | None = None
         self.sw_combo: ttk.Combobox | None = None
+        self.log_btn: ttk.Button | None = None
+        self._log: _LogWindow | None = None
+        """Log 窗口。**最多一扇** —— 用户按第二次 Log 是"我要看日志"，
+        不是"我要两份日志"，而两扇窗只有一扇会被 `_pump()` 刷新。"""
         self._runs: tuple[Run, ...] = ()
 
         # bridge 喂不喂得饱 run group 面板 —— **当判据用，不当假设用**。
@@ -691,13 +1038,14 @@ class BaseApp:
             # done 的一个都不重跑）。给它另起一条路等于第二份调度逻辑。
             "Re-run failed only": self.do_resume,
             "Extraction defaults...": self.show_defaults,
+            "Show log...": self.show_log,
             "About": self.show_about,
         }
         for name, items in (
             ("File", ("New batch", "Open spec...", "Save spec as...", "-", "Exit")),
             ("Batch", ("Duplicate batch...", "Rename...", "-", "Open batch dir")),
             ("Runs", ("Dry-run", "Submit", "Cancel", "Resume", "-", "Re-run failed only")),
-            ("Tools", ("Extraction defaults...", "Check environment (doctor)")),
+            ("Tools", ("Show log...", "Extraction defaults...", "Check environment (doctor)")),
             ("Help", ("About",)),
         ):
             menu = tk.Menu(bar, tearoff=0)
@@ -1014,11 +1362,24 @@ class BaseApp:
         return box
 
     def refresh_groups(self) -> None:
-        """重画组表。**当前组前面打一个 `*`** —— 选中高亮在表失焦时看不出来。"""
+        """重画组表。**当前组前面打一个 `*`** —— 选中高亮在表失焦时看不出来。
+
+        🚨 **这张表画的是「有哪几个组」，不是「各有几个 run」** —— 所以算不出 run 数
+        绝不许让它一行都不画。原来 `group_run_counts()` 在第一行就抛了出去，
+        整个方法当场退出（`recompute()` 的 `_guard` 把异常吞成状态栏一行字），
+        表就冻在上一次的内容上：刚删掉的组还在，点它 -> "There is no run group
+        called ..."，于是"删不掉 + 反复弹框"。算不出来就写 `-> ?`，别写 0（0 是个
+        具体的答案，而这里根本没有答案），更别不画。
+        """
         if self.gtree is None:
             return
         active = self._active_group()
-        counts = dict(self.bridge.group_run_counts()) if self.groups_ok else {}
+        try:
+            counts = dict(self.bridge.group_run_counts()) if self.groups_ok else {}
+            merged = self.bridge.merged_run_count() if self.groups_ok else 0
+            countable = True
+        except EwaveBatchError:
+            counts, merged, countable = {}, 0, False
         self.gtree.delete(*self.gtree.get_children())
         for group in self._groups():
             name = group.name
@@ -1029,13 +1390,21 @@ class BaseApp:
                 values=(
                     ("* " if name == active else "  ") + name,
                     self._group_summary(name),
-                    "-> %d" % counts.get(name, 0),
+                    ("-> %d" % counts.get(name, 0)) if countable else "-> ?",
                 ),
             )
         if self.gtree.exists(active):
-            # ⚠️ 这一行会触发 `<<TreeviewSelect>>`。`refresh_groups` 只在 `recompute()`
-            #    里（`_syncing=True`）跑，而 `on_group_select` 在 `_syncing` 时直接返回 ——
-            #    那条重入保护就是为这里存在的。
+            # ⚠️ 这一行会触发 `<<TreeviewSelect>>`，而**挡住它的不是 `_syncing`**。
+            #    2026-08-20 实测（`tests/test_gui_invariants.py::
+            #    test_the_select_event_is_asynchronous`）：Tk 的虚拟事件是**排进事件
+            #    队列**的，处理器晚一拍才跑 —— 那时候 `recompute()` 早就把 `_syncing`
+            #    放下了。这里原来写着"`_syncing` 那条重入保护就是为这行存在的"，是错的。
+            #    真正管用的是 `switch_group()` 开头那句 `name == self._active_group()`：
+            #    我们只会把选中放回**当前组**自己那一行，所以晚到的那个事件恒等于
+            #    "切到我已经在的组" => 早返回。
+            #    ⇒ 改这里的时候记住：**选中不许落在 active 之外的行上**，
+            #      否则我们自己的重画会被当成用户点击，把 A 组的取值写进 B 组
+            #      （正是 `switch_group` docstring 里那个最难查的场景）。
             self.gtree.selection_set(active)
         _fit_tree_columns(
             self.gtree,
@@ -1046,7 +1415,6 @@ class BaseApp:
             caps=self._cap_px({"summary": GROUP_SUMMARY_CAP_CHARS}),
         )
         if self.groups_hint is not None:
-            merged = self.bridge.merged_run_count() if self.groups_ok else 0
             if merged:
                 word = "duplicate" if merged == 1 else "duplicates"
                 self.groups_hint.config(text="%d %s merged across groups" % (merged, word))
@@ -1071,6 +1439,13 @@ class BaseApp:
         直到跑出一批莫名其妙的 run 才会发现。
         """
         if not self.groups_ok or name == self._active_group():
+            return
+        if name not in {group.name for group in self._groups()}:
+            # 表上这一行是**旧的**（那个组已经不在了，只是上一次重画被别的错误挡住了）。
+            # 这不是"用户点错了"，弹框只会让人一点一个框；重画一次让那一行消失就行。
+            # `set_active_group` 那边照旧对不认识的名字抛错 —— 它面向的是写代码的人，
+            # 「静默退回 base」在那一层仍然是禁止的。
+            self.refresh_groups()
             return
         if not self.bridge.is_running() and not self.bridge.has_submitted():
             self._guard(self.push)
@@ -1133,8 +1508,14 @@ class BaseApp:
         self.recompute()
 
     def do_remove_group(self) -> None:
+        """删掉选中的组。删完退回 base（`remove_group` 自己会做）。"""
         if not self.groups_ok:
             return
+        # 先把界面上的值落进 bridge —— 与 Add / Duplicate 同一条规矩。少了这一步，
+        # "在 A 组里改了温度，然后删掉 B 组"会让那个温度被随后的 `_reload_group_vars()`
+        # 用模型里的旧值盖回去（用户没撤销过任何东西，改动却没了）。
+        if not self.bridge.is_running() and not self.bridge.has_submitted():
+            self._guard(self.push)
         name = self._selected_group()
         if name == BASE_GROUP:
             _info(
@@ -1245,6 +1626,7 @@ class BaseApp:
             )
             check.grid(row=row, column=0, sticky=tk.W)
             self.ovr_boxes[key] = check
+            _Tooltip(check, OVERRIDE_TIP % label)
         ttk.Label(parent, text=label, width=width, anchor=tk.W).grid(  # type: ignore[arg-type]
             row=row, column=1, sticky=tk.W, pady=2
         )
@@ -1271,6 +1653,13 @@ class BaseApp:
         self.settings_title = title
         grid = ttk.Frame(box)
         grid.pack(fill=tk.X)
+        self.settings_grid = grid
+        # 只在编辑 base 之外的组时才 pack（见 `_sync_group_hint`）—— base 是常态，
+        # 常态下多一行永远为空的灰字只是噪声。用 tk.Label 而不是 ttk：前景色走 style
+        # 会污染别的标签（同 `extra_warn` / `groups_warn`）。
+        self.group_hint = tk.Label(
+            box, font=self.f_ui, fg=HINT, anchor=tk.W, justify=tk.LEFT, wraplength=520
+        )
         # 第 0 列是"覆盖"勾选框，给它一个固定的最小宽度：没有它的那几行（扫频、
         # 以及 base 组下被藏起来的时候）会让标签整列跳一下。
         grid.columnconfigure(0, minsize=20)
@@ -1366,6 +1755,9 @@ class BaseApp:
         )
         adv_check.grid(row=5, column=0, sticky=tk.W)
         self.ovr_boxes["advanced"] = adv_check
+        # ★ 这一个只管 equalCurrent（两个 tolerance 只属于 base）—— 提示语里说清楚，
+        #   否则用户会以为勾上之后这个组连 tolerance 一起自己定了。
+        _Tooltip(adv_check, OVERRIDE_TIP % "equalCurrent (tolerances stay on base)")
         adv_head = ttk.Frame(grid)
         adv_head.grid(row=5, column=1, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.adv_btn = ttk.Button(adv_head, text="+ Advanced", width=13, command=self.toggle_adv)
@@ -1628,9 +2020,18 @@ class BaseApp:
         return f
 
     def build_statusbar(self, parent: object) -> ttk.Frame:
+        """状态栏：左边一句话，右边 `N / M done`，最右一个 **Log** 按钮。
+
+        Log 按钮在这儿而不是只在菜单里：状态栏那一行是**摘要**，而摘要装不下
+        dry-run 真正的产出（十几条命令，一条 300 多字符）。按钮就摆在摘要旁边，
+        "想看细节点这里"才是一条走得通的路 —— 藏进 Tools 菜单的东西没人找得到。
+        """
         f = ttk.Frame(parent, padding=(8, 2), relief=tk.SUNKEN)  # type: ignore[arg-type]
         self.status_lbl = ttk.Label(f, text="", style="Hint.TLabel")
         self.status_lbl.pack(side=tk.LEFT)
+        # 先 pack 的更靠右 -> Log 在最右，`N / M done` 在它左边。
+        self.log_btn = ttk.Button(f, text="Log", width=11, command=self.show_log)
+        self.log_btn.pack(side=tk.RIGHT, padx=(8, 0))
         self.status_right = ttk.Label(f, text="", style="Mono.TLabel")
         self.status_right.pack(side=tk.RIGHT)
         return f
@@ -1677,15 +2078,20 @@ class BaseApp:
         self._push_base_axis("relativeTolerance", [self.tol_r.get()])
         self._push_base_axis("relativeCurrentTolerance", [self.tol_c.get()])
         # 扫频和两个 tolerance 一样只属于 base（见 `GROUP_ROW_AXES` 的注释）。
-        # 编辑别的组时那几行是置灰的，格子里还是 base 的值 ⇒ 这一步是个 no-op。
-        b.set_sweep(
-            mode=self.sw_mode.get(),
-            spacing=self.sw_spacing.get(),
-            start=self.f_start.get(),
-            stop=self.f_stop.get(),
-            step=self.f_step.get(),
-            points=self.f_pts.get(),
-        )
+        # 编辑别的组时**一个字都不写**（同 `_push_base_axis`）：那几个格子此刻是置灰的、
+        # 装的是 base 的值，回写它们最好的情况是 no-op，最坏的情况是把界面上某个被
+        # 别处清空的格子当成用户的输入写进基线 —— 后者 2026-08-20 真发生过
+        # （见 `_sync_freq_fields` 里那段 🚨）。让"扫频只属于 base"由结构保证，
+        # 而不是由"那几个格子的值恰好没变"保证。
+        if self._active_is_base():
+            b.set_sweep(
+                mode=self.sw_mode.get(),
+                spacing=self.sw_spacing.get(),
+                start=self.f_start.get(),
+                stop=self.f_stop.get(),
+                step=self.f_step.get(),
+                points=self.f_pts.get(),
+            )
         b.set_extra_flags(self.extra.get())
         b.set_submit_command(self.dsub.get())
 
@@ -1752,6 +2158,7 @@ class BaseApp:
             return
         base = self._active_is_base()
         self._sync_override_vars()
+        self._sync_group_hint(base)
         for key, check in self.ovr_boxes.items():
             check.state(["disabled"] if base else ["!disabled"])
         # 两个 tolerance 只属于 base（见 `GROUP_ROW_AXES`），跟扫频一样整块跟着走。
@@ -1768,6 +2175,24 @@ class BaseApp:
             _set_enabled(container, key not in inherited)
         if inherited:
             self._syncing_vars(lambda: self._apply_axis_selection(selection, only=inherited))
+
+    def _sync_group_hint(self, base: bool) -> None:
+        """Settings 底下那行「为什么这些格子是灰的」。base 时整行收起来。
+
+        `pack(after=...)` 要在**已经 pack 过 grid 的同一个 master 里**才认得位置，
+        所以这行字建在 `box` 里、紧跟在 `settings_grid` 后面 —— 不这么写它会掉到
+        Total 那条公式底下，离它解释的那堆灰格子最远。
+        """
+        if self.group_hint is None or self.settings_grid is None:
+            return
+        if base:
+            if self.group_hint.winfo_manager():
+                self.group_hint.pack_forget()
+            return
+        self.group_hint.config(text=GROUP_EDIT_HINT % self._active_group())
+        if not self.group_hint.winfo_manager():
+            # 每次 recompute 都 re-pack 会闪，所以只在没被摆出来的时候摆一次。
+            self.group_hint.pack(fill=tk.X, after=self.settings_grid, pady=(4, 0))
 
     def _syncing_vars(self, step: object) -> None:
         """在"这是我们自己在写变量、不是用户操作"的旗子下跑一步。"""
@@ -1867,7 +2292,14 @@ class BaseApp:
             # 会让人以为它还算数，而命令行里根本没有它。
             # 走 StringVar 而不是 `entry.delete()` —— 这一格上一轮多半已经是 disabled 的，
             # 对 disabled 的 Entry 做 delete 会被静默吃掉。
-            if key in gui_state.SWEEP_SPACINGS and not on:
+            #
+            # 🚨 判据是 `key not in live`（**扫描模式**说它没用），不是 `not on`
+            #    （那还含着"现在编辑的不是 base"）。用 `not on` 的后果是：切到任何一个
+            #    组都会把 base 的 `step` / `points` 连同它的值一起抹掉 —— 那两个格子
+            #    此刻只是置灰的 base 值，不是这个组的东西。下一次 `push()` 就把空串
+            #    写回 base 的扫频，`sweep_axis_value` 当场抛 "'step' is selected but
+            #    empty"，而用户什么都没改过。2026-08-20 用户报的两个 bug 都源于这里。
+            if key in gui_state.SWEEP_SPACINGS and key not in live:
                 self.freq_vars[key].set("")
             entry.config(state="normal" if on else "disabled")
             if isinstance(label, ttk.Radiobutton):
@@ -2082,7 +2514,12 @@ class BaseApp:
         note = self._last_event_text()
         if note and not getattr(self, "_error", ""):
             text = text + "  |  " + note
-        self.status_lbl.config(text=text)
+        # 结论要有**颜色**。2026-08-20 用户实测：dry-run 跑完，状态栏写的是
+        # 「Finished - 0/3 done, 0 failed」，逐字都对，读起来却像"什么都没发生"——
+        # 而它的真实含义是"3 条命令全拼出来了"。现在那句话本身改掉了
+        # （`GuiState.status_line` 的 dry-run 分支），再给它一个绿/红，
+        # 让"能不能跑"在**没读完那句话之前**就已经答完了。
+        self.status_lbl.config(text=text, foreground=self._status_colour())
         right = "%d / %d done" % (counts["done"], total) if total else "0 / 0"
         self.status_right.config(text=right)
         if self.right_lbl is not None:
@@ -2092,10 +2529,40 @@ class BaseApp:
             self.runs_header.config(text=header)
         elif self.runs_titled:
             self.runs_box.config(text=" Runs - %s " % header)
+        if self.log_btn is not None:
+            events = len(self.bridge.events())
+            self.log_btn.config(text="Log (%d)" % events if events else "Log")
+        self._log_refresh()
+
+    def _status_colour(self) -> str:
+        """状态栏那句话的颜色。红=有东西坏了，绿=可以提交了，灰=还没有结论。"""
+        if getattr(self, "_error", ""):
+            return RED
+        result = self.bridge.dry_run_result()
+        if result is not None:
+            return RED if result[1] else GREEN
+        counts = self.bridge.summary()
+        if not self.bridge.is_running() and counts.get("failed"):
+            return RED
+        return HINT
 
     def _runs_summary(self, counts: dict[str, int], total: int) -> str:
         if not total:
             return "0 runs"
+        # dry-run 跑完时**每个 run 都还是 `ready`**（它不提交、不建目录），于是
+        # 下面那句通用的 "preview (not submitted)" 和"根本没按过 Dry-run"长得一模一样。
+        # 而这两件事对用户的意义完全相反：一个是"还不知道能不能跑"，
+        # 另一个是"命令已经全拼出来了，可以提交"。
+        result = self.bridge.dry_run_result()
+        if result is not None:
+            built, failed = result
+            if failed:
+                return "%d runs - dry-run: %d commands built, %d failed" % (
+                    total,
+                    built,
+                    failed,
+                )
+            return "%d runs - dry-run OK, commands built, nothing submitted" % total
         if not self.bridge.is_planned() or counts["ready"] == total:
             return "%d runs, preview (not submitted)" % total
         parts = [
@@ -2104,6 +2571,15 @@ class BaseApp:
         return "%d runs - %s" % (total, " - ".join(parts))
 
     def _last_event_text(self) -> str:
+        """状态栏尾巴上那条「最后发生了什么」。**结果过期了就一个字都不说。**
+
+        2026-08-20 实测：dry-run 跑完再改一个温度，状态栏成了
+        「Preview up to date - 6 runs ready to submit  |  failed: ...」——
+        前半句说的是新矩阵，后半句是上一份矩阵留下的尸体，而它们中间只隔一根竖线。
+        `result_is_current()` 就是这两半共用的那个"说的还是同一件事吗"。
+        """
+        if not self.bridge.result_is_current():
+            return ""
         events = self.bridge.events()
         if not events:
             return ""
@@ -2179,8 +2655,42 @@ class BaseApp:
         self.refresh_tree()
         self.update_status()
         self.sync_buttons()
-        if report is not None and not report.finished:
+        if report is not None and report.finished:
+            self._batch_finished()
+            return
+        if report is not None:
             self._timer = self.frame.after(self._poll_ms(), self._pump)
+
+    def _batch_finished(self) -> None:
+        """一批跑完（或 dry-run 规划完）之后的收尾。
+
+        ★ **dry-run 收尾时主动把 Log 窗口推到脸上。** dry-run 的全部产出就是那些
+        命令，而它们一条都不在主界面上：状态栏只装得下最后一条，
+        `Selected run -> Command` 一次只看得见一个 run。用户 2026-08-20 的原话是
+        「点击 dry run 之后，我也不知道到底可以跑了不」—— 真正的答案
+        （4 条命令都拼出来了 / 第 2 条为什么拼不出来）一直躺在事件流里，
+        只是界面上没有地方显示它。
+
+        **真提交的批次不弹**：那时表格自己就是进度，弹一扇窗只会挡着它。
+        要看日志按状态栏上的 Log。
+        """
+        if self.bridge.dry_run_result() is None:
+            self._log_refresh()
+            return
+        self.show_log()
+
+    def show_log(self) -> object:
+        """打开（或前置）Log 窗口。已经开着就只刷新 + 提到最前，**不开第二扇**。"""
+        if self._log is None or not self._log.alive():
+            self._log = _LogWindow(self)
+        self._log.refresh(force=True)
+        self._log.present()
+        return self._log
+
+    def _log_refresh(self) -> None:
+        """Log 窗口开着就跟着刷一下；没开就什么都不做（不为了刷新去开窗）。"""
+        if self._log is not None and self._log.alive():
+            self._log.refresh()
 
     def _stop_timer(self) -> None:
         if self._timer is not None:
@@ -2306,8 +2816,14 @@ class BaseApp:
 
         改一个已经落过盘的批次的名字，等于让界面指向一个空目录，而磁盘上那批产物
         还在老名字底下、resume 也跟着找不着。要另起一个名字走 Duplicate batch。
+
+        ⚠️ 判据是 `has_submitted()` 而**不是** `has_started()`（2026-08-20 一并订正）：
+        dry-run 也算 `has_started()`，于是"按一次 Dry-run 就再也改不了批次名"，
+        而且拦下来时说的是「This batch has already been submitted」——
+        一句**假话**（dry-run 一个字节都没写）。这和按钮那边是同一条口径，
+        理由写在 `gui.state.GuiState.has_submitted` 上。
         """
-        if self.bridge.has_started():
+        if self.bridge.has_submitted():
             _error(
                 "Cannot rename this batch",
                 "This batch has already been submitted, and its name is its directory "

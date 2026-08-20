@@ -1963,5 +1963,183 @@ class PreflightRefusesInsteadOfFailingSixTimes(_SmokeTest):
         self.assertNotIn("disabled", app.btn["Dry-run"].state(), "拦下之后还得能再按")
 
 
+class DuplicateAndRemoveRunGroup(_SmokeTest):
+    """★ 用户 2026-08-20 报的坑：run group **复制出来删不掉**，而且反复弹
+    "There is no run group called 'base-copy' in this batch. Groups: base"。
+
+    完整因果链（三段，中间两段都是静默的）：
+
+    1. `_sync_freq_fields` 判"要不要清空这一格"用的是 `not on`，而 `on` 里含着
+       "现在编辑的是不是 base"。⇒ 切到**任何**组的那一瞬间，base 的 `step` 格子
+       被清空；下一次 `push()` 把空串写回 base 的扫频。用户什么都没改。
+    2. 空 `step` 让 `_base_axes()` 抛 `SpecError`，而 `_expansion()` 的 try 从
+       `_axes_and_groups()` **后面**才开始 ⇒ 「展不开 -> None」这句承诺失效，
+       异常穿过 `group_run_counts()` 打到 `refresh_groups()` 的第一行。
+    3. `refresh_groups()` 于是一行都没画完就退出（`recompute()` 的 `_guard` 把它
+       吞成状态栏一行字）。组表**冻在上一次的内容上** —— 删掉的组还在表上，
+       点一下就是一个 "There is no run group called ..." 的框，删几次弹几次。
+
+    下面盯的是四个不同的环节，缺一条都能让这个坑重新长回来。
+    """
+
+    def _app(self):
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        bridge, _runner, _sched = _gui(self.root)
+        return bridge, split.build_frame(root, bridge)._ewb_app
+
+    def _names(self, app):
+        """组表**画出来的**那几行（去掉头两个字符 —— 当前组是 `* `，其余是两个空格）。"""
+        return [app.gtree.item(iid, "values")[0][2:] for iid in app.gtree.get_children()]
+
+    def test_switching_to_a_group_does_not_wipe_the_base_sweep(self) -> None:
+        """★ 第 1 环：切组不许动 base 的扫频格子。
+
+        判据是"切之前是什么、切完还是什么" —— 扫频只属于 base（`GROUP_ROW_AXES`），
+        编辑别的组时那几格只是**置灰的 base 值**，不是这个组的东西。
+        """
+        _bridge, app = self._app()
+        before = app.f_step.get()
+        self.assertTrue(before, "前提：默认扫频用的就是 step 那一档")
+        app.gtree.selection_set(gui_state.BASE_GROUP)
+        app.do_duplicate_group()
+        self.assertEqual(app.f_step.get(), before, "切到组就把 base 的 step 抹了")
+        app.switch_group(gui_state.BASE_GROUP)
+        self.assertEqual(app.f_step.get(), before)
+        # 期望值出处：`GuiState.sweep_live_fields`（spacing=step 时活的就是这三格）。
+        self.assertEqual(app.bridge.sweep_live_fields(), ("start", "stop", "step"))
+
+    def test_switching_to_a_group_keeps_the_batch_expandable(self) -> None:
+        """同一环的后果面：切一圈回来，run 数一个不少（手写 12，见 `EXPECTED_RUN_COUNT`）。
+
+        复制 base 得到的组与基线逐字相同 ⇒ 它自己贡献 0 个 run（全被跨组去重吃掉），
+        总数因此不变。总数掉到 0 = 扫频被抹了，那正是第 1 环的症状。
+        """
+        bridge, app = self._app()
+        app.gtree.selection_set(gui_state.BASE_GROUP)
+        app.do_duplicate_group()
+        app.switch_group(gui_state.BASE_GROUP)
+        self.assertEqual(bridge.run_count(), EXPECTED_RUN_COUNT)
+        self.assertEqual(app._error, "", "切个组就把批次配坏了")
+
+    def test_expansion_swallows_a_broken_sweep_instead_of_leaking_it(self) -> None:
+        """★ 第 2 环：「展不开 -> None」必须对**所有**展不开的原因成立。
+
+        期望值出处：`GuiState._expansion` 的 docstring 自己写的那句承诺。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_sweep(mode="linear", spacing="step", start="0", stop="40", step="", points="")
+        self.assertEqual(bridge.run_count(), 0)
+        self.assertEqual(bridge.merged_run_count(), 0)
+        self.assertEqual(
+            bridge.group_run_counts(), [(gui_state.BASE_GROUP, 0)], "算不出来也得给出这一行"
+        )
+
+    def test_expansion_still_counts_a_healthy_sweep_negative(self) -> None:
+        """反向：同一条路上扫频填好了必须数出 12 —— 否则上一条只是"永远返回 0"。"""
+        bridge, _runner, _sched = _gui(self.root)
+        self.assertEqual(bridge.run_count(), EXPECTED_RUN_COUNT)
+        self.assertEqual(bridge.group_run_counts(), [(gui_state.BASE_GROUP, EXPECTED_RUN_COUNT)])
+
+    def test_the_group_table_is_redrawn_even_when_the_count_blows_up(self) -> None:
+        """★ 第 3 环：算不出 run 数不许让组表**一行都不画**。
+
+        这张表画的是"有哪几个组"，run 数只是它的第三列。让第三列的失败带走整张表，
+        就是"删掉的组还赖在表上"的直接成因。
+        """
+        bridge, app = self._app()
+        app.do_add_group()
+
+        def boom():
+            raise SpecError("count exploded")
+
+        bridge.group_run_counts = boom
+        app.refresh_groups()
+        self.assertEqual(self._names(app), [group.name for group in bridge.groups()])
+        self.assertEqual(
+            [app.gtree.item(iid, "values")[2] for iid in app.gtree.get_children()],
+            ["-> ?", "-> ?"],
+            "数不出来就写 '?'：0 是个具体答案，而这里根本没有答案",
+        )
+
+    def test_the_group_table_shows_real_counts_negative(self) -> None:
+        """反向：数得出来的时候必须是数字，否则上一条就成了"永远写 ?"。"""
+        _bridge, app = self._app()
+        app.refresh_groups()
+        self.assertEqual(
+            [app.gtree.item(iid, "values")[2] for iid in app.gtree.get_children()],
+            ["-> %d" % EXPECTED_RUN_COUNT],
+        )
+
+    def test_duplicate_then_remove_leaves_only_base(self) -> None:
+        """★ 用户那条路从头走一遍：复制 -> 删 -> 模型和表**同时**只剩 base。
+
+        计数断言：组数 1 -> 2 -> 1，表上的行数逐拍跟着；run 数回到手写的 12。
+        """
+        bridge, app = self._app()
+        self.assertEqual(len(bridge.groups()), 1)
+        app.gtree.selection_set(gui_state.BASE_GROUP)
+        app.do_duplicate_group()
+        self.assertEqual(len(bridge.groups()), 2)
+        self.assertEqual(len(self._names(app)), 2)
+
+        copy_name = bridge.groups()[1].name
+        app.gtree.selection_set(copy_name)
+        app.do_remove_group()
+        self.assertEqual([group.name for group in bridge.groups()], [gui_state.BASE_GROUP])
+        self.assertEqual(self._names(app), [gui_state.BASE_GROUP], "删了但表上还在 = 删不掉")
+        self.assertEqual(bridge.active_group(), gui_state.BASE_GROUP)
+        self.assertEqual(bridge.run_count(), EXPECTED_RUN_COUNT)
+        self.assertEqual(app._error, "")
+
+    def test_clicking_a_stale_row_refreshes_instead_of_popping_a_dialog(self) -> None:
+        """★ 第 3 环的兜底：万一表还是旧的，点那一行只该让它消失，不该弹框。
+
+        用户按几次删除就吃了几个框 —— 一个点了也没用、还会再来的框，
+        比"表没刷新"本身更让人以为程序坏了。
+        """
+        bridge, app = self._app()
+        app.gtree.insert("", "end", iid="ghost", values=("  ghost", "", "-> 0"))
+        popped = []
+        import gui._ui as ui
+
+        original = ui._error
+        ui._error = lambda title, message: popped.append((title, message))
+        self.addCleanup(setattr, ui, "_error", original)
+
+        app.switch_group("ghost")
+        self.assertEqual(popped, [], "旧行不是用户操作错误，不该弹框")
+        self.assertEqual(self._names(app), [gui_state.BASE_GROUP], "旧行必须当场消失")
+        self.assertEqual(bridge.active_group(), gui_state.BASE_GROUP)
+
+    def test_the_bridge_still_refuses_an_unknown_group_negative(self) -> None:
+        """反向：界面兜底了，**核心那层不许跟着放软**。
+
+        `set_active_group` 对不认识的名字静默退回 base = 用户以为自己在改某个组、
+        实际改的是基线（`GuiState.set_active_group` 的 docstring）。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        with self.assertRaises(SpecError):
+            bridge.set_active_group("ghost")
+
+    def test_a_greyed_row_says_why_it_is_greyed(self) -> None:
+        """★ 用户报的另一半：「duplicate / 新建出来的组有些输入框根本填不了」。
+
+        继承的行不给编辑、扫频只属于 base —— 两条都是有意的（`GROUP_ROW_AXES`），
+        但界面原来一个字都没说。一个不解释自己的禁用状态，跟坏了没有区别。
+        """
+        _bridge, app = self._app()
+        self.assertFalse(app.group_hint.winfo_manager(), "编辑 base 时不该有这行字")
+        app.do_add_group()
+        self.assertTrue(app.group_hint.winfo_manager(), "编辑组时必须解释那些灰格子")
+        text = app.group_hint.cget("text")
+        self.assertIn("tick the box", text)
+        self.assertIn("base only", text)
+        self.assertTrue(all(ord(ch) < 128 for ch in text), "红区 LANG 常是 C => 纯 ASCII")
+        app.switch_group(gui_state.BASE_GROUP)
+        self.assertFalse(app.group_hint.winfo_manager(), "回到 base 这行字必须收起来")
+
+
 if __name__ == "__main__":
     unittest.main()
