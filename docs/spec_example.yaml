@@ -14,7 +14,9 @@
 # ============================================================================
 
 batch_name: demo_batch          # 留空 = 用 UTC 时间戳现起一个
-batch_root: ./batches           # 批次落在哪。**绝不要指到设计师的 workarea 里**
+batch_root: ./batches           # 批次落在哪。留空 = <install>/ewave_batches
+                                # **绝不要指到设计师的 spine（ewave_simulation/）里**
+                                # 也别指进 $HOME：红区那儿有配额，爆了是静默的
 
 # ---------------------------------------------------------------------------
 # designs —— 要提取的 (Library, Cell, view)

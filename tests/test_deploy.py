@@ -703,10 +703,19 @@ class ShellSyntax(unittest.TestCase):
 class DeployMustNotEatBatchResults(unittest.TestCase):
     """★ 2026-08-20 真丢过一次数据的回归守卫。**这一条是端到端的：真跑 `deploy.sh`。**
 
+    ⚠️ **2026-08-24 起这一条的分量变了：它现在是这批数据唯一的防线，不是保险。**
+    默认落点当时被挪到了 `~/ewave_batches`，而红区 `$HOME` 有配额（实测约 500 MB）
+    且爆掉是静默的（0 字节文件 + 照样打印 "done"）—— 那是把用户从一个坑推进另一个坑。
+    现在默认落点**有意**回到 `<install>/ewave_batches`
+    （`ewave_batch.core.layout.default_batch_root`），也就是说：批次结果**默认就在**
+    这个测试模拟的位置上。`PRESERVE` 少一行、`looks_like_batch_data()` 认漏一次，
+    就是 08-20 原样重演，而且这次是对**每一个**用户、不是碰巧 cd 对了目录的那个。
+
     当时的链条（三段，每一段单独看都不算错）：
 
     1. `gui.state.DEFAULT_BATCH_ROOT` 是 `./ewave_batches` —— 相对**启动 GUI 时的
        当前目录**。而人自然会 `cd <安装目录>` 再起界面 ⇒ 批次落在安装目录里面。
+       （今天不必再"碰巧 cd 对"了，见上。）
     2. `deploy.sh` 升级时把安装目录里每一个"不认识的"顶层条目 `mv` 进
        `.deploy/backups/<TS>/`，`PRESERVE` 当时只有 `.deploy` 和 `site.local.sh`。
     3. 备份只留最新 `KEEP_BACKUPS` 份，再部署几次就静默删掉。

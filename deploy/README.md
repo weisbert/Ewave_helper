@@ -215,8 +215,15 @@ cp site.example.sh site.local.sh     # 然后按里面的说明改那一行
 > 于是"`cd <安装目录>` 再起界面"这个最自然的用法会让批次落在安装目录里，
 > 下一次部署把它 `mv` 进 `.deploy/backups/`，再 3 次部署之后轮转静默删掉。
 > 用户真丢过一次。当时这个风险是**已知**的，靠的是这份文档 + 换装完打一段提醒 ——
-> 两样都没拦住。现在改成结构上拦：默认落点挪出安装目录（`~/ewave_batches`）、
-> 探测 `batch.json`、界面上把落点显示出来并在指进程序目录时标红。
+> 两样都没拦住。现在改成结构上拦：默认落点是 `<install>/ewave_batches`（2026-08-24
+> 用户拍板；中间那版 `~/ewave_batches` 撞了红区 `$HOME` 配额，已撤），
+> 探测 `batch.json`、界面上把落点显示出来并在指进**已知有害的地方**时标红
+> （现在那是 `$HOME` 和 `.deploy/`，**不再是安装目录** —— 安装目录就是默认落点）。
+>
+> ⚠️ **所以下面那张表现在是这批数据唯一的防线，不是「多一道保险」。**
+> 默认落点又回到安装目录里了，`PRESERVE` 少一行、`looks_like_batch_data()`
+> 认漏一次，就是 08-20 重演。动它们之前先看
+> `tests/test_deploy.py::DeployMustNotEatBatchResults`。
 > 守它的是 `tests/test_deploy.py::DeployMustNotEatBatchResults`（真跑一次 deploy）。
 
 包自己也带的名字（例如 `docs`）会被明确报错拒绝，而不是被静默地套一层。

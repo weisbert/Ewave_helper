@@ -84,6 +84,9 @@ from ..model import (
 )
 
 __all__ = [
+    "install_root",
+    "default_batch_root",
+    "BATCH_ROOT_DIRNAME",
     "compute_run_paths",
     "ensure_run_dirs",
     "write_cmd_sh",
@@ -113,6 +116,48 @@ GDS_SUFFIX = ".gds"
 # `RUN_LOG_NAME` / `CMD_SH_NAME` 是**退路**名字：只在 `<corner>_<temp>` 预测不出来、
 # 且 run_id 也给不出词根时才用。正常路径走 `RUN_LOG_TEMPLATE` / `CMD_SH_TEMPLATE`
 # （每个 run 一份，理由见 model.CMD_SH_TEMPLATE）。两者都从 model 来，别在这儿重定义。
+
+BATCH_ROOT_DIRNAME = "ewave_batches"
+"""默认落点在安装目录里叫什么。`deploy.sh` 的 `PRESERVE` 里写死的就是这个名字。"""
+
+
+def install_root() -> str:
+    """本工具安装在哪 —— `ewave_batch` 包的**父目录**的绝对路径。
+
+    `<install>/ewave_batch/core/layout.py` 往上三级。GUI 那边原来自己算过一份
+    （`os.path.join(os.path.dirname(gui/state.py), os.pardir)`），同一个答案两处算
+    迟早会分家，所以只留这一份。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))          # <install>/ewave_batch/core
+    return _posix(os.path.dirname(os.path.dirname(here)))       # <install>
+
+
+def default_batch_root() -> str:
+    """批次落在哪的兜底值 = `<install>/ewave_batches`（用户 2026-08-24 拍板）。
+
+    这里踩过**两个方向相反**的坑，两个都必须同时躲开，所以值不是随便挑的：
+
+    1. **`./ewave_batches`（相对 cwd）** —— 2026-08-20 丢过一次真实结果：人自然会
+       `cd <install>` 再起界面 ⇒ 批次落进安装目录 ⇒ `deploy.sh` 把"不认识的"顶层条目
+       `mv` 进 `.deploy/backups/<TS>/` ⇒ 几次部署之后轮转静默删掉。
+    2. **`~/ewave_batches`** —— 上面那次的过度修正，而它落进了仓库里**早就写明**的
+       另一个坑：红区 `$HOME` 有配额（用户实测约 500 MB），而 mesh/pmsh 中间件动辄
+       几 GB。配额爆掉的样子是致命的静默：`mvp/redzone/go_workarea.sh` 记着实测 ——
+       eresist 写 `resist.rst` 写不下拿到 **0 字节**、**却照样打印 "Execute eresist
+       done."**，emsolver 随后读空文件崩掉。`df -h $HOME` 报的"可用"是文件系统剩余、
+       不是用户配额，**它骗过人**。
+
+    现在两条都不成立：坑 1 已经在 `deploy.sh` 里**结构性**堵死了 —— `PRESERVE` 写死
+    `ewave_batches`，而且任何含 `batch.json` 的顶层目录一律不搬（`looks_like_batch_data`），
+    `tests/test_deploy.py` 有端到端回归守卫。安装目录在 `<workarea>/` 下面，没有配额问题。
+    于是落点回到安装目录，而且是**绝对路径**（与 cwd 无关：从哪儿起界面都是同一批结果，
+    resume 才找得回上一批）。
+
+    ⚠️ 这不是往源码里写站点坐标（硬约束 1b）—— 它是**运行时发现**：值由
+    `ewave_batch` 包自己的位置算出来，仓库里一个字节的路径都没有。
+    """
+    return _join(install_root(), BATCH_ROOT_DIRNAME)
+
 
 SET_CURRENT_LOG_NAME = "set_current.log"
 """`set_run_as_current` 的审计日志。写进批次的 `logs/`，**不写进 spine**。"""

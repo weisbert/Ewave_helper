@@ -1497,10 +1497,11 @@ class BaseApp:
         """顶上那条。**两行**：第一行批次名 + 官方 run 目录，第二行落点。
 
         第二行是 2026-08-20 那次数据丢失之后加的。在那之前"我的结果落在哪"这个问题
-        在界面上**无解**：`batch_root` 是 `./ewave_batches`（相对启动 GUI 时的 cwd），
-        既不显示也不能改，唯一的线索是动作栏里那行拼好的 Batch dir。于是从安装目录
-        起界面 = 结果落在安装目录里 = 下一次部署把它搬进 `.deploy/backups/` 再轮转删掉，
-        而用户全程看不到任何提示。落点必须是**看得见、改得动、指错了会红**的东西。
+        在界面上**无解**：`batch_root` 既不显示也不能改，唯一的线索是动作栏里那行拼好的
+        Batch dir。而落点错了的两种样子都是**静默**的（被部署轮转删掉 / 撞 `$HOME` 配额
+        写出 0 字节），用户全程看不到任何提示。落点必须是**看得见、改得动、指错了会红**
+        的东西 —— 红字来自 `GuiState.batch_root_warning()`，真正的判据是按下 Submit 那
+        一刻的实写探针 `GuiState.batch_root_check()`。
         """
         outer = ttk.Frame(parent)  # type: ignore[arg-type]
         f = ttk.Frame(outer, padding=(8, 6, 8, 2))

@@ -70,24 +70,16 @@ from ewave_batch.tools import ewave as ewave_tool
 # 界面默认值 —— **全是工具语义或占位符，一个站点坐标都没有**
 # --------------------------------------------------------------------------
 
-DEFAULT_BATCH_ROOT = "~/ewave_batches"
-"""批次落在哪的兜底值。**必须是与 cwd 无关的绝对位置。**
+DEFAULT_BATCH_ROOT = layout_module.default_batch_root()
+"""批次落在哪的兜底值 = `<install>/ewave_batches`。**与 cwd 无关的绝对路径。**
 
-2026-08-20 之前这里是 `./ewave_batches`（相对**启动 GUI 时的当前目录**），
-用户丢过一次真实结果，链条是：人自然会 `cd <安装目录>` 再起界面 ⇒ 批次落在安装目录
-里面 ⇒ 下一次 `deploy.sh` 把它 `mv` 进 `.deploy/backups/<TS>/` ⇒ 再 3 次部署之后
-轮转静默删掉。**这个风险当时是已知的**（`deploy/README.md` 写了、部署完还会打一段
-警告），但"文档 + 一行会滚过去的警告"没拦住任何人 —— 所以现在改成结构上拦：
+理由、以及这里踩过的**两个方向相反**的坑（`./ewave_batches` 会被部署吃掉、
+`~/ewave_batches` 会撞红区 `$HOME` 配额且失败是静默的），逐条写在
+`ewave_batch.core.layout.default_batch_root` 上 —— 那是这个值唯一的家。
 
-1. 默认落点挪出安装目录（这里）；
-2. `deploy.sh` 的 `PRESERVE` 里写死 `ewave_batches`，并且**任何含 `batch.json` 的
-   顶层目录一律不搬**（`looks_like_batch_data`）；
-3. 界面上把 batch root 显示出来、可改，指进程序目录时**标红**
-   （`batch_root_warning()`）。
-
-`~` 由 `os.path.expanduser` 在 `batch_dir()` / `core.spec.spec_to_batch` 里展开
-（两处本来就在做，没有新的展开点）。**绝不会指进设计师的 spine**
-（硬约束 4；真落盘前还有 `core.layout` 的 `_assert_outside_spine` 兜底）。"""
+界面这一侧只加一层：落点显示出来、可改，指进已知有害的地方时**标红**
+（`batch_root_warning()`）。**绝不会指进设计师的 spine**（硬约束 4；真落盘前
+还有 `core.layout` 的 `_assert_outside_spine` 兜底）。"""
 
 CORNER_VALUES: tuple[str, ...] = ("cbest", "cworst", "rcbest", "rcworst", "typical")
 """5 个工艺角的通用名字（BRIEF §10 用户给的轴清单）。**不是站点身份** ——
@@ -930,29 +922,186 @@ class GuiState:
         self._invalidate()
 
     def batch_root_warning(self) -> str:
-        """batch root 指进了**程序自己所在的目录** -> 一句红字。没问题 -> 空串。
+        """落点指到了**已知会吃掉数据的地方** -> 一句红字。没问题 -> 空串。
 
-        这是 2026-08-20 那次数据丢失的结构性防线。`deploy.sh` 升级时会把安装目录里
-        每一个"不认识的"顶层条目 `mv` 进 `.deploy/backups/<TS>/`，3 次部署之后轮转
-        把它删掉。批次落在安装目录里面 = 把结果放在一个会被自动清理的地方。
+        两条判据，是两次真实事故各留下的一条，方向**正好相反** ——
+        所以这里不能只留一条，也不能把其中一条反过来写：
 
-        判据是"解析后的绝对路径落在本工具的包目录里"，不是字符串前缀比较 ——
-        `./ewave_batches` 是相对 cwd 的，只有解析成绝对路径之后才知道它到底在哪，
-        而"从安装目录启动 GUI"正是最常见的用法。
+        1. **`$HOME` 底下**（用户 2026-08-24 报的，而且"发生很多次了"）：红区 `$HOME`
+           有配额（实测约 500 MB），一个 run 的 mesh/pmsh 中间件就是几 GB。
+           配额爆掉的样子是**致命的静默** —— `mvp/redzone/go_workarea.sh` 记着实测：
+           eresist 写 `resist.rst` 写不下拿到 0 字节、却照样打印 "Execute eresist done."，
+           emsolver 随后读空文件崩掉。`df` 和 `quota` 都骗过人，只有实写算数
+           （所以还有 `preflight()` 里那个实写探针，这一条只是提前一步说话）。
+        2. **`<install>/.deploy/` 底下**：那是部署自己的地盘（staging / backups /
+           scratch），`deploy.sh` 会轮转删它。
+
+        ⚠️ **安装目录本身现在是默认落点，不再报警**（2026-08-20 那版在这里报警，
+        而它正是把人推去 `~/` 的那句话）。安装目录安全的理由不在界面这一层，在
+        `deploy.sh`：`PRESERVE` 写死 `ewave_batches`，且任何含 `batch.json` 的顶层
+        目录一律不搬（`looks_like_batch_data`），`tests/test_deploy.py` 端到端守着。
+
+        判据一律是**解析后的绝对路径**，不是字符串前缀比较 —— `~` 和 `./` 都得先展开
+        才知道到底落在哪，而这两种写法恰恰是最常见的。
+        """
+        env = self._env if self._env is not None else os.environ
+        try:
+            root = os.path.abspath(os.path.expanduser(self.batch_root or DEFAULT_BATCH_ROOT))
+        except (OSError, ValueError):  # pragma: no cover - 怪路径
+            return ""
+
+        def _inside(parent: str) -> bool:
+            if not parent:
+                return False
+            try:
+                return os.path.commonpath([root, os.path.abspath(parent)]) == os.path.abspath(parent)
+            except (OSError, ValueError):  # 不同盘符 / 怪路径
+                return False
+
+        install = layout_module.install_root()
+        deploy_dir = os.path.join(install, ".deploy")
+        if _inside(deploy_dir):
+            return (
+                "Batch root is inside %s." % deploy_dir + _NL +
+                "  That is the deploy machinery's own scratch/backup area and it gets "
+                "rotated away - results kept here disappear a few deploys later." + _NL +
+                "  Next: point it somewhere else, e.g. %s" % DEFAULT_BATCH_ROOT
+            )
+
+        home = env.get("HOME") or env.get("USERPROFILE") or ""
+        if home and _inside(home) and not _inside(install):
+            return (
+                "Batch root is under $HOME (%s)." % home + _NL +
+                "  $HOME is quota'd here (~500 MB was measured) while one run's mesh "
+                "intermediates run to several GB. Blowing the quota is SILENT: eWave "
+                "writes a 0-byte file, still prints 'done', and the next stage crashes "
+                "reading it. df and quota both under-report this - only a real write "
+                "tells the truth." + _NL +
+                "  Next: point it back under the workarea, e.g. %s" % DEFAULT_BATCH_ROOT
+            )
+        return ""
+
+    PROBE_BYTES = 8 * 1024 * 1024
+    """落点实写探针的大小。**8 MB 是刻意挑的**：小到不值一提（本地盘上几十毫秒），
+    大到能撞上"配额只剩一点点"——那正是 2026-08-24 那次的形状（$HOME 配额约 500 MB，
+    已经快满）。真正的中间件是几 GB，探针不可能替它证明"装得下"，它只证明
+    **"现在还能不能写"**，而那一条恰恰是 df/quota 答不对的那条。"""
+
+    def batch_root_check(self) -> str:
+        """按下 Submit 前**真往落点写一个文件**。写得下 -> 空串；写不下 -> 挡路的原因。
+
+        为什么不能只看 `df` / `quota`：`mvp/redzone/relocate_and_rerun.sh` 记着实测 ——
+        「`df -h $HOME` 报的那个『可用』是误导，那是文件系统剩余，不是用户配额」，
+        两个都骗过人。而配额爆掉在 eWave 那一侧是**静默**的：写出 0 字节还照样打印
+        "done"，下一级读空文件才崩 —— 也就是说不实写，第一个知道出事的会是 35 分钟后
+        的 emsolver。
+
+        判据是**回读字节数**，不是"有没有抛异常"：配额满时 `write()` 常常不报错，
+        错误要到 `close()` 才出来，甚至干脆只留下一个短文件（这正是 0 字节 `resist.rst`
+        的来路）。所以写完必须 flush + 关闭 + `stat` 回读。
+
+        `batch_root_warning()` 是它的**前哨**（不落盘、每次重画都跑、只认已知有害的
+        位置）；这一条贵一点、只在按下去那一刻跑一次，但它是唯一说真话的那个。
         """
         try:
             root = os.path.abspath(os.path.expanduser(self.batch_root or DEFAULT_BATCH_ROOT))
-            tool = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-            if os.path.commonpath([root, tool]) != tool:
-                return ""
-        except (OSError, ValueError):  # pragma: no cover - 不同盘符 / 怪路径
+        except (OSError, ValueError):  # pragma: no cover - 怪路径
             return ""
-        return (
-            "Batch root is inside the tool's own directory (%s).\n"
-            "  A deploy moves anything it does not recognise into .deploy/backups/ and "
-            "rotation deletes it a few deploys later - results kept here can disappear.\n"
-            "  Next: point it somewhere outside, e.g. %s" % (tool, DEFAULT_BATCH_ROOT)
-        )
+        probe = os.path.join(root, ".ewb_write_probe")
+        written = -1
+        try:
+            os.makedirs(root, exist_ok=True)
+            # 探针文件**本工具自己命名**，只建它、只删它，绝不碰落点里别的东西。
+            with open(probe, "wb") as handle:
+                handle.write(bytes(self.PROBE_BYTES))
+                handle.flush()
+                os.fsync(handle.fileno())   # 配额错误常常要到这里才现身
+            written = os.stat(probe).st_size
+        except OSError as exc:
+            return (
+                "Cannot write to the batch root (%s): %s" % (root, exc) + _NL +
+                "  Nothing has been submitted. A run writes tens of GB here, so this is "
+                "checked before any job goes out." + _NL +
+                "  Next: pick a Batch root you can write to, e.g. %s" % DEFAULT_BATCH_ROOT
+            )
+        finally:
+            try:
+                os.remove(probe)
+            except OSError:  # pragma: no cover - 建都没建起来
+                pass
+        if written != self.PROBE_BYTES:
+            return (
+                "The batch root (%s) accepted a %d MB test write but only %d bytes "
+                "landed - that is a quota or a full filesystem."
+                % (root, self.PROBE_BYTES // (1024 * 1024), max(written, 0)) + _NL +
+                "  This is the failure that does NOT announce itself: eWave writes a "
+                "short file, still prints 'done', and the next stage crashes reading it "
+                "35 minutes later." + _NL +
+                "  Next: point Batch root at something with room, e.g. %s"
+                % DEFAULT_BATCH_ROOT
+            )
+        return ""
+
+    PROBE_BYTES = 8 * 1024 * 1024
+    """落点实写探针的大小。**8 MB 是刻意挑的**：小到不值一提（本地盘上几十毫秒），
+    大到能撞上"配额只剩一点点" —— 那正是 2026-08-24 那次的形状（$HOME 配额约 500 MB，
+    而且已经快满）。真正的中间件是几 GB，探针不可能替它证明"装得下"，它只证明
+    **"现在还能不能写"**，而那一条恰恰是 df/quota 答不对的那条。"""
+
+    def batch_root_check(self) -> str:
+        """按下 Submit 前**真往落点写一个文件**。写得下 -> 空串；写不下 -> 挡路的原因。
+
+        为什么不能只看 `df` / `quota`：`mvp/redzone/relocate_and_rerun.sh` 记着实测 ——
+        「`df -h $HOME` 报的那个『可用』是误导，那是文件系统剩余，不是用户配额」，
+        两个都骗过人。而配额爆掉在 eWave 那一侧是**静默**的：写出 0 字节还照样打印
+        "done"，下一级读空文件才崩 —— 不实写的话，第一个知道出事的会是 35 分钟后的
+        emsolver。
+
+        判据是**回读字节数**，不是"有没有抛异常"：配额满时 `write()` 常常不报错，
+        错误要到 `close()` / `fsync()` 才出来，甚至干脆只留下一个短文件（这正是
+        0 字节 `resist.rst` 的来路）。所以写完必须 flush + fsync + `stat` 回读。
+
+        `batch_root_warning()` 是它的**前哨**（不落盘、每次重画都跑、只认已知有害的
+        位置）；这一条贵一点、只在按下去那一刻跑一次，但它是唯一说真话的那个。
+        """
+        try:
+            root = os.path.abspath(os.path.expanduser(self.batch_root or DEFAULT_BATCH_ROOT))
+        except (OSError, ValueError):  # pragma: no cover - 怪路径
+            return ""
+        probe = os.path.join(root, ".ewb_write_probe")
+        written = -1
+        try:
+            os.makedirs(root, exist_ok=True)
+            # 探针文件**本工具自己命名**，只建它、只删它，绝不碰落点里别的东西。
+            with open(probe, "wb") as handle:
+                handle.write(bytes(self.PROBE_BYTES))
+                handle.flush()
+                os.fsync(handle.fileno())   # 配额错误常常要到这里才现身
+            written = os.stat(probe).st_size
+        except OSError as exc:
+            return (
+                "Cannot write to the batch root (%s): %s" % (root, exc) + _NL +
+                "  Nothing has been submitted. A run writes tens of GB here, so this is "
+                "checked before any job goes out." + _NL +
+                "  Next: pick a Batch root you can write to, e.g. %s" % DEFAULT_BATCH_ROOT
+            )
+        finally:
+            try:
+                os.remove(probe)
+            except OSError:  # pragma: no cover - 建都没建起来
+                pass
+        if written != self.PROBE_BYTES:
+            return (
+                "The batch root (%s) accepted a %d MB test write but only %d bytes "
+                "landed - that is a quota or a full filesystem."
+                % (root, self.PROBE_BYTES // (1024 * 1024), max(written, 0)) + _NL +
+                "  This is the failure that does NOT announce itself: eWave writes a "
+                "short file, still prints 'done', and the next stage crashes reading it "
+                "35 minutes later." + _NL +
+                "  Next: point Batch root at something with room, e.g. %s"
+                % DEFAULT_BATCH_ROOT
+            )
+        return ""
 
     def set_official_run_dir(self, path: str) -> None:
         """批次级的官方 run 目录（design 没写自己的就用它）。坐标从这里现场解析。
@@ -1733,6 +1882,12 @@ class GuiState:
                 "  Next: fill in 'Official run dir' at the top, or use 'Browse...' to pick "
                 "the design dir the official GUI already ran once (it contains gdsout_setup)."
             )
+        landing = self.batch_root_check()
+        if landing:
+            problems.append(landing)
+        landing = self.batch_root_check()
+        if landing:
+            problems.append(landing)
         duplicates = self._duplicate_designs()
         if duplicates:
             # ★ 这一条必须排在下面那条**前面**，而且排掉它。

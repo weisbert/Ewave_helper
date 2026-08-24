@@ -147,8 +147,12 @@ mkdir -p "$INCOMING" "$STAGING" "$BACKUPS"
 # 而人自然会 `cd <install>` 再起界面 => 跑出来的批次落在安装目录里面 => 下一次
 # 部署把它 `mv` 进 `.deploy/backups/<TS>/`，再 3 次部署之后轮转把它删掉。
 # 症状是"我的批次目录还在，但里面只剩新跑的那一批"。
-# 默认 batch_root 已经挪出安装目录（改成 `~/ewave_batches`），但**这一条不能撤**：
-# 老的安装里那个目录还在原地，而且谁都可以把 batch_root 指回来。
+# 2026-08-24 更新：默认 batch_root **就是** `<install>/ewave_batches`（用户拍板）。
+# 中间有一版把它挪到了 `~/ewave_batches`，那是过度修正 —— 红区 `$HOME` 有配额
+# （实测约 500 MB），而一个 run 的 mesh 中间件是几 GB，配额爆掉在 eWave 那侧是静默的
+# （0 字节文件 + 照样打印 "done"）。所以落点回到安装目录，而**保住它就全靠这里** ——
+# 下面 PRESERVE 这一行和 looks_like_batch_data() 现在是这批数据唯一的防线，
+# 不是"多一道保险"。改它们之前先看 tests/test_deploy.py 的端到端守卫。
 PRESERVE=(".deploy" "site.local.sh" "ewave_batches")
 if [[ -f "$DEPLOY/preserve.list" ]]; then
   while IFS= read -r _line || [[ -n "$_line" ]]; do

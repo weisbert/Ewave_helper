@@ -214,6 +214,7 @@ def _gui(
     modes: dict[str, FakeFailureMode] | None = None,
     corners: tuple[str, ...] = CORNERS,
     temps: tuple[str, ...] = TEMPERATURES,
+    env: dict[str, str] | None = None,
 ) -> tuple[GuiState, FakeRunner, FakeScheduler]:
     """走**界面那条路**造一个批次：勾选 → `GuiState` → `plan()`。
 
@@ -231,6 +232,7 @@ def _gui(
         scheduler=scheduler,
         runner=runner,
         discover=lambda _path: facts,
+        env=env,
     )
     # 只扫 corner x temperature：其余轴清空，好让 run_id 与手写表逐字对得上。
     bridge.set_axis_values("corner", corners)
@@ -2419,22 +2421,81 @@ class WhereBatchesLandIsVisibleAndSafe(_SmokeTest):
             elsewhere, here, "换个目录启动，批次就落到别处去了 —— 那正是 08-20 丢数据的第一环"
         )
 
-    def test_a_root_inside_the_tool_directory_is_flagged(self) -> None:
-        """落点指进程序自己的目录 -> 红字。部署会把那里的东西搬走并在几次之后删掉。"""
-        bridge, _runner, _sched = _gui(self.root)
-        tool = os.path.dirname(os.path.dirname(os.path.abspath(gui_state.__file__)))
-        bridge.set_batch_root(os.path.join(tool, "ewave_batches"))
+    # 落点的"哪里有害"这套判据 2026-08-24 翻过一次面，两个方向的事故各留一条：
+    #   * 安装目录  —— 08-20 被 deploy 轮转吃掉。现在**结构上**由 deploy.sh 保住
+    #     （`PRESERVE` + `looks_like_batch_data`，端到端守卫在 test_deploy.py），
+    #     所以它是默认落点、**不再报红**。
+    #   * `$HOME`   —— 08-24 撞红区配额（约 500 MB）。失败是静默的（0 字节 + 照样
+    #     打印 done），所以这一条必须报红，而且要在 Submit 前实写验一次。
+    # 两条方向相反，缺任何一条都会把用户推进另一个坑里 —— 08-20 那版就是只有前一条，
+    # 而它那句 "Next: e.g. ~/ewave_batches" 正是把人推去撞配额的那句话。
+
+    def _env_home(self, home: str) -> dict[str, str]:
+        """给 bridge 一个受控的 `$HOME`。Windows 上 `tempfile` 的临时目录本来就在
+        `%USERPROFILE%` 底下，不钉住它的话每个用例都会误触发 $HOME 那一条。"""
+        return {"HOME": home, "USERPROFILE": home}
+
+    def test_a_root_under_home_is_flagged(self) -> None:
+        """★ 2026-08-24 用户报的那条：落点落在 `$HOME` 底下 -> 红字。
+
+        红区 `$HOME` 有配额（实测约 500 MB），一个 run 的 mesh 中间件是几 GB。
+        而配额爆掉是**静默**的，所以这一条不能等到跑完才说。
+        """
+        fake_home = os.path.join(self.root, "home")
+        bridge, _runner, _sched = _gui(self.root, env=self._env_home(fake_home))
+        bridge.set_batch_root(os.path.join(fake_home, "ewave_batches"))
         warning = bridge.batch_root_warning()
-        self.assertIn("inside the tool", warning)
+        self.assertIn("$HOME", warning)
+        self.assertIn("quota", warning)
         self.assertIn("Next:", warning)
         self.assertTrue(all(ord(ch) < 128 for ch in warning), "红区 LANG 常是 C => 纯 ASCII")
 
-    def test_a_root_outside_is_not_flagged_negative(self) -> None:
-        """反向：正常落点不许报红 —— 逢开必红等于没报。"""
-        bridge, _runner, _sched = _gui(self.root)
-        self.assertEqual(bridge.batch_root_warning(), "", "临时目录也被判成程序目录了")
-        bridge.set_batch_root("~/ewave_batches")
+    def test_the_default_root_is_not_flagged_negative(self) -> None:
+        """★ 反向、而且是**承重**的一条：默认落点自己不许报红。
+
+        默认值就是 `<install>/ewave_batches`。它要是报红，用户唯一的"下一步"就是
+        把落点挪走 —— 08-20 那版正是这么把人挪进 `$HOME` 的。
+        """
+        fake_home = os.path.join(self.root, "home")
+        bridge, _runner, _sched = _gui(self.root, env=self._env_home(fake_home))
+        bridge.set_batch_root(gui_state.DEFAULT_BATCH_ROOT)
+        self.assertEqual(
+            bridge.batch_root_warning(), "", "默认落点自己在报红 —— 那等于让人无处可去"
+        )
         self.assertEqual(bridge.batch_root_warning(), "")
+
+    def test_a_root_under_the_deploy_dir_is_flagged(self) -> None:
+        """`<install>/.deploy/` 是部署自己的地盘，会轮转删 —— 落这儿要红。
+
+        安装目录整体不再报红之后，这一条是那个方向上**唯一**还剩的红字，
+        没有它「安装目录随便放」就变成真的随便放了。
+        """
+        fake_home = os.path.join(self.root, "home")
+        bridge, _runner, _sched = _gui(self.root, env=self._env_home(fake_home))
+        install = os.path.dirname(os.path.dirname(os.path.abspath(gui_state.__file__)))
+        bridge.set_batch_root(os.path.join(install, ".deploy", "backups"))
+        warning = bridge.batch_root_warning()
+        self.assertIn(".deploy", warning)
+        self.assertIn("Next:", warning)
+
+    def test_submit_is_blocked_when_the_landing_spot_cannot_be_written(self) -> None:
+        """★ 实写探针：`df` / `quota` 都骗过人，只有真写一个文件算数。
+
+        判据是 `preflight()` 拦住了，而不是"有没有打印一句话" —— 08-20 的教训就是
+        警告会滚过去。落点写不下时**一个 job 都不许出去**。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        # 落点的**父目录是个文件** -> `os.makedirs` 在 Windows 和 Linux 上都失败。
+        # 比挑一个“应该没权限”的绝对路径可移植：那种路径在红区未必真没权限。
+        blocker = os.path.join(self.root, "not_a_dir")
+        with open(blocker, "w", encoding="ascii") as handle:
+            handle.write("x")
+        bridge.set_batch_root(os.path.join(blocker, "batches"))
+        problems = bridge.preflight()
+        self.assertTrue(
+            any("batch root" in p.lower() for p in problems),
+            "落点根本写不下，preflight 却放行了：%r" % (problems,),
+        )
 
     def test_the_gui_shows_the_root_and_the_resolved_dir(self) -> None:
         """界面上既看得见 root（可改），也看得见拼出来的那个绝对路径。"""
@@ -2461,13 +2522,19 @@ class WhereBatchesLandIsVisibleAndSafe(_SmokeTest):
 
     def test_the_warning_shows_up_in_the_gui(self) -> None:
         """红字要真摆出来，不是只在 bridge 里返回一个字符串。"""
-        bridge, app = self._app()
-        self.assertFalse(app.broot_warn.winfo_manager(), "正常落点不该有红字")
-        tool = os.path.dirname(os.path.dirname(os.path.abspath(gui_state.__file__)))
-        app.broot.set(os.path.join(tool, "ewave_batches"))
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        fake_home = os.path.join(self.root, "home")
+        bridge, _runner, _sched = _gui(self.root, env=self._env_home(fake_home))
+        app = split.build_frame(root, bridge)._ewb_app
+        app.broot.set(gui_state.DEFAULT_BATCH_ROOT)
         app.recompute()
-        self.assertTrue(app.broot_warn.winfo_manager(), "指进程序目录了却没红")
-        self.assertIn("inside the tool", app.broot_warn.cget("text"))
+        self.assertFalse(app.broot_warn.winfo_manager(), "默认落点不该有红字")
+        app.broot.set(os.path.join(fake_home, "ewave_batches"))
+        app.recompute()
+        self.assertTrue(app.broot_warn.winfo_manager(), "落进 $HOME 了却没红")
+        self.assertIn("$HOME", app.broot_warn.cget("text"))
 
 
 if __name__ == "__main__":

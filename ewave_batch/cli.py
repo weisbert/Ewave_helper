@@ -892,8 +892,9 @@ def _add_planning_options(parser: argparse.ArgumentParser) -> None:
         "--batch-root",
         default="",
         metavar="DIR",
-        help="where batches land (default: batch_root: from the spec). "
-        "Never point this inside the designer spine.",
+        help="where batches land (default: batch_root: from the spec, "
+        "else <install>/ewave_batches). Never point this inside the designer "
+        "spine, and avoid $HOME - it is quota'd here and overrunning it is silent.",
     )
     parser.add_argument(
         "--batch-name",

@@ -111,15 +111,15 @@ EXIT_DIFF = 2
 EXIT_NO_BASELINE = 3
 """没能比对：OFFDIR 里没有 `run_ewave_*.sh`（或里面没有 ewave 那一行）。"""
 
-DEFAULT_BATCH_ROOT = "~/ewave_batches"
-"""与 `gui.state.DEFAULT_BATCH_ROOT` 同一个值 —— "我的批次落在哪"只许有一个答案。
-本模块只**算**路径、一个目录都不建（见 `--batch-root` 的帮助），
-但两处不一致的话，dry-run 预览出来的路径和真跑出来的就对不上。"""
-"""落点的默认根。**只用来算路径，一个目录都不会建。**
+DEFAULT_BATCH_ROOT = layout.default_batch_root()
+"""与 `gui.state.DEFAULT_BATCH_ROOT` 同一个值 —— 「我的批次落在哪」只许有一个答案，
+所以两边都从 `core.layout.default_batch_root()` 取（理由写在那儿）。
 
-刻意是相对路径：红区的绝对路径全是站点坐标，源码里不许有（硬约束 1b）。
-用户要落在别处就 `--batch-root`。
-"""
+本模块只**算**路径、一个目录都不建（见 `--batch-root` 的帮助），但两处不一致的话，
+dry-run 预览出来的路径就和真跑出来的对不上 —— 而 dry-run 存在的全部意义就是"先看准"。
+
+⚠️ 它是**绝对路径**，但不违反硬约束 1b：值由 `ewave_batch` 包自己的位置在运行时算出，
+仓库里没有任何一个字节的站点路径。（之前这里刻意写相对路径，代价是落点跟着 cwd 漂。）"""
 
 DEFAULT_BATCH_NAME = "dryrun"
 """默认批次名。真跑时由 spec 的 `batch_name:` 或时间戳决定，这里只是让路径成型。"""
