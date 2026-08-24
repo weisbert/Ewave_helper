@@ -2537,5 +2537,134 @@ class WhereBatchesLandIsVisibleAndSafe(_SmokeTest):
         self.assertIn("$HOME", app.broot_warn.cget("text"))
 
 
+class EachSubmitIsItsOwnBatch(_TempRootTest):
+    """★ 2026-08-24：New batch 必须**换一个身份**，不许接着往上一批的目录里写。
+
+    用户的模型是 Cadence ADE 那个 —— **跑一次就是一次新结果，旧的还在**。
+    原来不是：`reset()` 不动 `batch_name`，而名字就是目录名 ⇒
+    「跑完 -> New batch -> 再跑」把上一批的 `batch.json` 盖掉、新产物落在旧结果上。
+    连"留空 = 用时间戳现起一个"也躲不掉：名字在第一次 `plan()` 之后被烤进
+    `batch_name`，`reset()` 不清它就永远是第一次那个时间戳。
+
+    也就是说这个工具存在的理由（`<corner>_<temp>/` 静默覆盖）在**批次这一层**
+    被原样重造了一遍，而且这一层盖的是一整批、不是一个 run。
+    """
+
+    def test_new_batch_after_an_auto_named_batch_picks_a_fresh_name(self) -> None:
+        """留空起名的批次：New batch 之后必须落到**另一个**目录。
+
+        ⚠️ 本用例**不许 sleep**。时间戳只到秒（`model.TIMESTAMP_FORMAT`），而
+        「按完 New batch 马上按 Submit」正是最自然的操作 —— 一 sleep 就把这条
+        唯一会出事的路径测没了。第一版就是靠 sleep 才绿的，那是假绿。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_batch_name("")
+        bridge.plan()
+        first = bridge.batch_dir()
+        self.assertTrue(bridge.batch_name, "留空之后 plan() 没现起一个名字")
+        # 跑过了：磁盘上留下 batch.json，这才是"这个目录被占了"的判据。
+        os.makedirs(first, exist_ok=True)
+        with open(os.path.join(first, "batch.json"), "w", encoding="ascii") as h:
+            h.write("{}")
+        bridge.reset()
+        self.assertEqual(bridge.batch_name, "", "自动名没被清掉 -> 下一批还落在同一个目录")
+        bridge.plan()
+        self.assertNotEqual(
+            os.path.normcase(bridge.batch_dir()),
+            os.path.normcase(first),
+            "同一秒内 New batch + 再跑，落点没变 —— 上一批会被盖掉",
+        )
+
+    def test_new_batch_after_a_hand_typed_name_keeps_the_stem_and_adds_a_suffix(self) -> None:
+        """手打名的批次：保住词根、往后找第一个没被占的序号。
+
+        判据是"目录里有没有 `batch.json`"，不是"目录在不在" —— 一个同名空目录多半是
+        人自己建的，占着它的名字没道理。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_batch_name("mesh_sweep")
+        bridge.plan()
+        os.makedirs(bridge.batch_dir(), exist_ok=True)
+        with open(os.path.join(bridge.batch_dir(), "batch.json"), "w", encoding="ascii") as h:
+            h.write("{}")
+        bridge.reset()
+        self.assertEqual(bridge.batch_name, "mesh_sweep-2")
+
+    def test_a_name_the_gui_echoes_back_does_not_count_as_hand_typed(self) -> None:
+        """★ 最容易漏的一条：`push()` 每一拍把界面那一格写回 bridge。
+
+        界面上那一格是从 `batch_name` 同步的（`_ui` 里 plan 之后会灌回去），所以
+        `set_batch_name()` 会被**用自动起的名字**反复调用。要是那样就算"用户手打的"，
+        `_name_is_auto` 永远是 False，New batch 也就永远换不了身份 —— bug 原样还在。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_batch_name("")
+        bridge.plan()
+        generated = bridge.batch_name
+        bridge.set_batch_name(generated)      # <- push() 每一拍干的事
+        bridge.set_batch_name(generated)
+        bridge.reset()
+        self.assertEqual(bridge.batch_name, "", "回灌自己的名字被当成了用户手打")
+
+    def test_submitting_onto_an_existing_batch_is_refused(self) -> None:
+        """落点上已经有一个批次 -> preflight 拦住，**一个 job 都不发**。
+
+        `write_batch_state` 那一层是无条件原子覆盖（它必须是 —— 跑到一半每拍都要写），
+        所以拦只能拦在按下去之前。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_batch_name("occupied")
+        bridge.plan()
+        os.makedirs(bridge.batch_dir(), exist_ok=True)
+        with open(os.path.join(bridge.batch_dir(), "batch.json"), "w", encoding="ascii") as h:
+            h.write("{}")
+        problems = bridge.preflight()
+        self.assertTrue(
+            any("already a batch" in p for p in problems),
+            "落点上已经有一批了，preflight 却放行：%r" % (problems,),
+        )
+        blocked = [p for p in problems if "already a batch" in p]
+        self.assertIn("Next:", blocked[0])
+        self.assertTrue(all(ord(ch) < 128 for ch in blocked[0]), "红区 LANG 常是 C => 纯 ASCII")
+
+    def test_dry_run_is_not_blocked_by_an_existing_batch_negative(self) -> None:
+        """反向：dry-run 一个字节都不写 -> 不许被这条拦。
+
+        08-20 的教训就是"一次 dry-run 把界面锁死"。预览凭什么只能看一次。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_batch_name("occupied2")
+        bridge.plan()
+        os.makedirs(bridge.batch_dir(), exist_ok=True)
+        with open(os.path.join(bridge.batch_dir(), "batch.json"), "w", encoding="ascii") as h:
+            h.write("{}")
+        self.assertEqual(bridge.preflight(dry_run=True), [])
+
+    def test_the_gui_reloads_the_name_field_after_new_batch(self) -> None:
+        """★ 界面那一格必须跟着换。
+
+        `push()` 每一拍把它写回 bridge —— 不重灌就是把旧名字原样推回去，
+        New batch 又变回"接着往同一个目录里写"，而 bridge 那侧的修复看起来还是对的。
+        """
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        bridge, _runner, _sched = _gui(self.root)
+        app = split.build_frame(root, bridge)._ewb_app
+        app.batch.set("")            # 界面那一格才是真起点：`push()` 从它取值
+        app.recompute()
+        first = bridge.batch_name
+        self.assertTrue(first, "留空之后没现起一个名字")
+        # 跑过了 —— 没落过盘的名字重用本来就无害，那不是这条要守的东西。
+        os.makedirs(bridge.batch_dir(), exist_ok=True)
+        with open(os.path.join(bridge.batch_dir(), "batch.json"), "w", encoding="ascii") as h:
+            h.write("{}")
+        app.do_new_batch()
+        self.assertNotEqual(
+            app.batch.get(), first, "New batch 之后界面那一格还是旧名字"
+        )
+        self.assertEqual(app.batch.get(), bridge.batch_name, "界面和 bridge 的名字对不上")
+
+
 if __name__ == "__main__":
     unittest.main()

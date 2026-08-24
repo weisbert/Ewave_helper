@@ -3430,7 +3430,7 @@ class BaseApp:
                 pass
             self._timer = None
 
-    def _preflight_blocks(self, what: str) -> bool:
+    def _preflight_blocks(self, what: str, *, dry_run: bool = False) -> bool:
         """按下去之前先问一句"现在跑得成吗"。挡住了就弹框说清楚并返回 True。
 
         为什么值得多这一步：2026-08-20 用户漏填了官方 run 目录就按 Dry-run，
@@ -3440,7 +3440,7 @@ class BaseApp:
         与其让他从 6 条一模一样的失败里反推，不如在按下去的那一刻就说清楚，
         而且**不起 driver** —— 不起就不会留下一批假的 failed 结果。
         """
-        problems = self.bridge.preflight()
+        problems = self.bridge.preflight(dry_run=dry_run)
         if not problems:
             return False
         _error("Cannot %s yet" % what, (_NL + _NL).join(problems))
@@ -3461,7 +3461,7 @@ class BaseApp:
     def do_dry_run(self) -> None:
         """只拼命令、不提交（D8）。走的是**同一个 driver**，只是 options.dry_run=True。"""
         self.recompute()
-        if self._preflight_blocks("dry-run"):
+        if self._preflight_blocks("dry-run", dry_run=True):
             return
         try:
             self.bridge.start(dry_run=True)
@@ -3495,6 +3495,10 @@ class BaseApp:
         （否则那些 done / failed 会静默消失），所以要有一个明确的"我要重来一批"。
         """
         self.bridge.reset()
+        # ★ 必须把名字那一格重灌：`reset()` 会**换一个身份**（自动名清空重起，手打名
+        #   往后加序号），而 `push()` 每一拍把这一格写回 bridge —— 不灌就是把旧名字
+        #   原样推回去，New batch 又变回"接着往同一个目录里写"。
+        self.batch.set(self.bridge.batch_name)
         self._stop_timer()
         self.recompute()
 

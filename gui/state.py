@@ -617,6 +617,8 @@ class GuiState:
     ) -> None:
         self.batch_root = batch_root or DEFAULT_BATCH_ROOT
         self.batch_name = batch_name
+        self._name_is_auto = not str(batch_name).strip()
+        """当前这个批次名是**自动起的**（时间戳）还是**用户手打的**。见 `set_batch_name`。"""
         self.official_run_dir = official_run_dir
         self._default_submit_command = default_submit_command(env)
         """开局那条命令的出处：装了 `site.local.sh` 就是站点真实的那条，
@@ -753,10 +755,27 @@ class GuiState:
             self._plan_errors = {}
             self._dirty = False
             return
+        # 名字是 `spec_to_batch` 现起的时间戳（我们本来是空的）-> 记成"自动"。
+        # `reset()` 靠这一位决定：自动的直接清空重起一个，手打的往后加序号。
+        minted = not self.batch_name
+        self._name_is_auto = self._name_is_auto or minted
         state = spec_module.spec_to_batch(
             spec, batch_root=self.batch_root, tool_version=self._tool_version
         )
         self.batch_name = state.batch_name
+        if minted and self.existing_batch_at_landing():
+            # ★ **时间戳只到秒**（`model.TIMESTAMP_FORMAT`）。New batch 之后一秒内
+            #   再按一次，现起的名字和上一批逐字相同 -> 又落回同一个目录，
+            #   `reset()` 那一半的修复被这一下全抵消掉。而"按完 New batch 马上按
+            #   Submit"恰恰是最自然的操作。
+            #   所以自动名也要过一次占位检查 —— 判据是磁盘上有没有 `batch.json`，
+            #   跟手打名那条路同一个判据、同一个函数。
+            self.batch_name = self._next_free_batch_name()
+            state = spec_module.spec_to_batch(
+                replace(spec, batch_name=self.batch_name),
+                batch_root=self.batch_root,
+                tool_version=self._tool_version,
+            )
 
         contexts: dict[str, PlanContext] = {}
         for design in state.designs:
@@ -914,8 +933,18 @@ class GuiState:
     # 每一个都只碰内存里的选择，**不写盘、不提交**；改完置脏，下一次 plan() 才重算。
 
     def set_batch_name(self, name: str) -> None:
-        self.batch_name = str(name).strip()
-        self._invalidate()
+        """改批次名。**顺带记住这个名字是谁起的** —— `reset()` 要靠它决定怎么换身份。
+
+        判据是「值变了没有」，不是「有没有人调过本方法」：`plan()` 算出来的时间戳名字
+        会经 `_ui.push()` 每一拍回灌一次（界面那一格是从 `batch_name` 同步的），
+        每次都当成"用户手打的"，`_name_is_auto` 就永远是 False，New batch 也就永远
+        换不了身份 —— 那正是这次要修的 bug 本身。
+        """
+        cleaned = str(name).strip()
+        if cleaned != self.batch_name:
+            self._name_is_auto = not cleaned
+            self.batch_name = cleaned
+            self._invalidate()
 
     def set_batch_root(self, root: str) -> None:
         self.batch_root = str(root).strip() or DEFAULT_BATCH_ROOT
@@ -986,6 +1015,50 @@ class GuiState:
     大到能撞上"配额只剩一点点"——那正是 2026-08-24 那次的形状（$HOME 配额约 500 MB，
     已经快满）。真正的中间件是几 GB，探针不可能替它证明"装得下"，它只证明
     **"现在还能不能写"**，而那一条恰恰是 df/quota 答不对的那条。"""
+
+    def _next_free_batch_name(self) -> str:
+        """`<name>` 已经被占了就找 `<name>-2` / `<name>-3`… 第一个空位。
+
+        「被占」= 那个目录**已经是一个批次**（里面有 `batch.json`）。仅仅存在一个同名
+        空目录不算 —— 那多半是人自己建来放东西的，占着它的名字没有道理。
+        `_LOOP_CAP` 只是个防呆上限：真到 999 个同名批次，说明词根本身该换了。
+        """
+        base = self.batch_name.strip()
+        if not base:
+            return ""
+        try:
+            root = os.path.abspath(os.path.expanduser(self.batch_root or DEFAULT_BATCH_ROOT))
+        except (OSError, ValueError):  # pragma: no cover - 怪路径
+            return base
+
+        def taken(name: str) -> bool:
+            return os.path.isfile(os.path.join(root, name, layout_module.BATCH_JSON_NAME))
+
+        if not taken(base):
+            return base
+        for suffix in range(2, 1000):
+            candidate = "%s-%d" % (base, suffix)
+            if not taken(candidate):
+                return candidate
+        return base  # pragma: no cover - 999 个同名批次
+
+    def existing_batch_at_landing(self) -> str:
+        """落点上**已经有一个批次**了 -> 它的名字；没有 -> 空串。
+
+        判据是 `<batch_dir>/batch.json` 在不在。给 `preflight()` 用：新提交一批**不许**
+        盖在别人身上，而 `write_batch_state` 那一层是无条件原子覆盖（它必须是 ——
+        跑到一半每拍都要写），所以拦只能拦在按下去之前。
+
+        ⚠️ 这条**只挡新提交**，不挡 resume：resume 存在的全部意义就是读那个 `batch.json`。
+        """
+        try:
+            path = os.path.join(
+                os.path.abspath(os.path.expanduser(self.batch_dir())),
+                layout_module.BATCH_JSON_NAME,
+            )
+        except (OSError, ValueError):  # pragma: no cover - 怪路径
+            return ""
+        return self.batch_name or "<batch>" if os.path.isfile(path) else ""
 
     def batch_root_check(self) -> str:
         """按下 Submit 前**真往落点写一个文件**。写得下 -> 空串；写不下 -> 挡路的原因。
@@ -1859,7 +1932,7 @@ class GuiState:
         """
         return self._driver is not None and not self._dry_run_only
 
-    def preflight(self) -> list[str]:
+    def preflight(self, *, dry_run: bool = False) -> list[str]:
         """现在按下去能不能跑得成 —— 返回**挡路的原因**（空 list = 可以跑）。
 
         为什么要有这一步而不是"跑起来再说"：漏填官方 run 目录时，每一个 run 都会在
@@ -1882,9 +1955,24 @@ class GuiState:
                 "  Next: fill in 'Official run dir' at the top, or use 'Browse...' to pick "
                 "the design dir the official GUI already ran once (it contains gdsout_setup)."
             )
-        landing = self.batch_root_check()
-        if landing:
-            problems.append(landing)
+        if not dry_run:
+            # ★ 落点这两条只在**真提交**时问：dry-run 一个字节都不写，
+            #   拿"这儿已经有一批了"去拦一次预览是假的，而实写探针还会**建出**
+            #   batch root —— dry-run 不许有落盘副作用。
+            landing = self.batch_root_check()
+            if landing:
+                problems.append(landing)
+            occupied = self.existing_batch_at_landing()
+            if occupied:
+                problems.append(
+                    "There is already a batch at %s." % self.batch_dir() + _NL +
+                    "  Submitting would overwrite its batch.json and drop new results on "
+                    "top of the old ones - the same silent overwrite this tool exists to "
+                    "prevent, one level up." + _NL +
+                    "  Next: File -> New batch (it picks a fresh name), or Batch -> "
+                    "Rename... to name this one yourself. To finish the existing batch "
+                    "instead, use Runs -> Re-run failed only."
+                )
         landing = self.batch_root_check()
         if landing:
             problems.append(landing)
@@ -1948,7 +2036,29 @@ class GuiState:
         return [key for key, count in seen.items() if count > 1]
 
     def reset(self) -> None:
-        """New batch：把上一次的 driver / 状态 / 事件丢掉，**保留界面上的勾选**。"""
+        """New batch：丢掉上一次的 driver / 状态 / 事件，**保留勾选**，**换一个身份**。
+
+        ★ 2026-08-24 修的 bug：原来这里不动 `batch_name`，而名字就是目录名 ⇒
+        「跑完 -> New batch -> 再跑」写进的是**同一个** `batch_dir`，上一批的
+        `batch.json` 被盖掉、run_id 撞上的产物直接落在旧结果上。
+        连"留空 = 用时间戳现起一个"这条路也一样：名字在第一次 `plan()` 之后就被烤进
+        `batch_name` 了，`reset()` 不清它就永远是第一次那个时间戳。
+
+        这正是本工具存在的理由（`<corner>_<temp>/` 静默覆盖，见 CLAUDE.md 三行心智模型）
+        在**批次这一层**原样重造了一遍 —— 而且更贵：那一层盖的是一个 run，这一层盖的是一批。
+
+        用户要的模型是 Cadence ADE 那个：**跑一次就是一次新结果，旧的还在**
+        （2026-08-24 原话）。所以：
+
+        * 名字是自动起的 -> 清空，下一次 `plan()` 现起一个新时间戳；
+        * 名字是用户手打的 -> 保住那个词根，往后找第一个没被占的 `-2` / `-3`…
+          （不是拒绝：New batch 是个明确的"我要重来一批"动作，在这儿弹框问名字
+          等于让人给每一批想名字。改名的路照旧在 Batch -> Rename。）
+
+        两条都会改 `batch_name`，所以**调用方必须把界面那一格重灌一次** ——
+        `_ui.push()` 每一拍把那一格写回 bridge，不灌就是把旧名字又推了回来。
+        """
+        self.batch_name = "" if self._name_is_auto else self._next_free_batch_name()
         self._dry_run_only = True
         self._driver = None
         self._result_state = None
