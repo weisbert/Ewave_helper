@@ -2965,5 +2965,189 @@ class HistoryPickerIsWiredUp(_SmokeTest):
         )
 
 
+class LastSettingsComeBackOnTheNextStart(_TempRootTest):
+    """★ 用户 2026-08-24：「load 过一次，相关的设置就保存在本地，下次启动不用再 load」。
+
+    ⚠️ 本组同时守着一条**反向**的界线：存的只有**设定**（designs / 轴 / 组 /
+    官方目录的**路径** / 落点），**绝不存**从官方目录解析出来的坐标。
+
+    为什么这条不能松：站点级那批（ptxt / PDK 根 / key / Donau 三元组 / 工具路径）
+    缓存了顶多是过期；但 **per-design 的端口表缓存不得** —— 端口映射不在 `.sNp` 里，
+    在命令行里，靠 `-p` 的顺序（CLAUDE.md 三行心智模型第一条）。设计师改一次版图
+    加个端口，缓存里还是老表 ⇒ `-p` 错位 ⇒ **`.sNp` 每一位的含义都错了，
+    而且跑得出来、数字也像**。那正是本工具要消灭的那类静默错误。
+
+    而解析一次约 10 ms、还按目录缓存在内存里 —— 省的那点时间不值得拿它换。
+    """
+
+    def _env(self) -> dict[str, str]:
+        return {"EWB_SESSION": os.path.join(self.root, "session.local.json")}
+
+    def test_settings_survive_a_restart(self) -> None:
+        """★ 承重：存一次，新开一个 bridge 就能直接展开矩阵，不用再 Browse。"""
+        env = self._env()
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_axis_values("temperature", ("-40", "55", "125"))
+        bridge.set_batch_name("mesh_sweep")
+        bridge.plan()
+        before = len(bridge.runs())
+        self.assertTrue(bridge.save_session(env=env), "没存下来")
+
+        fresh = GuiState(batch_root=bridge.batch_root, env=env, discover=bridge._discover)
+        self.assertEqual(len(fresh.designs()), 0, "这个用例要的是一个全新的 bridge")
+        self.assertTrue(fresh.load_session(env=env), "没读回来")
+        self.assertEqual(len(fresh.designs()), len(bridge.designs()))
+        self.assertTrue(fresh.official_run_dir, "顶上那格是空的 —— 那就还得再 Browse 一次")
+        fresh.plan()
+        self.assertEqual(len(fresh.runs()), before, "读回来之后矩阵对不上")
+
+    def test_the_session_file_holds_no_discovered_coordinates(self) -> None:
+        """★ 界线：文件里**只有设定**，一个解析出来的坐标都没有。
+
+        判据挑的是**端口表**（`official_port_spec` / 端口名），因为它是那批里
+        缓存代价最高的一个 —— 错了会静默地把 `.sNp` 每一位的含义都换掉。
+        """
+        env = self._env()
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.plan()
+        path = bridge.save_session(env=env)
+        text = open(path, encoding="utf-8").read()
+
+        facts = bridge._facts_for(bridge.designs()[0])
+        self.assertTrue(facts.official_port_spec.mapping, "这个用例要的是一份解析出了端口的 facts")
+        for _port_id, pin in facts.official_port_spec.mapping:
+            self.assertNotIn(pin, text, "端口名进了会话文件 —— 缓存端口表 = .sNp 静默错位")
+        for value, label in (
+            (facts.ptxt, "ptxt"),
+            (facts.key, "key"),
+            (facts.dsub_queue, "dsub queue"),
+            (facts.ewave_bin, "ewave path"),
+        ):
+            if value:
+                self.assertNotIn(value, text, "%s 进了会话文件" % label)
+        # 反向：设定**必须**在里面，否则这条会因为"文件是空的"而假绿。
+        self.assertIn(bridge.designs()[0].cell, text, "设定没进去")
+
+    def test_an_auto_generated_batch_name_is_not_saved(self) -> None:
+        """自动名是个时间戳，存下来明天开机会变成 `...-2` 这种词根 —— 那不是名字。"""
+        env = self._env()
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_batch_name("")
+        bridge.plan()
+        self.assertTrue(bridge.batch_name, "这个用例要的是一个自动起的名字")
+        bridge.save_session(env=env)
+        fresh = GuiState(env=env)
+        fresh.load_session(env=env)
+        self.assertEqual(fresh.batch_name, "", "自动名被存成了下一批的词根")
+
+    def test_a_hand_typed_batch_name_is_saved_negative(self) -> None:
+        """反向：手打的名字要留住 —— 否则上一条会退化成"批次名一律不存"。"""
+        env = self._env()
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_batch_name("mesh_sweep")
+        bridge.save_session(env=env)
+        fresh = GuiState(env=env)
+        fresh.load_session(env=env)
+        self.assertEqual(fresh.batch_name, "mesh_sweep")
+
+    def test_a_name_from_the_file_survives_the_next_submit(self) -> None:
+        """★ 文件里写着的名字**是人起的** —— 下一次 Submit 不许把它丢掉换成时间戳。
+
+        根因是 `_apply_spec` 直接赋值 `batch_name` 而没更新 `_name_is_auto`。
+        那一位停在 True 的后果有两个，都很隐蔽：用户起的名字在下一次提交时消失；
+        以及「上次那份设定」存/读不幂等（存的时候按"自动名不存"把它丢了，再存又出现）。
+        """
+        env = self._env()
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_batch_name("mesh_sweep")
+        bridge.save_session(env=env)
+
+        fresh = GuiState(batch_root=bridge.batch_root, env=env, discover=bridge._discover)
+        fresh.load_session(env=env)
+        fresh.start(dry_run=False)
+        _drive_gui(fresh)
+        self.assertEqual(fresh.viewing(), "mesh_sweep", "读回来之后名字被当成自动名丢了")
+
+    def test_a_broken_session_file_is_ignored_not_fatal(self) -> None:
+        """读坏了一律当没有。一份读不了的状态文件不该让 GUI 起不来。"""
+        env = self._env()
+        with open(env["EWB_SESSION"], "w", encoding="ascii") as handle:
+            handle.write("{ this is not json")
+        fresh = GuiState(env=env)
+        self.assertFalse(fresh.load_session(env=env))
+        self.assertEqual(len(fresh.designs()), 0)
+
+    def test_missing_session_file_is_not_an_error(self) -> None:
+        """第一次用（文件还不存在）→ False，不抛。"""
+        fresh = GuiState(env=self._env())
+        self.assertFalse(fresh.load_session(env=self._env()))
+
+    def test_saving_into_an_unwritable_place_does_not_raise(self) -> None:
+        """存不下不是错误 —— 代价只是下次要重填一次，那本来就是加这功能前的常态。"""
+        blocker = os.path.join(self.root, "not_a_dir")
+        with open(blocker, "w", encoding="ascii") as handle:
+            handle.write("x")
+        env = {"EWB_SESSION": os.path.join(blocker, "session.local.json")}
+        bridge, _runner, _sched = _gui(self.root)
+        self.assertEqual(bridge.save_session(env=env), "")
+
+    def test_the_round_trip_is_idempotent(self) -> None:
+        """★ 存 -> 读 -> 存，两份文件逐字相同，而且矩阵不许变大。
+
+        2026-08-24 抓到的一个**静默翻倍**（`Save spec as...` -> `Open spec` 本来就有，
+        自动会话让它每次开机都发生一遍）：取消勾选 `fullWave` 之后它没有取值
+        ⇒ 不进 spec ⇒ 读回来时被填回内置默认的 `off, on` ⇒ 12 个 run 变 24 个，
+        而界面上看起来只是"打开了刚存的那份"。一个 run 是 10 核 / 100 GB / 35 分钟。
+
+        判据两条都要：只比 run 数，"两根轴各丢一个值"这种也会绿；只比文件，
+        矩阵变了而文件恰好也变了同样绿。
+        """
+        env = self._env()
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.plan()
+        before = len(bridge.runs())
+        first = open(bridge.save_session(env=env), encoding="utf-8").read()
+
+        fresh = GuiState(batch_root=bridge.batch_root, env=env, discover=bridge._discover)
+        fresh.load_session(env=env)
+        fresh.plan()
+        self.assertEqual(len(fresh.runs()), before, "读回来矩阵变了 —— 那是白跑的 run")
+        second = open(fresh.save_session(env=env), encoding="utf-8").read()
+        self.assertEqual(first, second, "存->读->存 不幂等")
+
+    def test_an_axis_the_user_emptied_stays_empty(self) -> None:
+        """★ 上一条的根因，单独钉住：**spec 没写的轴 = 空**，不是"给他补个默认值"。
+
+        补的那一下是在替用户做他没做的决定，而"轴没有取值"本来就有明确语义 ——
+        不扫这根轴（那个 flag 仍然取学到的默认值）。
+        """
+        env = self._env()
+        bridge, _runner, _sched = _gui(self.root)
+        self.assertEqual(
+            [a.name for a in bridge.axes() if a.name == "fullWave"], [], "_gui 应该已经清空它"
+        )
+        bridge.save_session(env=env)
+        fresh = GuiState(batch_root=bridge.batch_root, env=env, discover=bridge._discover)
+        fresh.load_session(env=env)
+        self.assertEqual(
+            [a.name for a in fresh.axes() if a.name == "fullWave"],
+            [],
+            "被清空的轴自己填回了默认值",
+        )
+
+    def test_the_file_is_json_even_when_pyyaml_is_installed(self) -> None:
+        """★ 固定 JSON。装了 PyYAML 时默认分支会把 YAML 写进 `.json` ——
+        而 `load_spec` 按扩展名走 JSON 解析，当场炸（"自己写的文件自己读不回来"）。
+        """
+        env = self._env()
+        bridge, _runner, _sched = _gui(self.root)
+        path = bridge.save_session(env=env)
+        self.assertTrue(path.endswith(".json"), "落点换了扩展名，开机就找不着它了")
+        import json
+
+        with open(path, encoding="utf-8") as handle:
+            json.load(handle)     # 炸了就是这条要抓的东西
+
+
 if __name__ == "__main__":
     unittest.main()

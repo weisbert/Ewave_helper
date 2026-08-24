@@ -153,7 +153,11 @@ mkdir -p "$INCOMING" "$STAGING" "$BACKUPS"
 # （0 字节文件 + 照样打印 "done"）。所以落点回到安装目录，而**保住它就全靠这里** ——
 # 下面 PRESERVE 这一行和 looks_like_batch_data() 现在是这批数据唯一的防线，
 # 不是"多一道保险"。改它们之前先看 tests/test_deploy.py 的端到端守卫。
-PRESERVE=(".deploy" "site.local.sh" "ewave_batches")
+# `session.local.json` = 界面自动存的「上次那份设定」（2026-08-24 加）。它和
+# site.local.sh 同一类：装好之后才产生、包里没有、被搬走就是静默丢失 ——
+# 症状是用户开机发现 designs / 官方目录 / 勾选全空了，而"自动保存"这个功能
+# 恰恰是为了让他不必再填一次。
+PRESERVE=(".deploy" "site.local.sh" "session.local.json" "ewave_batches")
 if [[ -f "$DEPLOY/preserve.list" ]]; then
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     _line="${_line%%#*}"

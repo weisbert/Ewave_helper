@@ -896,7 +896,7 @@ def dump_spec(spec: BatchSpec, *, as_json: bool | None = None) -> str:
     return header + body
 
 
-def save_spec(spec: BatchSpec, path: str) -> str:
+def save_spec(spec: BatchSpec, path: str, *, as_json: bool | None = None) -> str:
     """把 spec 写到 `path`（**原子写**：同目录临时文件 + `os.replace`）。**返回真正写到的路径。**
 
     ## 为什么返回路径而不是文本
@@ -908,13 +908,20 @@ def save_spec(spec: BatchSpec, path: str) -> str:
 
     调用方要文本的话自己 `dump_spec`。
 
+    `as_json=True` 强制出 JSON 并**不再改扩展名**。给的是"这个文件必须是 JSON"这种
+    调用方用的（GUI 那份 `session.local.json` 就是）：它按固定名字去找，
+    换扩展名就等于换了个文件；而这台机器装着 PyYAML 时，默认分支会把 YAML 内容
+    写进一个 `.json` 里 —— `load_spec` 按扩展名走 JSON 解析，当场炸。
+    正是本函数上面那条"自己写的文件自己打不开"，只是方向相反。
+
     原子写的理由和 `batch.json` 一样：写到一半断电或磁盘满，不能留半份 spec ——
     半份 YAML 读回来要么报错、要么**语义不同**，后者更坏。
     """
     target = str(path)
-    as_json = not have_yaml()
-    if as_json and os.path.splitext(target)[1].lower() in (".yaml", ".yml"):
-        target = os.path.splitext(target)[0] + ".json"
+    if as_json is None:
+        as_json = not have_yaml()
+        if as_json and os.path.splitext(target)[1].lower() in (".yaml", ".yml"):
+            target = os.path.splitext(target)[0] + ".json"
     text = dump_spec(spec, as_json=as_json)
     directory = os.path.dirname(os.path.abspath(target)) or "."
     os.makedirs(directory, exist_ok=True)

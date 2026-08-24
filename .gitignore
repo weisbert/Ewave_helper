@@ -20,6 +20,11 @@ gdsout_setup*
 # 站点坐标（真实内网路径）—— 模板 site.example.sh 进 git，实际值不进
 site.local.sh
 
+# 界面自动存的「上次那份设定」（library / cell / view / 官方 run 目录路径）——
+# 全是站点标识符（硬约束 1b）。只存设定、不存解析出来的坐标，理由见
+# gui.state.GuiState.save_session。deploy.sh 的 PRESERVE 保着它不被升级吃掉。
+session.local.json
+
 # 构建产物
 mvp/mvp_pack.sh
 mvp/dist/

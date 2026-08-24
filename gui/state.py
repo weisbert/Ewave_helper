@@ -82,6 +82,19 @@ DEFAULT_BATCH_ROOT = layout_module.default_batch_root()
 （`batch_root_warning()`）。**绝不会指进设计师的 spine**（硬约束 4；真落盘前
 还有 `core.layout` 的 `_assert_outside_spine` 兜底）。"""
 
+SESSION_NAME = "session.local.json"
+"""上次那份设定存在哪（装机目录下，与 `site.local.sh` 同一层）。
+
+**`.local.` 是承重的**：里面装着 library / cell / view / 官方 run 目录 ——
+全是站点标识符（CLAUDE.md 硬约束 1b）。`.gitignore` 挡着它，`deploy.sh` 的
+`PRESERVE` 保着它（不保的话一次升级就把用户的设定搬进 `.deploy/backups/` 再轮转删掉，
+和 2026-08-20 那次批次结果一模一样的形状）。
+
+**固定 JSON，不跟着 PyYAML 走。** `save_spec` 会在没有 PyYAML 时把扩展名换成
+`.json`，于是"存在哪"变成两个答案，而开机要去找的那个必须只有一个。
+YAML 是给人写的（`Save spec as...` 那条路），这份是机器状态。
+"""
+
 CORNER_VALUES: tuple[str, ...] = ("cbest", "cworst", "rcbest", "rcworst", "typical")
 """5 个工艺角的通用名字（BRIEF §10 用户给的轴清单）。**不是站点身份** ——
 它们是 PDK 通用词汇，真正的站点坐标是 ptxt 的路径，那个由 `core.discover` 现场解析。"""
@@ -253,6 +266,9 @@ SITE_LOCAL_NAME = "site.local.sh"
 沿用 `mvp/mvp_pack.sh` 已经在用的那个名字和 `KEY=value` 格式，一台机器只需要一份。
 红区那边它在装机目录根下，`deploy.sh` 把它列进 `PRESERVE` ⇒ 每次升级都留着。"""
 
+SESSION_ENV = "EWB_SESSION"
+"""指定上次那份设定存哪的环境变量。见 `session_path`。"""
+
 SITE_LOCAL_ENV = "EWB_SITE_LOCAL"
 """显式指一份 site.local.sh（给 doctor / 测试用）。给了就**只**认它，不再往下找。"""
 
@@ -328,6 +344,20 @@ def site_local_path(env: Mapping[str, str] | None = None) -> str:
         if os.path.isfile(candidate):
             return candidate
     return ""
+
+
+def session_path(env: Mapping[str, str] | None = None) -> str:
+    """上次那份设定的落点。**装机目录下**，与 `site.local.sh` 同一层。
+
+    `$EWB_SESSION` 可以指到别处（测试和"我不想让它记"都用得上；指到一个不可写的
+    地方最多是存不下，见 `GuiState.save_session`）。刻意**不**跟着 cwd 走：
+    从哪个目录起界面都该看到同一份设定，那正是这个功能存在的意义。
+    """
+    environ: Mapping[str, str] = os.environ if env is None else env
+    explicit = str(environ.get(SESSION_ENV, "")).strip()
+    if explicit:
+        return explicit
+    return os.path.join(layout_module.install_root(), SESSION_NAME).replace(chr(92), "/")
 
 
 def default_submit_command(env: Mapping[str, str] | None = None) -> str:
@@ -768,9 +798,25 @@ class GuiState:
         self._extra_text = " ".join(_render_flag_token(k, v) for k, v in spec.extra_flags.items())
         self._default_overrides = dict(spec.defaults)
         self._options = spec.options
+        # 批次级的官方 run 目录不在 `BatchSpec` 里（那是 per-design 字段）。
+        # 顶上那一格是"没写自己那份的 design 用哪个"，读 spec 时从第一个有值的
+        # design 认领回来 —— 否则 Load 完之后那格是空的，而矩阵其实是能展开的，
+        # 界面看起来像"坐标丢了"。
+        if not self.official_run_dir:
+            self.official_run_dir = next(
+                (d.official_run_dir for d in spec.designs if d.official_run_dir), ""
+            )
         if take_identity:
             if spec.batch_name:
                 self.batch_name = spec.batch_name
+                # ★ 文件里写着的名字**是人起的**（不管是手打的还是上一次会话存下来的），
+                #   所以 `_name_is_auto` 必须跟着变 False。这里从前是直接赋值、
+                #   绕过 `set_batch_name`，于是那一位停在构造时的 True：
+                #   * Load 一份叫 `mesh_sweep` 的 spec，下一次 Submit 会把名字丢掉、
+                #     改用时间戳 —— 用户起的名字没了；
+                #   * 「上次那份设定」存/读不幂等（存的时候按"自动名不存"丢掉它，
+                #     再存又出现，两份文件不一样）。
+                self._name_is_auto = False
             if spec.batch_root:
                 self.batch_root = spec.batch_root
         self._invalidate()
@@ -2677,6 +2723,73 @@ class GuiState:
         """公开版本 —— 「Save」按钮把它写出去（写盘由调用方做）。"""
         return self._spec_snapshot()
 
+    # ==================================================== 上次那份设定（自动存 / 自动读）
+    # ★ 用户 2026-08-24：「load 过一次，相关的设置就保存在本地，下次启动不用再 load」。
+    #
+    #   ⚠️ 存的是**设定**（designs / 轴 / 组 / 官方目录**路径** / 落点），
+    #      **绝不是**从官方目录解析出来的坐标。这条界线不能含糊：
+    #
+    #      站点级那批（ptxt 路径、PDK 根、key、Donau 三元组、工具路径、默认 flag 表）
+    #      缓存了顶多是过期；但 **per-design 的端口表缓存不得** ——
+    #      端口映射不在 `.sNp` 里，在命令行里，靠 `-p` 的顺序（CLAUDE.md 三行心智模型）。
+    #      设计师改一次版图加个端口，缓存里还是老表 ⇒ `-p` 错位 ⇒ **`.sNp` 每一位的
+    #      含义都错了，而且跑得出来、数字也像**。那正是本工具要消灭的那类静默错误。
+    #
+    #      而解析一次只要约 10 ms、还按目录缓存在 `_facts` 里 —— 省下来的那点时间
+    #      根本不值得拿它换。所以：**记住路径，内容每次现读。**
+
+    def save_session(self, *, env: Mapping[str, str] | None = None) -> str:
+        """把当前设定存成"上次那份"。返回写到的路径；存不下 → 空串（**不抛**）。
+
+        存不下不是错误：装机目录只读、盘满、没权限 —— 任何一种都不该让界面弹框，
+        更不该让人没法继续干活。代价只是下次开机要重新填一次，而那正是加这个功能
+        之前的常态。
+
+        批次名只在**用户手打过**的时候才存。自动名是个时间戳，存下来明天开机会变成
+        `batch_20260824_032116-2` 这种词根 —— 那不是名字，是垃圾。
+        """
+        spec = self._spec_snapshot()
+        if self._name_is_auto:
+            spec = replace(spec, batch_name="")
+        # 官方 run 目录：批次级那一格不在 `BatchSpec` 里（它是 per-design 字段），
+        # 所以给没写自己那份的 design 补上 —— 否则读回来时顶上那格是空的，
+        # 而"不用再 load"这件事恰恰全靠它。
+        if self.official_run_dir:
+            spec = replace(
+                spec,
+                designs=[
+                    d if d.official_run_dir else replace(d, official_run_dir=self.official_run_dir)
+                    for d in spec.designs
+                ],
+            )
+        path = session_path(env if env is not None else self._env)
+        try:
+            return spec_module.save_spec(spec, path, as_json=True)
+        except (OSError, EwaveBatchError):
+            return ""
+
+    def load_session(self, *, env: Mapping[str, str] | None = None) -> bool:
+        """把"上次那份"读回来。读到了 → True；没有 / 读坏了 → False（**不抛**）。
+
+        读坏了一律当没有：一份读不了的状态文件不该让 GUI 起不来，而"开局是空的"
+        本来就是合法状态（同 `site.local.sh` 那条规矩）。
+
+        ⚠️ **只在开局调**。中途调会把用户手上正在编辑的设定冲掉，
+        而它看起来只是"界面刷新了一下"。
+        """
+        path = session_path(env if env is not None else self._env)
+        if not os.path.isfile(path):
+            return False
+        try:
+            self.load_spec(path)
+        except (OSError, EwaveBatchError):
+            return False
+        # 这份是**状态**不是用户的工程文件：留着 `source_path` 会让
+        # 「Save spec as...」把它当成"当前打开的那个 spec"，而它不是。
+        if self._spec is not None:
+            self._spec = replace(self._spec, source_path="", source_sha256="")
+        return True
+
     def _facts_for(self, design: Design) -> SiteFacts:
         """这个 design 的站点坐标。解析不了 → 空 `SiteFacts` + 一条 note。
 
@@ -2762,8 +2875,25 @@ class GuiState:
 
     # ---- spec → 界面勾选 -------------------------------------------------
     def _selection_from_axes(self, axes: Sequence[Axis]) -> dict[str, tuple[str, ...]]:
-        """spec 里的轴 → 界面勾选。spec 没写的轴保持界面上原来的值。"""
-        selection = dict(self._selection)
+        """spec 里的轴 → 界面勾选。**spec 没写的轴 = 空**，不是"保持界面上原来的值"。
+
+        ★ 2026-08-24 修的一个静默翻倍。原来这里从 `dict(self._selection)` 起步，
+        也就是把文件和界面**混合**起来 —— 而 `load_spec` 自己的契约写的是
+        「用户按了 Load，界面就该显示文件里的东西，而不是两者的混合」。两处注释互相矛盾，
+        对的是 `load_spec` 那句。
+
+        症状：把 `fullWave` 取消勾选（于是它没有取值 ⇒ `_axes_and_groups` 不把它
+        写进 spec ⇒ 文件里根本没有这根轴）⇒ Open 回来时它被填回内置默认的
+        `off, on` 两个值 ⇒ **矩阵从 12 个 run 变成 24 个**，而界面上看起来只是
+        "打开了刚存的那份"。一个 run 是 10 核 / 100 GB / 35 分钟，那是 12 个白跑的。
+
+        存/读必须是**幂等**的：存一份、读回来、再存一份，两份文件要逐字相同。
+        这一条在「上次那份设定」自动读进来之后更要紧 —— 它每次开机都跑一遍。
+
+        「轴没有取值」的语义本来就是**不扫这根轴**（那个 flag 仍然取学到的默认值），
+        不是"没配过、给他补一个"。补的那一下正是在替用户做他没做的决定。
+        """
+        selection = {name: () for name in self._selection}
         for axis in axes:
             if set(axis.flags) & set(SWEEP_AXIS_FLAGS):
                 # 扫频轴由 `_sweep_from_axes` 拆成那四个格子。按 **flag** 认而不是按名字认：

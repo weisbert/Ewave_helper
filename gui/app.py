@@ -83,6 +83,18 @@ def launch(layout: str = "split") -> int:
         from .state import GuiState
 
         bridge = GuiState()
+        # ★ 上次那份设定（用户 2026-08-24：「load 过一次，下次启动不用再 load」）。
+        #   **在 build_frame 之前**：界面变量是建控件时从 bridge 灌的，
+        #   读晚一步就得再走一遍整份重灌，而那条路（`_init_vars_from_bridge`）
+        #   是给 Open spec 用的、有它自己的时机。
+        #   读不到 / 读坏了一律当没有，界面照常起来 —— 一份坏掉的状态文件
+        #   不该让人没法干活（同 `site.local.sh` 那条规矩）。
+        #   ⚠️ 存的只有**设定**，官方目录里的坐标（尤其端口表）每次现读，
+        #      理由写在 `GuiState.save_session` 上。
+        if not smoke:
+            # 冒烟不读：那会让自检的结果取决于这台机器上恰好留着什么设定，
+            # 而自检要证明的是"控件树建得起来"。
+            bridge.load_session()
         frame = frame_module.build_frame(root, bridge)
         frame.pack(fill="both", expand=True)
         if smoke:

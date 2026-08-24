@@ -1250,7 +1250,7 @@ class BaseApp:
         "add_design", "del_design", "dup_design", "on_design_edit",
         # 批次 / 运行
         "do_submit", "do_dry_run", "do_cancel", "do_resume", "do_new_batch",
-        "on_showing_selected", "do_adopt_settings",
+        "on_showing_selected", "do_adopt_settings", "do_forget_session",
         "do_rename_batch", "do_duplicate_batch", "do_open_spec", "do_save_spec",
         "do_pick_batch_root", "do_pick_offdir", "do_open_batch_dir", "do_exit",
         "on_row_action", "show_log", "show_trace", "show_defaults", "show_about",
@@ -1457,6 +1457,7 @@ class BaseApp:
         actions: dict[str, object] = {
             "New batch": self.do_new_batch,
             "Open spec...": self.do_open_spec,
+            "Forget saved settings": self.do_forget_session,
             "Save spec as...": self.do_save_spec,
             "Exit": self.do_exit,
             "Duplicate batch...": self.do_duplicate_batch,
@@ -1478,7 +1479,8 @@ class BaseApp:
             "About": self.show_about,
         }
         for name, items in (
-            ("File", ("New batch", "Open spec...", "Save spec as...", "-", "Exit")),
+            ("File", ("New batch", "Open spec...", "Save spec as...", "-",
+                      "Forget saved settings", "-", "Exit")),
             ("Batch", ("Duplicate batch...", "Rename...", "-", "Open batch dir")),
             ("Runs", ("Dry-run", "Submit", "Cancel", "-", "Re-run failed", "Use these settings")),
             (
@@ -2917,6 +2919,7 @@ class BaseApp:
             self._guard(self.bridge.plan)
             # 这四条也要各自过闸：用户把 Mesh 的某个格子清空、把温度写成一个词，
             # 核心会（正确地）拒绝，而**界面不该因此死掉**。理由写在 `_guard` 上。
+            self._guard(self._touch_session)
             self._guard(self._sync_history)
             self._guard(self._sync_group_rows)
             self._guard(self._sync_freq_fields)
@@ -3870,7 +3873,71 @@ class BaseApp:
     def do_open_batch_dir(self) -> None:
         self._reveal("Batch dir", self.bridge.batch_dir())
 
+    SESSION_SAVE_MS = 1500
+    """设定改完多久落一次盘。**防抖**：界面每敲一个键就 `recompute()` 一次，
+    每次都写盘等于把一个 NFS 上的文件当草稿纸用。1.5 秒的量级是"停下来想一下"，
+    而在那之前 `do_exit` 那条强制保存兜着。"""
+
+    def _touch_session(self) -> None:
+        """设定动过了 —— 排一次延迟保存（已经排着就不重排，让它接着倒计时）。
+
+        只排定时器、不落盘：本方法在 `recompute()` 里、也就是**每一个键**上被调。
+        """
+        if getattr(self, "_session_timer", None) is not None:
+            return
+        try:
+            self._session_timer = self.top.after(  # type: ignore[attr-defined]
+                self.SESSION_SAVE_MS, self._save_session_now
+            )
+        except tk.TclError:  # pragma: no cover - 窗口已经关掉
+            self._session_timer = None
+
+    def _save_session_now(self) -> None:
+        """真落盘。**存不下不弹框** —— 理由写在 `GuiState.save_session` 上。"""
+        self._session_timer = None
+        saver = getattr(self.bridge, "save_session", None)
+        if callable(saver):
+            self.trace.note("session save", saver() or "(not saved)")
+
+    def do_forget_session(self) -> None:
+        """把"上次那份"删掉，下次开机回到空白。
+
+        存在的理由：这份文件里有 library / cell / 官方目录路径 —— 换个项目、
+        或者把机器交给别人之前，得有一条**看得见的**路把它清掉，
+        而不是让人自己去装机目录里找一个 `.local.json`。
+        """
+        path = gui_state.session_path()
+        if not _confirm(
+            "Forget saved settings",
+            "Delete " + path + " ?" + _NL + _NL +
+            "The next start will come up empty. Batches on disk are not touched.",
+        ):
+            return
+        if self._session_timer is not None:
+            try:
+                self.top.after_cancel(self._session_timer)  # type: ignore[attr-defined]
+            except tk.TclError:  # pragma: no cover
+                pass
+            self._session_timer = None
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _error("Cannot forget the saved settings", "%s: %s" % (path, exc))
+            return
+        self.trace.note("session forget", path)
+
     def do_exit(self) -> None:
+        # ★ 关窗前**强制存一次**：防抖那 1.5 秒里关掉窗口是很正常的一步
+        #   （改完最后一个勾选就去点叉），少这一下，用户最后那次改动就丢了。
+        if getattr(self, "_session_timer", None) is not None:
+            try:
+                self.top.after_cancel(self._session_timer)  # type: ignore[attr-defined]
+            except tk.TclError:  # pragma: no cover
+                pass
+            self._session_timer = None
+        self._save_session_now()
         self._stop_timer()
         try:
             self.top.destroy()  # type: ignore[attr-defined]
@@ -4114,6 +4181,19 @@ def _info(title: str, message: str) -> None:
     if smoke_enabled():
         return
     messagebox.showinfo(title, message)
+
+
+def _confirm(title: str, message: str) -> bool:
+    """要一次 yes/no。**冒烟下一律 False** —— 那等于"用户按了取消"。
+
+    与 `_error` / `_info` 同一条路（先 `_dialog` 记一条，headless 不弹框）。
+    默认 False 而不是 True：本函数的调用方都是**删东西**的，
+    headless 里默认"删"是把一个测试跑成一次数据丢失。
+    """
+    _dialog("confirm", title, message)
+    if smoke_enabled():
+        return False
+    return bool(messagebox.askyesno(title, message))
 
 
 def _error(title: str, message: str) -> None:

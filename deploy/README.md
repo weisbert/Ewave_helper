@@ -203,7 +203,7 @@ cp site.example.sh site.local.sh     # 然后按里面的说明改那一行
 
 | 保住的东西 | 靠什么认出来 |
 |---|---|
-| `.deploy/` `site.local.sh` `ewave_batches/` | 写死在 `deploy.sh` 的 `PRESERVE` 里 |
+| `.deploy/` `site.local.sh` `session.local.json` `ewave_batches/` | 写死在 `deploy.sh` 的 `PRESERVE` 里 |
 | **任何含 `batch.json` 的目录**（`<它>/batch.json` 或 `<它>/*/batch.json`） | `looks_like_batch_data()` 现场探测 —— 名字叫什么都行 |
 | `*.tar.gz` / `*.sha256` | 那是你刚上传的交付包，不是安装内容 |
 | `.deploy/preserve.list` 里列的名字 | 一行一个，`#` 是注释 |
