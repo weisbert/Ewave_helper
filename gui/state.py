@@ -29,6 +29,7 @@ GUI ──►  root.after(interval, gui_state.tick)  ← 同一份 driver 代码
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 
@@ -181,6 +182,20 @@ MESH_FLAGS: tuple[str, ...] = ("-e", "-d", "--viaMergeSpace")
 """网格密度轴掌管的三个 flag（BRIEF §10：**唯一改 mesh 的轴**）。"""
 
 _NL = chr(10)
+
+
+def _has_batch_json(batch_dir: str) -> bool:
+    """这个目录**已经是一个批次**了没有。
+
+    判"被占了没有"只许有这一条判据，而且要和 `layout.list_batches`（历史列表）、
+    `deploy.sh::looks_like_batch_data`（部署不许搬走的东西）逐字同义。
+    三处不一致的后果是同一个：列表里看不见的批次会被当成空位占掉 = 覆盖。
+    """
+    try:
+        return os.path.isfile(os.path.join(batch_dir, layout_module.BATCH_JSON_NAME))
+    except (OSError, ValueError):  # pragma: no cover - 怪路径
+        return False
+
 """换行符。`preflight()` 的多行文案用它拼 —— 那几条要在对话框里分行显示。"""
 
 MESH_SEP = "/"
@@ -673,6 +688,23 @@ class GuiState:
         self._notes: list[str] = []
         self._events: list[DriverEvent] = []
         self._driver: DriverProtocol | None = None
+        self._viewed: BatchState | None = None
+        """**结果侧**：Runs 表现在显示的那一批。`None` = 显示预览（`_state`）。
+
+        ★ 这一格就是「设定」和「结果」的分界线，2026-08-24 加的。在它之前两侧共用
+        `_state` 一个对象 —— `plan()` 重建它，而 driver 就地改它 —— 于是"提交之后
+        还能改设定"必然把跑着的那批状态冲掉。界面只好把设定面板整个冻住，
+        而冻住又让整个工具显得是一次性的（用户原话：应该像 Cadence 的 simulation
+        一样，跑一次就是一次新结果）。
+
+        拆开之后两侧各有各的对象：
+        * `_state`  = 预览。当前设定展开出来的矩阵，`plan()` 随便重建，**没人在跑它**；
+        * `_viewed` = 结果。要么是 driver 手里那份（活的），要么是从磁盘 `batch.json`
+          读回来的某一批（历史）。`plan()` **绝不碰它**。
+        """
+        self._viewed_contexts: dict[str, PlanContext] = {}
+        """`_viewed` 那一批自己的 contexts。`resume()` 要用它，**不能用 `_contexts`** ——
+        后者是当前设定的，而当前设定跟三个月前那一批可以毫无关系。"""
         self._result_state: BatchState | None = None
         """driver 那份结果是**对着哪一份 `BatchState`** 跑出来的。
 
@@ -696,6 +728,15 @@ class GuiState:
         当前的勾选 —— 用户按了 Load，界面就该显示文件里的东西，而不是两者的混合。
         """
         spec = spec_module.load_spec(path)
+        self._apply_spec(spec, take_identity=True)
+
+    def _apply_spec(self, spec: BatchSpec, *, take_identity: bool) -> None:
+        """把一份 spec 灌进界面的勾选。`load_spec` 和 `adopt_settings_from` 共用。
+
+        `take_identity` = 连 `batch_name` / `batch_root` 一起拿。Load 一个 spec 文件要
+        （文件里写了就按文件的来）；而"照着历史里那一批再跑一次"**不要** ——
+        那是新的一批，沿用旧名字就是写回旧目录。
+        """
         self._spec = spec
         self._designs = list(spec.designs)
         # 组也要灌回界面，否则「Load 一个带 groups 的 spec」会静默退化成全笛卡尔积 ——
@@ -727,10 +768,11 @@ class GuiState:
         self._extra_text = " ".join(_render_flag_token(k, v) for k, v in spec.extra_flags.items())
         self._default_overrides = dict(spec.defaults)
         self._options = spec.options
-        if spec.batch_name:
-            self.batch_name = spec.batch_name
-        if spec.batch_root:
-            self.batch_root = spec.batch_root
+        if take_identity:
+            if spec.batch_name:
+                self.batch_name = spec.batch_name
+            if spec.batch_root:
+                self.batch_root = spec.batch_root
         self._invalidate()
 
     def plan(self) -> None:
@@ -763,7 +805,7 @@ class GuiState:
             spec, batch_root=self.batch_root, tool_version=self._tool_version
         )
         self.batch_name = state.batch_name
-        if minted and self.existing_batch_at_landing():
+        if minted and _has_batch_json(state.batch_dir):
             # ★ **时间戳只到秒**（`model.TIMESTAMP_FORMAT`）。New batch 之后一秒内
             #   再按一次，现起的名字和上一批逐字相同 -> 又落回同一个目录，
             #   `reset()` 那一半的修复被这一下全抵消掉。而"按完 New batch 马上按
@@ -777,26 +819,7 @@ class GuiState:
                 tool_version=self._tool_version,
             )
 
-        contexts: dict[str, PlanContext] = {}
-        for design in state.designs:
-            key = matrix_module.design_key(design)
-            facts = self._facts_for(design)
-            defaults = dict(discover_module.learn_default_flags(facts))
-            if not self._learned:
-                # 「学到的默认表」记第一份非空的那个，给 Extraction defaults 对话框显示。
-                # 学不到（本机没有官方目录）时保持空 —— 空表和"学到了一张空表"在界面上
-                # 是两回事，前者要显示成"还没学到，用的是内置兜底"。
-                self._learned = dict(defaults)
-            defaults.update(self._default_overrides)
-            contexts[key] = PlanContext(
-                design=design,
-                facts=facts,
-                axes=tuple(state.axes),
-                defaults=defaults,
-                extra_flags=dict(state.extra_flags),
-                options=state.options,
-                batch_dir=state.batch_dir,
-            )
+        contexts = self._build_contexts(state, learn=True)
 
         self._state = state
         self._contexts = contexts
@@ -818,10 +841,164 @@ class GuiState:
                 self._plan_errors[run.run_id] = f"{exc.__class__.__name__}: {exc}"
         self._dirty = False
 
+    def _build_contexts(self, state: BatchState, *, learn: bool) -> dict[str, PlanContext]:
+        """`design_key` → `PlanContext`。**只从传进来的 `state` 取**，不看当前勾选。
+
+        两个调用方，差别只在 `learn`：
+
+        * `plan()`（`learn=True`）—— 预览。默认表现学现用（从官方目录 learn 一遍再叠
+          用户的覆盖），因为设定就是"现在这一份"。顺带把第一份非空的记进 `_learned`
+          给 Extraction defaults 对话框看。
+        * `open_batch()`（`learn=False`）—— 打开一个**历史批次**。默认表用批次自己
+          冻着的那份（`BatchState.defaults`），**不许拿今天的重新学**：那份就是为了
+          "换了 PDK 版本之后 resume 老批次不能悄悄换值"才存进 batch.json 的。
+          只有它是空的（老批次、或者当时就没学到）才退回现学 —— 空表拼不出命令，
+          那时"用今天的"总好过"什么都没有"。
+        """
+        contexts: dict[str, PlanContext] = {}
+        frozen = dict(state.defaults)
+        for design in state.designs:
+            key = matrix_module.design_key(design)
+            facts = self._facts_for(design)
+            if learn:
+                defaults = dict(discover_module.learn_default_flags(facts))
+                if not self._learned:
+                    # 「学到的默认表」记第一份非空的那个，给 Extraction defaults 对话框显示。
+                    # 学不到（本机没有官方目录）时保持空 —— 空表和"学到了一张空表"在界面上
+                    # 是两回事，前者要显示成"还没学到，用的是内置兜底"。
+                    self._learned = dict(defaults)
+                defaults.update(self._default_overrides)
+            else:
+                defaults = dict(frozen) or dict(discover_module.learn_default_flags(facts))
+            contexts[key] = PlanContext(
+                design=design,
+                facts=facts,
+                axes=tuple(state.axes),
+                defaults=defaults,
+                extra_flags=dict(state.extra_flags),
+                options=state.options,
+                batch_dir=state.batch_dir,
+            )
+        return contexts
+
+    # ==================================================== 结果侧：历史与「在看哪一批」
+    # ★ 本段**只读磁盘**或只动 `_viewed`，一个设定都不碰。
+    #   这条分界线是 2026-08-24「真解法」的全部内容，见 `_viewed` 上的注释。
+
+    def batch_history(self) -> tuple[layout_module.BatchSummary, ...]:
+        """落点底下有哪些批次，新的在前。**磁盘是唯一真相。**
+
+        不缓存：批次可能是别的会话（或 CLI）跑出来的，缓存等于让界面对着一份过期的
+        历史。一次 `listdir` + 每批一个小 JSON，几十批的量级不值得优化。
+        """
+        return layout_module.list_batches(
+            os.path.abspath(os.path.expanduser(self.batch_root or DEFAULT_BATCH_ROOT))
+        )
+
+    def viewing(self) -> str:
+        """Runs 表现在显示的是哪一批。空串 = 预览（当前设定会跑什么）。"""
+        return self._viewed.batch_name if self._viewed is not None else ""
+
+    def show_preview(self) -> None:
+        """回到「当前设定会跑什么」。**跑着的那批照跑** —— 这只是换个看的东西。"""
+        if self._running:
+            raise EwaveBatchError(
+                "A batch is running - the results view stays on it until it finishes." + _NL +
+                "  Next: wait for it, or press Cancel."
+            )
+        self._viewed = None
+        self._viewed_contexts = {}
+        self._driver = None
+        self._result_state = None
+        self._invalidate()
+
+    def open_batch(self, name: str) -> None:
+        """看历史里的某一批。**只读磁盘，一个设定都不碰。**
+
+        这是「设定」和「结果」拆开之后才成立的动作：打开三个月前那一批不该、也不会
+        把界面上的勾选改成那一批的。想拿它的设定接着跑是**另一个**动作
+        （`adopt_settings_from`），必须显式 —— 混成一件的话每点一次历史都会把手上
+        正在编辑的设定冲掉。
+
+        正在跑的时候不许切走：切走了 `tick()` 还在改 driver 手里那份，而表上显示的是
+        别的东西 —— 两个都在动，就没人说得清哪个是真的。
+        """
+        if self._running:
+            raise EwaveBatchError(
+                "A batch is running - cannot switch the results view yet." + _NL +
+                "  Next: wait for it to finish, or press Cancel."
+            )
+        cleaned = str(name).strip()
+        if not cleaned:
+            self.show_preview()
+            return
+        root = os.path.abspath(os.path.expanduser(self.batch_root or DEFAULT_BATCH_ROOT))
+        path = os.path.join(root, cleaned, layout_module.BATCH_JSON_NAME)
+        state = layout_module.read_batch_state(path)   # StateError 往上抛，界面弹框
+        # 批次被搬过（或当初记的是别的机器上的绝对路径）时以**现在这个目录**为准 ——
+        # 同 `sched.driver.resume_batch` 那条，理由也一样：否则产物一个都验不过。
+        state.batch_dir = os.path.join(root, cleaned).replace('\\', "/")
+        self._viewed = state
+        self._driver = None      # 从磁盘读回来的，还没有 driver
+        self._result_state = None
+        self._events = []
+        contexts = self._build_contexts(state, learn=False)
+        self._viewed_contexts = contexts
+        self._plans = {}
+        self._plan_errors = {}
+        for run in state.runs:
+            context = contexts.get(run.design_key)
+            if context is None:  # pragma: no cover - state 自洽时不会
+                continue
+            try:
+                self._plans[run.run_id] = ewave_tool.build_ewave_plan(run, context)
+            except EwaveBatchError as exc:
+                self._plan_errors[run.run_id] = f"{exc.__class__.__name__}: {exc}"
+
+    def adopt_settings_from(self, name: str) -> None:
+        """把某一批的设定搬进界面（designs / 轴 / 组 / extra flags / 并行度）。
+
+        **显式动作**，不是打开批次的副作用。搬完之后落点身份是**新的**：
+        这是"照着它再跑一次"，不是"回到它"—— 沿用旧名字就是写回旧目录。
+        """
+        root = os.path.abspath(os.path.expanduser(self.batch_root or DEFAULT_BATCH_ROOT))
+        state = layout_module.read_batch_state(
+            os.path.join(root, str(name).strip(), layout_module.BATCH_JSON_NAME)
+        )
+        self._apply_spec(
+            BatchSpec(
+                designs=list(state.designs),
+                axes=list(state.axes),
+                groups=list(state.groups),
+                defaults=dict(state.defaults),
+                extra_flags=dict(state.extra_flags),
+                options=replace(state.options, dry_run=False),
+            ),
+            take_identity=False,
+        )
+        self.batch_name = ""       # 新的一批 = 新身份，见 `reset()`
+        self._name_is_auto = True
+
+    def viewed_summary(self) -> layout_module.BatchSummary | None:
+        """正在看的那一批的概况。看预览时 → None。"""
+        if self._viewed is None:
+            return None
+        return layout_module.summarize_state(self._viewed)
+
     def start(self, *, dry_run: bool = False) -> None:
-        """开跑（或 dry-run）。已经在跑时是 no-op。"""
+        """开跑（或 dry-run）。已经在跑时是 no-op。
+
+        ★ **真提交一律起一个新批次**（2026-08-24 用户拍板的模型：跑一次就是一次新
+        结果，旧的还在，跟 Cadence ADE 的 simulation 一样）。所以按下 Submit 的第一件
+        事是换身份 —— 自动名重起一个时间戳，手打名往后找第一个没被占的 `-2`/`-3`…
+        界面上那一格因此是**下一批的名字**（一个词根），不是"当前这一批"的名字。
+
+        dry-run 不换：它不写盘、不占目录，换身份只会让那一格每按一次预览就变一次。
+        """
         if self._running:
             return
+        if not dry_run:
+            self._mint_fresh_identity()
         self._options.dry_run = dry_run
         self._dry_run_only = dry_run
         if self._dirty or self._state is None:
@@ -839,7 +1016,26 @@ class GuiState:
             on_event=self._record_event,
         )
         self._result_state = state
+        if not dry_run:
+            # 提交完就看这一批 —— 它才是刚发生的那件事。
+            # ★ **dry-run 不进这里**：它不写盘、磁盘上没有它，也就不是一条历史。
+            #   当成"在看的一批"的话，跑完 dry-run 再改一个勾选，表会钉死在那份旧预览上
+            #   （`_viewed` 不跟着 `plan()` 走，那正是它存在的意义）——
+            #   而"dry-run 之后界面照样跟着勾选走"是 2026-08-20 修过的东西，不能再破一次。
+            #   dry-run 跑的本来就是 `_state` 这个对象，driver 就地改它，表照样会动。
+            self._viewed = state
+            self._viewed_contexts = dict(self._contexts)
         self._running = True
+
+    def _mint_fresh_identity(self) -> None:
+        """换一个没被占的批次身份。`start()` 和 `reset()`（New batch）共用。
+
+        判据是磁盘上有没有 `batch.json` —— 与 `batch_history()`、
+        `deploy.sh::looks_like_batch_data` 同一条。三处不一致的话，
+        列表里看不见的批次会被当成空位占掉，那就是覆盖。
+        """
+        self.batch_name = "" if self._name_is_auto else self._next_free_batch_name()
+        self._invalidate()
 
     def resume(self, *, dry_run: bool = False) -> None:
         """断点续跑（D7）：**从 `batch.json` 恢复**，已经 done 的一个都不重跑。
@@ -854,26 +1050,26 @@ class GuiState:
         """
         if self._running:
             return
-        if self._driver is None:
+        if self._viewed is None:
+            # 没在看任何一批 = 手上只有预览，没有 `batch.json` 可读。
+            # 退回 `start()`（它会起一个新批次），与本方法加进来之前逐字相同。
             self.start(dry_run=dry_run)
             return
-        if self._state is None or not self._contexts:  # pragma: no cover - 有 driver 必有这两样
-            self.plan()
-        state = self._state
-        assert state is not None
+        state = self._viewed
         from ewave_batch.sched.driver import resume_batch
 
         driver = resume_batch(
             state.batch_dir,
-            self._contexts,
+            self._viewed_contexts or self._contexts,
             self._make_scheduler(),
             self._make_runner(),
             on_event=self._record_event,
         )
         self._driver = driver
-        self._state = driver.state
+        # ★ **不碰 `_state`**：那是预览，是用户手上正在编辑的设定展开出来的东西。
+        #   续跑一个历史批次不该把界面上的勾选换成它的 —— 那是 `adopt_settings_from`。
+        self._viewed = driver.state
         self._result_state = driver.state
-        self._plans = {}
         self._dry_run_only = dry_run
         self._running = True
 
@@ -896,9 +1092,22 @@ class GuiState:
             self._driver.cancel()
         self._running = False
 
+    def result_state(self) -> BatchState | None:
+        """Runs 表该显示哪一份 —— **结果侧唯一的入口**。
+
+        看某一批时是那一批（`_viewed`，可能就是 driver 手里那份，driver 就地改它的
+        status，所以表会跟着动）；看预览时是 `_state`。
+
+        ★ 别在别处写第二个"该显示哪一份"的判断：这个分岔一旦有两份，
+        表格和状态栏就会各读各的，出现"5 行的表配一句 3 runs"——
+        那正是 `result_is_current()` 当年为之存在的病。
+        """
+        return self._viewed if self._viewed is not None else self._state
+
     def runs(self) -> tuple[Run, ...]:
-        """当前矩阵里的全部 run（**同一批对象**，driver 就地改它们的 status）。"""
-        return tuple(self._state.runs) if self._state is not None else ()
+        """正在看的那一批的全部 run（**同一批对象**，driver 就地改它们的 status）。"""
+        state = self.result_state()
+        return tuple(state.runs) if state is not None else ()
 
     def designs(self) -> tuple[Design, ...]:
         return tuple(self._designs)
@@ -921,7 +1130,10 @@ class GuiState:
     def summary(self) -> dict[str, int]:
         """`RunStatus.value` → 条数。**6 个键恒在**（界面不用 `.get` 兜底）。"""
         counts = {name: 0 for name in STATUS_ORDER}
-        if self.result_is_current():
+        if self._viewed is None and self.result_is_current():
+            # 看预览、而预览又正好是 driver 跑的那一份（dry-run 之后没动过勾选）——
+            # 那时 driver 的计数更权威。看某一批时**一律现数**：`_viewed` 里的
+            # `Run.status` 就是真相（活的那份是 driver 就地改的，历史那份是磁盘读的）。
             counts.update(self._driver.summary())  # type: ignore[union-attr]
             return counts
         for run in self.runs():
@@ -1023,42 +1235,67 @@ class GuiState:
         空目录不算 —— 那多半是人自己建来放东西的，占着它的名字没有道理。
         `_LOOP_CAP` 只是个防呆上限：真到 999 个同名批次，说明词根本身该换了。
         """
-        base = self.batch_name.strip()
-        if not base:
+        name = self.batch_name.strip()
+        if not name:
             return ""
+        # 词根 = 去掉末尾那个 `-<数字>`。不去的话序号会**叠加**：
+        # `mesh` -> `mesh-2` -> `mesh-2-2` -> `mesh-2-2-2`（2026-08-24 实测），
+        # 连按三次 Submit 就没法看了。去掉之后是 `mesh-2` / `mesh-3` / `mesh-4`。
+        # 用户自己就想叫 `mesh-2` 也没事：下面第一件事是问它被占了没有，
+        # 没被占就原样返回 —— 只有真撞上了才从词根往后数。
+        base = re.sub(r"-\d+$", "", name) or name
         try:
             root = os.path.abspath(os.path.expanduser(self.batch_root or DEFAULT_BATCH_ROOT))
         except (OSError, ValueError):  # pragma: no cover - 怪路径
             return base
 
         def taken(name: str) -> bool:
-            return os.path.isfile(os.path.join(root, name, layout_module.BATCH_JSON_NAME))
+            return _has_batch_json(os.path.join(root, name))
 
-        if not taken(base):
-            return base
+        if not taken(name):
+            return name
         for suffix in range(2, 1000):
             candidate = "%s-%d" % (base, suffix)
             if not taken(candidate):
                 return candidate
         return base  # pragma: no cover - 999 个同名批次
 
-    def existing_batch_at_landing(self) -> str:
-        """落点上**已经有一个批次**了 -> 它的名字；没有 -> 空串。
+    def next_batch_name(self) -> str:
+        """**下一次 Submit** 会用哪个名字。空串 = 到时候现起一个 UTC 时间戳。
 
-        判据是 `<batch_dir>/batch.json` 在不在。给 `preflight()` 用：新提交一批**不许**
-        盖在别人身上，而 `write_batch_state` 那一层是无条件原子覆盖（它必须是 ——
-        跑到一半每拍都要写），所以拦只能拦在按下去之前。
-
-        ⚠️ 这条**只挡新提交**，不挡 resume：resume 存在的全部意义就是读那个 `batch.json`。
+        ⚠️ 与 `batch_dir()` 是两个问题，别混：那个答的是「我正在看的那一批在哪」
+        （看历史时就是那一批的目录）。混用的症状很隐蔽 —— 2026-08-24 实测：
+        `preflight()` 拿 `batch_dir()` 当"下一批会落在哪"，于是提交完第一批之后
+        第二次 Submit 被自己的守卫拦住（"那儿已经有一批了"——那是**正在看的**那一批），
+        而按钮是亮的、什么都没发生。
         """
-        try:
-            path = os.path.join(
-                os.path.abspath(os.path.expanduser(self.batch_dir())),
-                layout_module.BATCH_JSON_NAME,
-            )
-        except (OSError, ValueError):  # pragma: no cover - 怪路径
+        return "" if self._name_is_auto else self._next_free_batch_name()
+
+    def next_batch_dir(self) -> str:
+        """下一次 Submit 会落在哪个目录。名字要到 `plan()` 才现起时 → 根目录 + `<batch>`。"""
+        root = os.path.abspath(os.path.expanduser(self.batch_root or DEFAULT_BATCH_ROOT))
+        return os.path.join(root, self.next_batch_name() or "<batch>").replace(chr(92), "/")
+
+    def existing_batch_at_landing(self) -> str:
+        """**下一批**的落点上已经有一个批次了 -> 它的名字；没有 -> 空串。
+
+        判据是 `<下一批的目录>/batch.json` 在不在。给 `preflight()` 用：新提交一批
+        **不许**盖在别人身上，而 `write_batch_state` 那一层是无条件原子覆盖
+        （它必须是 —— 跑到一半每拍都要写），所以拦只能拦在按下去之前。
+
+        正常路径下这条**永远不该响**：`start()` 每次先 `_mint_fresh_identity()`，
+        而那个函数挑的就是第一个没被占的名字。它是**背带**，守的是 mint 挑不出空位
+        （同一词根 999 批）那种边角，以及将来有人绕过 mint 直接调 `start()`。
+        一条永远不响的守卫也比一条会说谎的守卫强 —— 前者是保险，后者是 bug。
+
+        ⚠️ 只挡新提交，不挡 resume：resume 存在的全部意义就是读那个 `batch.json`。
+        """
+        name = self.next_batch_name()
+        if not name:
+            # 名字要到 `plan()` 才现起，而 `plan()` 自己会避开被占的（见那里的
+            # `existing_batch_at_landing` 分支）—— 这里没有可判的东西。
             return ""
-        return self.batch_name or "<batch>" if os.path.isfile(path) else ""
+        return name if _has_batch_json(self.next_batch_dir()) else ""
 
     def batch_root_check(self) -> str:
         """按下 Submit 前**真往落点写一个文件**。写得下 -> 空串；写不下 -> 挡路的原因。
@@ -1797,6 +2034,11 @@ class GuiState:
 
     def batch_dir(self) -> str:
         """批次落在哪。还没 plan 过就用当前的 root + name 现拼一个预览。"""
+        if self._viewed is not None:
+            # 看某一批时，"批次目录"就是**那一批**的目录 —— 动作栏那行路径、
+            # Open batch dir、resume 全指它。否则点开历史里的一批，
+            # 界面显示的却是"下一批会落在哪"，而两者长得一模一样。
+            return self._viewed.batch_dir
         if self._state is not None:
             return self._state.batch_dir
         name = self.batch_name or "<batch>"
@@ -1965,7 +2207,7 @@ class GuiState:
             occupied = self.existing_batch_at_landing()
             if occupied:
                 problems.append(
-                    "There is already a batch at %s." % self.batch_dir() + _NL +
+                    "There is already a batch at %s." % self.next_batch_dir() + _NL +
                     "  Submitting would overwrite its batch.json and drop new results on "
                     "top of the old ones - the same silent overwrite this tool exists to "
                     "prevent, one level up." + _NL +
@@ -2058,7 +2300,9 @@ class GuiState:
         两条都会改 `batch_name`，所以**调用方必须把界面那一格重灌一次** ——
         `_ui.push()` 每一拍把那一格写回 bridge，不灌就是把旧名字又推了回来。
         """
-        self.batch_name = "" if self._name_is_auto else self._next_free_batch_name()
+        self._mint_fresh_identity()
+        self._viewed = None
+        self._viewed_contexts = {}
         self._dry_run_only = True
         self._driver = None
         self._result_state = None

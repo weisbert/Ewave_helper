@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 import datetime
 import fnmatch
 import io
@@ -84,6 +85,9 @@ from ..model import (
 )
 
 __all__ = [
+    "BatchSummary",
+    "list_batches",
+    "summarize_state",
     "install_root",
     "default_batch_root",
     "BATCH_ROOT_DIRNAME",
@@ -1261,6 +1265,110 @@ def state_from_dict(data: Mapping[str, object]) -> BatchState:
 # --------------------------------------------------------------------------
 # batch.json / runs.csv：落盘
 # --------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchSummary:
+    """历史列表里的一行。**从磁盘上的 `batch.json` 读出来的**，不是内存里的。
+
+    为什么要一个单独的小类型而不是直接端 `BatchState`：列表要显示十几二十行，
+    而 `BatchState` 带着全部 runs / streamout / defaults —— 列表只需要几个数字。
+    更要紧的是**语义**：列表说的是"磁盘上有这些批次"，那是一个只读的事实，
+    跟"我现在正在编辑的设定"没有任何关系。两者混用正是界面一直分不清
+    「设定」和「结果」的根源。
+    """
+
+    name: str
+    """批次目录名 = `batch_name`。列表里的身份。"""
+    batch_dir: str
+    created_at: str = ""
+    updated_at: str = ""
+    total: int = 0
+    done: int = 0
+    failed: int = 0
+    running: int = 0
+    """`pending` + `running` 合起来算 —— 列表这一层不区分"在排队"和"在算"。"""
+    designs: int = 0
+    tool_version: str = ""
+    error: str = ""
+    """这一行读坏了的原因（`batch.json` 是半份 JSON 之类）。非空 = 其余字段没意义。
+
+    **坏掉的批次也要出现在列表里**，不许静默跳过：目录在那儿、结果可能也在那儿，
+    列表里没有它只会让人以为东西丢了。"""
+
+    @property
+    def finished(self) -> bool:
+        """跑完了没有（没有在飞的，也没有还没提交的）。"""
+        return not self.error and self.total > 0 and self.done + self.failed == self.total
+
+
+def summarize_state(state: BatchState) -> BatchSummary:
+    """把一份**已经在手里**的 `BatchState` 概括成一行。
+
+    与 `list_batches` 共用同一份计数口径 —— 界面上"正在看的这一批"和"历史列表里
+    那一行"必须是同一个数，两份实现必然漂。"""
+    return _summarize(state.batch_name, state.batch_dir, state)
+
+
+def _summarize(name: str, batch_dir: str, state: BatchState) -> BatchSummary:
+    counts = {status: 0 for status in RunStatus}
+    for run in state.runs:
+        counts[run.status] = counts.get(run.status, 0) + 1
+    return BatchSummary(
+        name=name,
+        batch_dir=batch_dir,
+        created_at=state.provenance.created_at,
+        updated_at=state.provenance.updated_at,
+        total=len(state.runs),
+        done=counts.get(RunStatus.DONE, 0),
+        failed=counts.get(RunStatus.FAILED, 0),
+        running=counts.get(RunStatus.PENDING, 0) + counts.get(RunStatus.RUNNING, 0),
+        designs=len(state.designs),
+        tool_version=state.provenance.tool_version,
+    )
+
+
+def list_batches(batch_root: str) -> tuple[BatchSummary, ...]:
+    """`<batch_root>` 底下有哪些批次。**新的在前**。
+
+    判据是 `<batch_root>/<name>/batch.json` —— 与 `deploy.sh` 的
+    `looks_like_batch_data()` 同一条（那边是 shell 版），也与
+    `GuiState._next_free_batch_name` 判"名字被占了没有"同一条。三处必须一致：
+    列表里看不见的批次会被 New batch 当成空位占掉，那就是覆盖。
+
+    **只看一层**，不递归：批次目录里面还有 `runs/<design>/<slug>/…` 一大棵树，
+    往下走既慢又只会捞出同一个批次。
+
+    排序按 `provenance.created_at`（UTC、ISO-8601、字符串序 = 时间序，
+    见 `model.TIMESTAMP_FORMAT`），没有 created_at 的排在最后、按名字。
+    刻意**不用 mtime**：resume 会重写 `batch.json`，mtime 是"最后一次动它"
+    而不是"什么时候跑的"，用它排序会让一次 resume 把三个月前的批次顶到最上面。
+
+    读不动的批次照样出现在列表里（`BatchSummary.error` 非空）—— 见那个字段。
+    """
+    root = _posix(batch_root)
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        # 根目录还不存在（一次都没跑过）不是错误 —— 那就是"历史是空的"。
+        return ()
+    out: list[BatchSummary] = []
+    for name in entries:
+        batch_dir = _join(root, name)
+        json_path = _join(batch_dir, BATCH_JSON_NAME)
+        if not os.path.isfile(json_path):
+            continue
+        try:
+            state = read_batch_state(json_path)
+        except StateError as exc:
+            out.append(BatchSummary(name=name, batch_dir=batch_dir, error=str(exc)))
+            continue
+        out.append(_summarize(name, batch_dir, state))
+    out.sort(key=lambda item: (item.created_at == "", item.created_at, item.name), reverse=True)
+    # 上面那个 reverse 把"没有 created_at"也翻到了前面 —— 再把它们挪到最后。
+    dated = [item for item in out if item.created_at]
+    undated = sorted((item for item in out if not item.created_at), key=lambda i: i.name)
+    return tuple(dated + undated)
 
 
 def read_batch_state(path: str) -> BatchState:

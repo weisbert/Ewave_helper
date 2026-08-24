@@ -903,7 +903,14 @@ class BridgePumpWiring(_SmokeTest):
         界面每敲一个键就 `recompute()` → `bridge.plan()`，而 `plan()` 造的是一份
         **全新的、每个 run 都 `ready`** 的 `BatchState`。于是跑完之后随手改一个勾选，
         表上那 9 个 done 就静默消失了 —— 看起来只是"界面刷新了一下"。
-        修法：`has_started()` 之后不再重新展开矩阵；要重来一批走 New batch。
+        当年的修法是 `has_started()` 之后不再重新展开矩阵 —— 一道**冻结**。
+        2026-08-24 换成了结构上的分家（`GuiState._viewed`）：`plan()` 只碰预览，
+        结果侧是另一个对象，于是设定面板不必冻，本条不变量照样成立。
+
+        ★ 所以这条测试的判据也跟着**变强**了：从前只能断言"Submit 是灰的"
+        （冻结的副作用，一个代理指标），现在直接断言那件事本身 ——
+        **表上的 done/failed 一个不少，而预览确实跟着那一下键变了**。
+        代理指标当年是不得已；留着它反而会把"界面死了"也测成绿的。
         """
         root = _tk_or_skip(self)
         from gui.frames import split
@@ -923,9 +930,14 @@ class BridgePumpWiring(_SmokeTest):
         self.assertEqual(len(statuses), EXPECTED_RUN_COUNT)
         self.assertEqual(statuses.count("done"), EXPECTED_DONE)
         self.assertEqual(statuses.count("failed"), EXPECTED_FAILED)
-        # Submit 也必须保持禁用 —— 再按一次就是整批重跑。
-        self.assertIn("disabled", app.btn["Submit"].state())
-        self.assertNotIn("disabled", app.btn["Resume"].state())
+        # 设定那一侧**确实动了** —— 少了这一条，"界面从此不再更新"也会绿。
+        self.assertEqual(
+            len(bridge._state.runs),
+            EXPECTED_RUN_COUNT // 2,
+            "取消了一个 corner，预览却没跟着变 —— 设定面板还是冻着的",
+        )
+        # 而 Submit **仍然可按**：再按一次是**新的一批**，不是把这一批重跑。
+        self.assertNotIn("disabled", app.btn["Submit"].state())
 
     def test_results_survive_a_keystroke_after_the_batch_finished_negative(self) -> None:
         """反向：明确按了 New batch 之后，矩阵**必须**跟着新勾选重算。
@@ -1931,21 +1943,46 @@ class DryRunMustNotLockTheUi(_SmokeTest):
         for name in ("Dry-run", "Submit"):
             self.assertNotIn("disabled", app.btn[name].state(), "%s 不该被 dry-run 关掉" % name)
 
-    def test_a_real_submit_does_lock_them_negative(self) -> None:
-        """反向：真提交之后两个都得关，否则再按一次就是整批从头重跑。"""
+    def test_a_real_submit_leaves_submit_usable_and_makes_a_new_batch(self) -> None:
+        """★ 真提交之后 Submit **照样可按** —— 而且再按一次是**新的一批**。
+
+        这一条 2026-08-24 翻了面。从前是"两个都得关，否则再按一次就是整批从头重跑"，
+        那在当时是对的：一个界面只有一个批次，Submit 的含义就是"把这一批跑掉"。
+        现在 `start()` 每次先换身份，Submit 的含义变成"按当前设定起一批"，
+        没有任何东西会被盖 —— 而拦住它正是让整个工具显得一次性的那道闸。
+
+        判据不是按钮的颜色，是**磁盘上真的多了一批**：颜色可以对而行为是错的。
+        """
         root = _tk_or_skip(self)
         from gui.frames import split
 
         bridge, _runner, _sched = _gui(self.root)
         app = split.build_frame(root, bridge)._ewb_app
-        bridge.start(dry_run=False)
+        app.do_submit()
         _drive_gui(bridge)
         app.sync_buttons()
+        first = bridge.viewing()
+        self.assertTrue(first, "提交完却没在看任何一批")
         for name in ("Dry-run", "Submit"):
-            self.assertIn("disabled", app.btn[name].state())
+            self.assertNotIn("disabled", app.btn[name].state(), "%s 被关掉了" % name)
 
-    def test_resume_needs_a_real_submit_not_a_dry_run(self) -> None:
-        """dry-run 之后 Resume 必须是灰的：它从磁盘上的 batch.json 恢复，而那个文件不存在。"""
+        app.do_submit()
+        _drive_gui(bridge)
+        second = bridge.viewing()
+        self.assertNotEqual(second, first, "再按一次 Submit 落回了同一批 —— 上一批会被盖")
+        names = {item.name for item in bridge.batch_history()}
+        self.assertIn(first, names, "第一批从历史里消失了")
+        self.assertIn(second, names)
+
+    def test_rerun_failed_needs_a_real_submit_not_a_dry_run(self) -> None:
+        """dry-run 之后「Re-run failed」必须是灰的。
+
+        两个理由，任何一个都够：dry-run 没写过 `batch.json`（它要从那儿恢复），
+        而且 dry-run 一个 run 都不会变成 failed（全部原地留在 ready）。
+
+        按钮 2026-08-24 从「Resume」改叫「Re-run failed」—— 按钮栏上「Resume」
+        读起来是"继续一个被中断的东西"，而人在那一刻想的是"重试失败的"。
+        """
         root = _tk_or_skip(self)
         from gui.frames import split
 
@@ -1954,7 +1991,24 @@ class DryRunMustNotLockTheUi(_SmokeTest):
         bridge.start(dry_run=True)
         _drive_gui(bridge)  # 跑到终态：还在跑的时候按钮本来就该是灰的，那不是 bug
         app.sync_buttons()
-        self.assertIn("disabled", app.btn["Resume"].state())
+        self.assertIn("disabled", app.btn["Re-run failed"].state())
+
+    def test_rerun_failed_is_grey_when_the_batch_has_no_failures_negative(self) -> None:
+        """反向：一批全 done 的批次，那个按钮也得灰。
+
+        判据是"有没有 failed 可补"，不是"提交过没有" —— 后者会让一批全成功的批次
+        亮着一个按下去只会说"没有可跑的"的按钮，那种亮着等于骗人。
+        """
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        bridge, _runner, _sched = _gui(self.root)   # 默认 runner 全成功
+        app = split.build_frame(root, bridge)._ewb_app
+        app.do_submit()
+        _drive_gui(bridge)
+        app.sync_buttons()
+        self.assertEqual(bridge.viewed_summary().failed, 0, "这个用例要的是一批全成功的")
+        self.assertIn("disabled", app.btn["Re-run failed"].state())
 
 
 class PreflightRefusesInsteadOfFailingSixTimes(_SmokeTest):
@@ -2606,24 +2660,51 @@ class EachSubmitIsItsOwnBatch(_TempRootTest):
         bridge.reset()
         self.assertEqual(bridge.batch_name, "", "回灌自己的名字被当成了用户手打")
 
-    def test_submitting_onto_an_existing_batch_is_refused(self) -> None:
-        """落点上已经有一个批次 -> preflight 拦住，**一个 job 都不发**。
+    def test_submitting_never_lands_on_an_existing_batch(self) -> None:
+        """★ 提交**永远不会**落到一个已经存在的批次上。
+
+        这一条 2026-08-24 改强了。原来断言的是"preflight 拦住"——那是把一个
+        **守卫会响**当成不变量。现在 `start()` 每次先 `_mint_fresh_identity()`，
+        挑的就是第一个没被占的名字，于是那个守卫在正常路径上永远不响
+        （它降级成背带，守 mint 挑不出空位那种边角）。
+
+        断言守卫会响，就会在"守卫被删了但行为其实是对的"时红，
+        也会在"守卫还在但 mint 坏了"时**绿** —— 两头都不对。
+        判据只能是落点本身：连提交三次，三个不同的目录，一个都没被盖。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_batch_name("occupied")
+        landed = []
+        for _ in range(3):
+            bridge.start(dry_run=False)
+            _drive_gui(bridge)
+            landed.append(bridge.batch_dir())
+        self.assertEqual(len(set(landed)), 3, "三次提交落进了同一个目录：%r" % (landed,))
+        for path in landed:
+            self.assertTrue(
+                os.path.isfile(os.path.join(path, "batch.json")), "%s 不是一个批次" % path
+            )
+        self.assertEqual(
+            len({item.name for item in bridge.batch_history()}), 3, "历史里少了批次"
+        )
+
+    def test_the_guard_still_refuses_if_minting_is_bypassed(self) -> None:
+        """背带本身也要有测试：绕过 mint 直接把名字指到一个已有批次上 -> preflight 拦住。
 
         `write_batch_state` 那一层是无条件原子覆盖（它必须是 —— 跑到一半每拍都要写），
         所以拦只能拦在按下去之前。
         """
         bridge, _runner, _sched = _gui(self.root)
         bridge.set_batch_name("occupied")
-        bridge.plan()
-        os.makedirs(bridge.batch_dir(), exist_ok=True)
-        with open(os.path.join(bridge.batch_dir(), "batch.json"), "w", encoding="ascii") as h:
-            h.write("{}")
+        bridge.start(dry_run=False)
+        _drive_gui(bridge)
+        taken = bridge.batch_dir()
+        # 绕过 mint：直接把"下一批"的名字钉回那个已经存在的批次。
+        bridge.set_batch_name(os.path.basename(taken.rstrip("/")))
+        bridge._next_free_batch_name = lambda: bridge.batch_name   # type: ignore[assignment]
         problems = bridge.preflight()
-        self.assertTrue(
-            any("already a batch" in p for p in problems),
-            "落点上已经有一批了，preflight 却放行：%r" % (problems,),
-        )
         blocked = [p for p in problems if "already a batch" in p]
+        self.assertTrue(blocked, "绕过 mint 之后 preflight 也放行了：%r" % (problems,))
         self.assertIn("Next:", blocked[0])
         self.assertTrue(all(ord(ch) < 128 for ch in blocked[0]), "红区 LANG 常是 C => 纯 ASCII")
 
@@ -2639,6 +2720,33 @@ class EachSubmitIsItsOwnBatch(_TempRootTest):
         with open(os.path.join(bridge.batch_dir(), "batch.json"), "w", encoding="ascii") as h:
             h.write("{}")
         self.assertEqual(bridge.preflight(dry_run=True), [])
+
+    def test_the_suffix_does_not_accumulate(self) -> None:
+        """`mesh-2` / `mesh-3` / `mesh-4`，**不是** `mesh-2-2-2`。
+
+        2026-08-24 实测：不去掉词根末尾那个 `-<数字>`，连按三次 Submit 就得到
+        `gui_batch-2-2-2` —— 每一批的名字都对，合起来没法看。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_batch_name("mesh")
+        landed = []
+        for _ in range(4):
+            bridge.start(dry_run=False)
+            _drive_gui(bridge)
+            landed.append(bridge.viewing())
+        self.assertEqual(landed, ["mesh", "mesh-2", "mesh-3", "mesh-4"])
+
+    def test_a_hand_typed_name_that_looks_like_a_suffix_is_kept_when_free(self) -> None:
+        """反向：用户自己就想叫 `mesh-2`，而它没被占 -> 原样用它，不许改成 `mesh-3`。
+
+        去词根那一步只在**真撞上了**之后才生效。少了这条反向用例，
+        "去掉末尾数字"会退化成"永远重命名用户输入"。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_batch_name("mesh-2")
+        bridge.start(dry_run=False)
+        _drive_gui(bridge)
+        self.assertEqual(bridge.viewing(), "mesh-2")
 
     def test_the_gui_reloads_the_name_field_after_new_batch(self) -> None:
         """★ 界面那一格必须跟着换。
@@ -2664,6 +2772,197 @@ class EachSubmitIsItsOwnBatch(_TempRootTest):
             app.batch.get(), first, "New batch 之后界面那一格还是旧名字"
         )
         self.assertEqual(app.batch.get(), bridge.batch_name, "界面和 bridge 的名字对不上")
+
+
+class SettingsAndResultsAreSeparate(_TempRootTest):
+    """★ 2026-08-24「真解法」：「我正在编辑的设定」和「我正在看的那批结果」是两件事。
+
+    在这之前它们共用一个 `BatchState` —— `plan()` 重建它，driver 就地改它。于是
+    "提交之后还能改设定"必然把跑着那批的状态冲掉，界面只好把整个设定面板冻住，
+    而冻住又让工具显得是一次性的（用户原话：应该像 Cadence 的 simulation 一样，
+    跑一次就是一次新结果）。
+
+    拆开之后：`_state` 是预览（`plan()` 随便重建），`_viewed` 是结果（`plan()` 绝不碰）。
+    本组守的就是这条分界线 —— 它一旦漏，症状是**静默**的：表上的数字看起来都对，
+    只是说的不是同一件事。
+    """
+
+    def test_settings_stay_editable_while_a_batch_is_running(self) -> None:
+        """★ 承重：跑着的时候改设定，**跑着那批一行都不变**，而预览跟着变。"""
+        bridge, _runner, _sched = _gui(self.root, modes=GUI_MODES)
+        bridge.set_batch_name("live")
+        bridge.start(dry_run=False)
+        bridge.tick()
+        live_rows = len(bridge.runs())
+        self.assertTrue(bridge.is_running(), "this test needs the batch to be still running")
+
+        bridge.set_axis_values("temperature", ("25",))
+        bridge.plan()
+
+        self.assertEqual(bridge.viewing(), "live", "改个设定就把在看的那一批切走了")
+        self.assertEqual(len(bridge.runs()), live_rows, "跑着那批的行数被 plan() 冲掉了")
+        self.assertLess(len(bridge._state.runs), live_rows, "预览没跟着设定走")
+        _drive_gui(bridge)
+        summary = bridge.summary()
+        # 判据是"全部到终态"而不是"全部 done"——`GUI_MODES` 有意注入了失败，
+        # 而这条守的是"跑着那批没被 plan() 打断"，不是"它成功了"。
+        self.assertEqual(
+            summary["done"] + summary["failed"] + summary["skipped"],
+            live_rows,
+            "跑着那批没能跑到终态：%r" % (summary,),
+        )
+
+    def test_opening_a_batch_does_not_touch_the_settings(self) -> None:
+        """打开历史里某一批，界面上的勾选**一个都不许动**。
+
+        两件事混成一件的话，每点一次历史都会把手上正在编辑的设定冲掉 ——
+        而那正是"我只是想看看上次跑了什么"最常见的一步。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_batch_name("older")
+        bridge.start(dry_run=False)
+        _drive_gui(bridge)
+
+        bridge.show_preview()
+        bridge.set_axis_values("temperature", ("25",))
+        bridge.plan()
+        before = [(d.library, d.cell, d.view) for d in bridge.designs()]
+        preview_rows = len(bridge._state.runs)
+
+        bridge.open_batch("older")
+        self.assertEqual(bridge.viewing(), "older")
+        self.assertEqual(
+            [(d.library, d.cell, d.view) for d in bridge.designs()], before, "designs 被改了"
+        )
+        self.assertEqual(len(bridge._state.runs), preview_rows, "预览被打开历史冲掉了")
+
+    def test_adopt_settings_is_a_separate_explicit_action(self) -> None:
+        """「照着那一批再跑」是**另一个**动作，而且落点是**新的**。"""
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.set_batch_name("source")
+        bridge.set_axis_values("temperature", ("25", "85"))
+        bridge.start(dry_run=False)
+        _drive_gui(bridge)
+        source_dir = bridge.batch_dir()
+
+        bridge.show_preview()
+        bridge.set_axis_values("temperature", ("125",))
+        bridge.plan()
+        self.assertNotEqual(len(bridge._state.runs), 0)
+
+        bridge.adopt_settings_from("source")
+        bridge.plan()
+        temps = [
+            str(getattr(v, "value", v))
+            for axis in bridge.axes()
+            if axis.name == "temperature"
+            for v in axis.values
+        ]
+        # 按**数值**比，不按字面：批次里存的是规范化之后的值（`25.0`），
+        # 搬回来照样是 `25.0` —— 那是忠实的，原批次的目录名用的也是它。
+        self.assertEqual(sorted(float(t) for t in temps), [25.0, 85.0], "设定没被搬过来")
+        bridge.start(dry_run=False)
+        self.assertNotEqual(
+            os.path.normcase(bridge.batch_dir()),
+            os.path.normcase(source_dir),
+            "照着旧批次再跑，却写回了它自己的目录",
+        )
+
+    def test_the_view_cannot_be_switched_while_running(self) -> None:
+        """跑着的时候不许切走结果视图。
+
+        切走了 `tick()` 还在改 driver 手里那份，而表上显示的是别的东西 ——
+        两个都在动，就没人说得清哪个是真的。
+        """
+        bridge, _runner, _sched = _gui(self.root, modes=GUI_MODES)
+        bridge.set_batch_name("busy")
+        bridge.start(dry_run=False)
+        bridge.tick()
+        self.assertTrue(bridge.is_running())
+        with self.assertRaises(gui_state.EwaveBatchError):
+            bridge.show_preview()
+        with self.assertRaises(gui_state.EwaveBatchError):
+            bridge.open_batch("busy")
+        _drive_gui(bridge)
+        bridge.show_preview()          # 跑完就放行
+        self.assertEqual(bridge.viewing(), "")
+
+    def test_a_dry_run_does_not_become_a_history_entry(self) -> None:
+        """★ dry-run 不写盘 -> 它**不是**一条历史，也不该被当成"在看的一批"。
+
+        当成的话，跑完 dry-run 再改一个勾选，表会钉死在那份旧预览上
+        （`_viewed` 不跟着 `plan()` 走，那正是它存在的意义）——
+        而"dry-run 之后界面照样跟着勾选走"是 2026-08-20 修过的，不能再破一次。
+        """
+        bridge, _runner, _sched = _gui(self.root)
+        bridge.start(dry_run=True)
+        _drive_gui(bridge)
+        self.assertEqual(bridge.viewing(), "", "dry-run 被当成了一条历史")
+        self.assertEqual(bridge.batch_history(), (), "dry-run 在磁盘上留下了东西")
+        before = len(bridge.runs())
+        bridge.set_axis_values("temperature", ("25",))
+        bridge.plan()
+        self.assertLess(len(bridge.runs()), before, "dry-run 之后界面不再跟着勾选走")
+
+    def test_history_lists_what_is_on_disk_newest_first(self) -> None:
+        """历史 = 磁盘上的批次，新的在前。**别的会话跑的也要出现。**"""
+        bridge, _runner, _sched = _gui(self.root)
+        for name in ("one", "two", "three"):
+            bridge.set_batch_name(name)
+            bridge.start(dry_run=False)
+            _drive_gui(bridge)
+        names = [item.name for item in bridge.batch_history()]
+        self.assertEqual(set(names), {"one", "two", "three"})
+        for item in bridge.batch_history():
+            self.assertTrue(item.finished, "%s 应该是跑完的" % item.name)
+            self.assertEqual(item.total, item.done + item.failed)
+
+
+class HistoryPickerIsWiredUp(_SmokeTest):
+    """`Showing:` 那一格 —— 界面上「在看哪一批」的唯一出口。"""
+
+    def _app(self):
+        root = _tk_or_skip(self)
+        from gui.frames import split
+
+        bridge, _runner, _sched = _gui(self.root)
+        return bridge, split.build_frame(root, bridge)._ewb_app
+
+    def test_it_starts_on_preview_and_lists_batches_after_a_submit(self) -> None:
+        from gui._ui import PREVIEW_ROW
+
+        bridge, app = self._app()
+        app.recompute()
+        self.assertEqual(app.showing.get(), PREVIEW_ROW, "一开始不是在看预览")
+        app.do_submit()
+        _drive_gui(bridge)
+        app.recompute()
+        self.assertIn(bridge.viewing(), app.showing.get(), "提交完没切到那一批")
+        values = list(app.showing_combo.cget("values"))
+        self.assertEqual(values[0], PREVIEW_ROW, "预览那一行必须一直在第一位")
+        self.assertTrue(
+            any(bridge.viewing() in v for v in values[1:]), "刚跑完那批没进下拉"
+        )
+
+    def test_picking_preview_goes_back_to_the_current_settings(self) -> None:
+        from gui._ui import PREVIEW_ROW
+
+        bridge, app = self._app()
+        app.do_submit()
+        _drive_gui(bridge)
+        app.recompute()
+        submitted_rows = len(app.tree.get_children())
+        app.corner_vars["typical"].set(False)
+        app.recompute()
+        self.assertEqual(
+            len(app.tree.get_children()), submitted_rows, "还在看那一批，表却变了"
+        )
+        app.showing.set(PREVIEW_ROW)
+        app.on_showing_selected()
+        self.assertEqual(bridge.viewing(), "")
+        self.assertLess(
+            len(app.tree.get_children()), submitted_rows, "切回预览之后表没跟着设定走"
+        )
 
 
 if __name__ == "__main__":

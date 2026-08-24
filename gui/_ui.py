@@ -206,6 +206,14 @@ RUNS_EMPTY_BLOCKED = (
 （preflight / 空表提示 / 陈旧的表），一处一处堵。
 """
 
+PREVIEW_ROW = "(preview - current settings)"
+"""历史下拉里的第一行 = 「还没提交的那一份」。
+
+**它必须是一行、而不是一个"没选中"的空状态**：下拉框空着的时候人读不出
+"表上这些是预览"，只会以为界面还没加载完。摆成一行，`Showing:` 那句话就永远
+是完整的一句 —— 要么在看预览，要么在看某一批。
+"""
+
 RUNS_STALE_WARNING = (
     "!  These rows are the LAST VALID preview, not the current settings - the settings "
     "below do not expand (see the message at the bottom of the window). Fix that and the "
@@ -1242,6 +1250,7 @@ class BaseApp:
         "add_design", "del_design", "dup_design", "on_design_edit",
         # 批次 / 运行
         "do_submit", "do_dry_run", "do_cancel", "do_resume", "do_new_batch",
+        "on_showing_selected", "do_adopt_settings",
         "do_rename_batch", "do_duplicate_batch", "do_open_spec", "do_save_spec",
         "do_pick_batch_root", "do_pick_offdir", "do_open_batch_dir", "do_exit",
         "on_row_action", "show_log", "show_trace", "show_defaults", "show_about",
@@ -1456,10 +1465,13 @@ class BaseApp:
             "Dry-run": self.do_dry_run,
             "Submit": self.do_submit,
             "Cancel": self.do_cancel,
-            "Resume": self.do_resume,
             # 「只重跑没成的」**就是** resume 的语义（D7：判据来自磁盘上的产物，
             # done 的一个都不重跑）。给它另起一条路等于第二份调度逻辑。
-            "Re-run failed only": self.do_resume,
+            # 2026-08-24：从前这里挂着两个名字（Resume / Re-run failed only）指同一个
+            # 方法，而按钮栏上写的是第三个。一个动作三个名字 = 用户得先猜它们一样不一样。
+            # 现在全线统一成按钮栏那个人话名字。
+            "Re-run failed": self.do_resume,
+            "Use these settings": self.do_adopt_settings,
             "Extraction defaults...": self.show_defaults,
             "Show log...": self.show_log,
             "Developer log...": self.show_trace,
@@ -1468,7 +1480,7 @@ class BaseApp:
         for name, items in (
             ("File", ("New batch", "Open spec...", "Save spec as...", "-", "Exit")),
             ("Batch", ("Duplicate batch...", "Rename...", "-", "Open batch dir")),
-            ("Runs", ("Dry-run", "Submit", "Cancel", "Resume", "-", "Re-run failed only")),
+            ("Runs", ("Dry-run", "Submit", "Cancel", "-", "Re-run failed", "Use these settings")),
             (
                 "Tools",
                 (
@@ -1506,7 +1518,12 @@ class BaseApp:
         outer = ttk.Frame(parent)  # type: ignore[arg-type]
         f = ttk.Frame(outer, padding=(8, 6, 8, 2))
         f.pack(fill=tk.X)
-        ttk.Label(f, text="Batch name:").pack(side=tk.LEFT)
+        # ★ 「Next batch」不是「Batch name」（2026-08-24 改的）。Submit 每按一次起一批新的
+        #   （`GuiState.start` 先换身份），所以这一格是**下一批**的名字/词根，
+        #   不是"当前这一批"的名字 —— 当前在看哪一批由 Runs 上方那个 `Showing:` 说了算。
+        #   叫回 Batch name 的话，在看历史里某一批时这一格会读起来像"那一批叫这个"，
+        #   而改它其实只影响下一次提交。
+        ttk.Label(f, text="Next batch:").pack(side=tk.LEFT)
         entry = ttk.Entry(f, textvariable=self.batch, width=26, font=self.f_mono)
         entry.pack(side=tk.LEFT, padx=(6, 4))
         entry.bind("<KeyRelease>", lambda _e: self.recompute())
@@ -1951,8 +1968,8 @@ class BaseApp:
             self.trace.note("switch_group: stale row", "%s is not in the model" % name)
             self.refresh_groups()
             return
-        if not self.bridge.is_running() and not self.bridge.has_submitted():
-            self._guard(self.push)
+        # 设定永远可编辑（见 `recompute` 上那段）—— 这里不再有"提交过就不许推"的闸。
+        self._guard(self.push)
         try:
             self.bridge.set_active_group(name)
         except EwaveBatchError as exc:
@@ -1995,8 +2012,8 @@ class BaseApp:
         name = self._ask_group_name("New run group", self._suggest_group_name())
         if name is None:  # 取消
             return
-        if not self.bridge.is_running() and not self.bridge.has_submitted():
-            self._guard(self.push)
+        # 设定永远可编辑（见 `recompute` 上那段）—— 这里不再有"提交过就不许推"的闸。
+        self._guard(self.push)
         try:
             actual = self.bridge.add_group(name)
         except EwaveBatchError as exc:
@@ -2024,8 +2041,8 @@ class BaseApp:
         if name is None:  # 取消
             self.trace.note("duplicate cancelled")
             return
-        if not self.bridge.is_running() and not self.bridge.has_submitted():
-            self._guard(self.push)
+        # 设定永远可编辑（见 `recompute` 上那段）—— 这里不再有"提交过就不许推"的闸。
+        self._guard(self.push)
         try:
             actual = self.bridge.duplicate_group(source, name)
         except EwaveBatchError as exc:
@@ -2085,8 +2102,8 @@ class BaseApp:
         # 先把界面上的值落进 bridge —— 与 Add / Duplicate 同一条规矩。少了这一步，
         # "在 A 组里改了温度，然后删掉 B 组"会让那个温度被随后的 `_reload_group_vars()`
         # 用模型里的旧值盖回去（用户没撤销过任何东西，改动却没了）。
-        if not self.bridge.is_running() and not self.bridge.has_submitted():
-            self._guard(self.push)
+        # 设定永远可编辑（见 `recompute` 上那段）—— 这里不再有"提交过就不许推"的闸。
+        self._guard(self.push)
         name = self._selected_group()
         self.trace.note(
             "remove target", "selected=%s active=%s treesel=%s"
@@ -2508,6 +2525,31 @@ class BaseApp:
         else:
             self.runs_header = None
 
+        # ★「在看哪一批」摆在**表的正上方**（2026-08-24）。位置是有讲究的：
+        #   它选的就是下面这张表显示什么，摆在别处（比如左栏或者菜单里）就变成
+        #   "两个地方各说各的"。放在这儿也避免新增一个顶层 section ——
+        #   那要动三版 frame 和它们的一致性闸门，而这块内容本来就属于 Runs。
+        showing = ttk.Frame(box)
+        showing.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(showing, text="Showing:").pack(side=tk.LEFT)
+        self.showing = tk.StringVar(value=PREVIEW_ROW)
+        self.showing_combo = ttk.Combobox(
+            showing, textvariable=self.showing, state="readonly",
+            font=self.f_mono, width=46, values=(PREVIEW_ROW,),
+        )
+        self.showing_combo.pack(side=tk.LEFT, padx=(6, 6))
+        self.showing_combo.bind("<<ComboboxSelected>>", self.on_showing_selected)
+        self.btn_adopt = ttk.Button(
+            showing, text="Use these settings", width=18, command=self.do_adopt_settings
+        )
+        self.btn_adopt.pack(side=tk.LEFT)
+        ttk.Button(
+            showing, text="Open dir", width=10, command=self.do_open_batch_dir
+        ).pack(side=tk.LEFT, padx=(4, 0))
+        self._history: tuple[object, ...] = ()
+        """上一次画出来的那几行（`layout.BatchSummary`）。下拉里选中的那一行要靠位置
+        换回批次名 —— 显示的字符串带着计数，**不能**拿它当 id 反查。"""
+
         wrap = ttk.Frame(box)
         wrap.pack(fill=tk.BOTH, expand=True)
         columns = tuple(col[0] for col in RUN_COLS)
@@ -2611,9 +2653,13 @@ class BaseApp:
             ("Dry-run", self.do_dry_run, "TButton"),
             ("Submit", self.do_submit, "Accent.TButton"),
             ("Cancel", self.do_cancel, "TButton"),
-            ("Resume", self.do_resume, "TButton"),
+            # 「Resume」这个词在按钮栏上读起来是"继续一个被中断的东西"，
+            # 而人在那一刻想的是"重试失败的"。菜单里本来就有这个人话别名，
+            # 只是埋在 Runs 菜单里 —— 2026-08-24 把它挪到台面上。
+            ("Re-run failed", self.do_resume, "TButton"),
         ):
-            button = ttk.Button(f, text=text, width=9, command=command, style=style)
+            width = 13 if text == "Re-run failed" else 9
+            button = ttk.Button(f, text=text, width=width, command=command, style=style)
             button.pack(side=tk.LEFT, padx=2)
             self.btn[text] = button
         ttk.Button(f, text="Open batch dir", width=15, command=self.do_open_batch_dir).pack(
@@ -2860,14 +2906,18 @@ class BaseApp:
         self._syncing = True
         self._error = ""
         try:
-            # ⚠️ 跑过之后**不再重新展开矩阵**。`plan()` 会造一份全新的、每个 run 都是
-            # `ready` 的 state —— 表上那些 done / failed 会当场消失，而界面上看起来
-            # 只是"刷新了一下"。要改设定就按 New batch（`bridge.reset()`）。
-            if not self.bridge.is_running() and not self.bridge.has_submitted():
-                self._guard(self.push)
-                self._guard(self.bridge.plan)
+            # ★ 2026-08-24：这里**曾经**有一道闸 ——「真提交过就不再重新展开矩阵」。
+            #   它是必要的恶：那时 `plan()` 重建的正是 driver 就地在改的那个对象，
+            #   不冻住，表上的 done / failed 就会当场消失。代价是提交之后改设定
+            #   **界面毫无反应**，整个工具因此显得是一次性的。
+            #   现在两侧各有各的对象（`gui.state.GuiState._viewed`），`plan()` 只碰预览，
+            #   于是这道闸没有存在的理由了 —— 设定面板**永远可编辑**，跑着也能改，
+            #   改的是"下一批"。表上显示哪一批由 `Showing:` 那一格说了算。
+            self._guard(self.push)
+            self._guard(self.bridge.plan)
             # 这四条也要各自过闸：用户把 Mesh 的某个格子清空、把温度写成一个词，
             # 核心会（正确地）拒绝，而**界面不该因此死掉**。理由写在 `_guard` 上。
+            self._guard(self._sync_history)
             self._guard(self._sync_group_rows)
             self._guard(self._sync_freq_fields)
             self._guard(self._sync_counts)
@@ -3001,6 +3051,98 @@ class BaseApp:
                 label.config(foreground="#101010" if on else "#9c9c9c")
         if self.sw_combo is not None:
             self.sw_combo.config(state="readonly" if editable else "disabled")
+
+    def _history_label(self, item: object) -> str:
+        """历史里的一行长什么样。**一行要能独立看懂**（下拉收起来时只看得见选中那一行）。
+
+        `20260824_0251  12 runs  10 ok  2 fail` —— 名字 + 规模 + 结果，
+        三样缺一个都得点开才知道是哪一批。读坏了的那一批显式写 `unreadable`，
+        不许静默变成 `0 runs`（那是一句假话，产物可能好好地在那儿）。
+        """
+        if item.error:
+            return "%s  (unreadable)" % item.name
+        bits = ["%d runs" % item.total]
+        if item.done:
+            bits.append("%d ok" % item.done)
+        if item.failed:
+            bits.append("%d fail" % item.failed)
+        if item.running:
+            bits.append("%d live" % item.running)
+        return "%s  %s" % (item.name, "  ".join(bits))
+
+    def _sync_history(self) -> None:
+        """把历史下拉重画一遍，并让它显示 bridge 认为在看的那一批。
+
+        **磁盘是唯一真相**（`bridge.batch_history()` 每次现扫）：批次可能是别的会话
+        或 CLI 跑出来的，缓存等于让人对着一份过期的历史做决定。
+        """
+        if getattr(self, "showing_combo", None) is None:
+            return
+        try:
+            history = self.bridge.batch_history()
+        except Exception:  # pragma: no cover - 落点不可读时不该让整个界面死掉
+            history = ()
+        self._history = tuple(history)
+        values = [PREVIEW_ROW] + [self._history_label(item) for item in self._history]
+        self.showing_combo.config(values=values)
+        viewing = self.bridge.viewing()
+        if not viewing:
+            self.showing.set(PREVIEW_ROW)
+        else:
+            match = next(
+                (self._history_label(i) for i in self._history if i.name == viewing), ""
+            )
+            # 正在跑的那一批还没写进磁盘列表（或者刚写一半）时 `match` 是空的 ——
+            # 那时也要显示它，否则提交完的第一秒下拉会跳回 `(preview)`，
+            # 而表上明明是那一批。
+            self.showing.set(match or viewing)
+        summary = self.bridge.viewed_summary()
+        self.btn_adopt.state(["!disabled"] if summary is not None else ["disabled"])
+
+    def on_showing_selected(self, _event: object = None) -> None:
+        """换一批看。**只换看的东西，一个设定都不碰。**"""
+        choice = self.showing.get()
+        if choice == PREVIEW_ROW:
+            name = ""
+        else:
+            name = next(
+                (i.name for i in self._history if self._history_label(i) == choice), ""
+            )
+            if not name:
+                # 下拉里那一行是旧的（列表在这一拍之前变过）。重画一次让它消失，
+                # 比弹一个"没有这一批"的框有用 —— 用户并没有做错什么。
+                self._sync_history()
+                return
+        try:
+            if name:
+                self.bridge.open_batch(name)
+            else:
+                self.bridge.show_preview()
+        except EwaveBatchError as exc:
+            _error("Cannot switch the results view", str(exc))
+            self._sync_history()
+            return
+        self.refresh_tree()
+        self.update_status()
+        self.sync_buttons()
+        self._sync_history()
+
+    def do_adopt_settings(self) -> None:
+        """把正在看的那一批的设定搬进界面。**新的一批** —— 不写回它的目录。"""
+        viewing = self.bridge.viewing()
+        if not viewing:
+            return
+        try:
+            self.bridge.adopt_settings_from(viewing)
+        except EwaveBatchError as exc:
+            _error("Cannot use these settings", str(exc))
+            return
+        # 与 Open spec 同一条路：设定整个换掉了，界面变量要整份重灌
+        # （`recompute()` 里的 `push()` 会把界面变量写回 bridge —— 不重灌就是
+        #  把刚搬进来的设定又用旧值盖回去）。
+        self._init_vars_from_bridge()
+        self.refresh_designs()
+        self.recompute()
 
     def _sync_counts(self) -> None:
         # ★ 批次名空着的时候 bridge 会现起一个 UTC 时间戳名。不灌回输入框的话，
@@ -3309,27 +3451,27 @@ class BaseApp:
         return "%s: %s" % (last.kind.value, last.message)
 
     def sync_buttons(self) -> None:
-        """按钮的可用性 —— 「正在跑」「真提交过」「没得跑」是**三件**事，别合成一个布尔。
+        """按钮的可用性。
 
-        2026-08-20 用户报的坑就是把它们合成了一个：漏填官方 run 目录 -> dry-run 全
-        failed -> Dry-run / Submit / Cancel 一起变灰，只剩一个 Resume 亮着，
-        而 Resume 要读 dry-run 根本没写过的 batch.json。于是界面死在那儿，
-        填好目录也没用（`recompute()` 那道闸门同时把矩阵冻住了）。
-
-        现在的口径：
+        2026-08-24 起的口径（「设定」和「结果」拆开之后）：
 
         | 按钮 | 什么时候能按 | 为什么 |
         |---|---|---|
-        | Dry-run | 不在跑 且 有 run 且 没**真提交**过 | dry-run 过不算跑过，随便按 |
-        | Submit  | 同上 | 真提交之后再按一次是整批从头重跑 |
+        | Dry-run | 不在跑 且 有 run | 不写盘、不占目录，随便按 |
+        | Submit  | 不在跑 且 有 run | **每按一次起一个新批次**，不会盖任何东西 |
         | Cancel  | 正在跑 | — |
-        | Resume  | **真提交过** 且 不在跑 | 判据来自磁盘上的 batch.json，dry-run 没写过它 |
+        | Re-run failed | 在看某一批 且 那一批有 failed 且 不在跑 | 判据来自磁盘上的 batch.json |
 
-        「真提交过」= `bridge.has_submitted()`。它和 `has_started()` 的分家写在
-        `gui.state.GuiState.has_submitted` 上。
+        ★ 变化最大的是 Submit：它**不再因为"提交过"而变灰**。从前变灰是因为再按一次
+        等于把同一批从头重跑（10 核 / 100 GB / 35 分钟 × N），那确实该拦；
+        但根子上是"一个界面只有一个批次"的模型不对。现在按一次就是新的一批
+        （`GuiState.start` 会先换身份），旧的原封不动躺在历史里 —— 跟 Cadence ADE 的
+        simulation 一样，这正是用户 2026-08-24 要的那个模型。
+
+        Re-run failed 就是从前那个 Resume（同一个 `do_resume`）。改名是因为按钮栏上
+        「Resume」读起来是"继续一个被中断的东西"，而用户在那一刻想的是"重试失败的"。
         """
         running = self.bridge.is_running()
-        submitted = self.bridge.has_submitted()
         # A7：一个 run 都没有时按下去会起一个**空批次**（建目录、写 batch.json、
         # 状态栏报 "0 runs"），而用户按它是因为以为自己配好了。没得跑就不许按。
         # `run_count()` 会因为设定不合法而抛 —— 那种时候同样不该能提交。
@@ -3342,19 +3484,16 @@ class BaseApp:
                 empty = self.bridge.run_count() == 0
             except EwaveBatchError:
                 empty = True
-        # ★ 关键的一个字：判据是 `has_submitted()` 而不是 `has_started()`。
-        #   **dry-run 不算"跑过"** —— 它不提交 job、不建目录，重按一次代价是零。
-        #   2026-08-20 用户报的正是这个：漏填官方 run 目录 -> dry-run 全 failed ->
-        #   Dry-run 自己也变灰 -> 填好目录之后没有任何办法重新预览。
-        #   反过来，**真提交之后两个都得关**：那时表上是真批次的状态，再按 Dry-run
-        #   会拿同一份 state 重跑一遍预览、把真结果冲掉（补没成的走 Resume）。
-        off = running or submitted or empty
+        off = running or empty
         for name in ("Dry-run", "Submit"):
             self.btn[name].state(["disabled"] if off else ["!disabled"])
         self.btn["Cancel"].state(["!disabled"] if running else ["disabled"])
-        # Resume 只在**真提交过**之后才有意义：它是从磁盘上的 batch.json 恢复的，
-        # 而 dry-run 压根没写过那个文件（点下去只会得到一条读不到文件的报错）。
-        self.btn["Resume"].state(["!disabled"] if (submitted and not running) else ["disabled"])
+        # Re-run failed 要有**具体的东西可补**：正在看某一批，而且它真有 failed。
+        # 拿"提交过没有"当判据是不够的 —— 一批全 done 的批次按它只会得到
+        # 一句"没有可跑的"，那种按钮亮着等于骗人。
+        summary = self.bridge.viewed_summary()
+        can_rerun = bool(summary) and not running and summary.failed > 0
+        self.btn["Re-run failed"].state(["!disabled"] if can_rerun else ["disabled"])
 
     def popup(self, event: object) -> None:
         iid = self.tree.identify_row(event.y)  # type: ignore[attr-defined]
@@ -3561,28 +3700,20 @@ class BaseApp:
         return answer["value"]
 
     def do_rename_batch(self) -> None:
-        """改批次名。**跑过之后不许改** —— 名字就是目录名。
+        """改**下一批**的名字。**永远可以改** —— 它还没落过盘。
 
-        改一个已经落过盘的批次的名字，等于让界面指向一个空目录，而磁盘上那批产物
-        还在老名字底下、resume 也跟着找不着。要另起一个名字走 Duplicate batch。
+        2026-08-24 之前这里拦着一道「提交过就不许改」。那道闸当时是对的：一个界面只有
+        一个批次，那一格就是**那一批**的名字，而名字就是目录名，改它等于让界面指向
+        一个空目录、resume 跟着找不着。
 
-        ⚠️ 判据是 `has_submitted()` 而**不是** `has_started()`（2026-08-20 一并订正）：
-        dry-run 也算 `has_started()`，于是"按一次 Dry-run 就再也改不了批次名"，
-        而且拦下来时说的是「This batch has already been submitted」——
-        一句**假话**（dry-run 一个字节都没写）。这和按钮那边是同一条口径，
-        理由写在 `gui.state.GuiState.has_submitted` 上。
+        现在那一格是「下一批」的名字（见 `build_batchbar` 里的标签），
+        而已经落过盘的批次由历史列表按名字认领 —— 改这一格碰不到它们中的任何一个。
+        闸门连同它那句话一起撤掉：留着它就是拦一件根本不危险的事，
+        而它那句「This batch has already been submitted」在新模型里是**假话**。
         """
-        if self.bridge.has_submitted():
-            _error(
-                "Cannot rename this batch",
-                "This batch has already been submitted, and its name is its directory "
-                "name on disk.\nUse Batch -> Duplicate batch... to start a new one, or "
-                "File -> New batch.",
-            )
-            return
         name = self._ask_text(
-            "Rename batch",
-            "Batch name",
+            "Rename next batch",
+            "Next batch name",
             self.batch.get(),
             "This is the directory name under the batch root. Leave it empty to let the "
             "tool pick a UTC timestamp.",
