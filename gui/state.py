@@ -222,39 +222,65 @@ _TOGGLE_AXES: frozenset[str] = frozenset({"equalCurrent", "fullWave"})
 
 SUBMIT_ACCOUNT_PLACEHOLDER = "ACCOUNT"
 SUBMIT_QUEUE_PLACEHOLDER = "QUEUE"
-"""`dsub -A` / `-q` 的占位符。站点的账号和队列是身份坐标，**不许进源码**
-（硬约束 1b）—— 这里放两个一眼假的大写词，它们的职责只是把命令的形状摆出来。"""
+"""`dsub -A` / `-q` 的占位符。**默认值不再用它们**（见 `DEFAULT_SUBMIT_COMMAND`），
+但它们还活着，有两个真实用处：
+
+1. `site.example.sh` 里仍然是占位符 —— 那份是给别的站点抄的模板；
+2. 有人手工把它们打回输入框时，`submit_command_placeholders()` 照样拦得住。
+
+⇒ 这套闸门是**在的**，只是默认路径不再触发它。别因为"默认值已经是真的了"就删掉。"""
 
 SUBMIT_PLACEHOLDERS: tuple[str, ...] = (SUBMIT_ACCOUNT_PLACEHOLDER, SUBMIT_QUEUE_PLACEHOLDER)
 """还留在命令里就**不许真提交**，见 `GuiState.submit_command_placeholders()`。"""
 
+DEFAULT_SUBMIT_ACCOUNT = "ug_rfic.momHClass"  # redzone-allow：用户 2026-08-28 明确批准公开
+DEFAULT_SUBMIT_QUEUE = "bigmem"  # redzone-allow：用户 2026-08-28 明确批准公开
+"""本站点的 Donau 账号与队列。**这两行是 CLAUDE.md 硬约束 1b 唯一的例外**，
+由用户 2026-08-28 在部署实测之后明确要求：
+
+> 「我觉得问题不大，就是服务器名字这些而已；我让你改默认值」
+
+起因是同一天在别人机器上部署时实测的卡手：占位符默认值意味着**每台新机器都得
+先配一次**才提交得了，而那一步没人猜得到该填什么。判断是用户的 —— 这是他自己
+公司的调度账号，风险由他评估。
+
+⚠️ **例外的边界就是这两行，不许外推。** library / cell / view / 端口名 / ptxt 路径 /
+PDK 版本串 / workarea 路径 / 工号 / 主机名 **全部仍然禁止进源码**，理由一个字没变
+（它们描述的是设计和版图，不是一台调度器的名字）。加新的站点值进来之前先问用户。
+
+行尾那两个 `redzone-allow` 是给 `scripts/redzone_scan.sh` 看的逐行豁免 ——
+少了它，这个仓库以后每一次提交都会被闸门拦下来。"""
+
 DEFAULT_SUBMIT_COMMAND = (
     "dsub"
-    f" -A {SUBMIT_ACCOUNT_PLACEHOLDER}"
-    f" -q {SUBMIT_QUEUE_PLACEHOLDER}"
+    f" -A {DEFAULT_SUBMIT_ACCOUNT}"
+    f" -q {DEFAULT_SUBMIT_QUEUE}"
     " -R 'cpu=20;mem=100000'"
 )
-"""界面打开时 `Donau submit` 那一格里的东西 —— 一条**看得懂形状、改两个词就能用**
-的模板（用户 2026-08-20：不许空着。一个空输入框不告诉任何人它想要什么，
-于是「Donau 在哪里设置」这个问题在界面上无解）。
+"""界面打开时 `Donau submit` 那一格里的东西 —— **开箱即可提交的一条真命令**。
 
-三件事必须同时成立，缺任何一条这个默认值就变成有害的：
+历史（这段别删，它解释了为什么现在长这样）：
+
+* 2026-08-20 之前：那一格**空着**。空输入框不告诉任何人它想要什么形状，
+  于是「Donau 在哪里设置」这个问题在界面上无解。
+* 2026-08-20 → 08-28：占位符模板 `-A ACCOUNT -q QUEUE`，换不掉就拒绝提交。
+  形状对了，但**每台新机器仍然得先配一次**。
+* 2026-08-28 起：账号/队列用真值（`DEFAULT_SUBMIT_ACCOUNT` / `DEFAULT_SUBMIT_QUEUE`，
+  那里写着用户批准的原话）。判据从「一眼假」换成了「开箱能用」。
+
+仍然成立的两件事：
 
 1. **形状是真的**：flag 名与顺序跟 `sched.donau.build_dsub_argv` 同源
    （`-A` 账号 / `-q` 队列 / `-R` 资源），整条能过 `parse_dsub_prefix` ——
-   它是可执行命令的模板，不是示意图。`tests/test_gui_submit_default.py` 盯着这条同步。
-2. **值是假的，而且一眼假**：账号 / 队列走占位符（硬约束 1b）；`-R` 用的是
-   `docs/spec_example.yaml` 里那条**例子**串，不是红区实测值
-   （`sched.donau` 模块 docstring 第 3 条：别把某一次的快照当默认值）。
-3. **换不掉就提交不了**：占位符还在 ⇒ `submit_command_error()` 标红、
-   `_make_scheduler()` 直接抛。少了这条，这个默认值只是把「空着」换成
-   「提交了一批必然被 dsub 拒掉的作业」，而后者离病根更远、更难看出原因。
+   它是可执行命令，不是示意图。`tests/test_gui_submit_default.py` 盯着这条同步。
+2. **`-R` 那串仍然是例子，不是实测快照**：`docs/spec_example.yaml` 里那条。
+   `sched.donau` 模块 docstring 第 3 条记着"kit 里那个 cpu= 核数是旧快照、
+   红区实测已经变了" —— 资源串该由官方 run 目录顶掉，不该由这里定。
+   ⇒ **账号/队列改成真值，不等于资源也该改成真值**，这两件事的性质不同：
+   前者是"这台调度器叫什么"（不会变），后者是"这次要多少核"（每次都可能变）。
 
-有官方 run 目录时模板会被**整条顶掉**：`_site_facts()` 一解析出站点的提交前缀就覆盖它
-（那份比模板准）。所以模板只活在「还没有任何站点坐标」的那段时间里。
-
-⚠️ 这是**兜底**，不是唯一入口：装了 `site.local.sh` 的机器上，开局那格直接就是站点
-真实的那条命令（`default_submit_command()`），占位符根本不出现。见下面那一节。
+优先级没变，从弱到强：本默认值 < `site.local.sh` < 官方 run 目录解析出来的前缀
+< 用户在框里手打的。账号跟这里不一样的人，仍然走 `site.local.sh` 覆盖掉它。
 """
 
 SITE_LOCAL_NAME = "site.local.sh"

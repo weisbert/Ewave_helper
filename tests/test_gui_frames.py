@@ -428,13 +428,16 @@ class HeadlessBuild(unittest.TestCase):
     """控件树真的建起来了 —— 不是「函数没抛异常」而已。"""
 
     def setUp(self) -> None:
-        import tkinter
+        # 🚨 **复用 `tests.test_gui_common` 那个进程级共用根**，别在这里 `tkinter.Tk()`。
+        # Windows 上一个进程开到几十个 Tk 根之后 `Tk()` 开始抛
+        # `Can't find a usable init.tcl` —— 而那被当成"这台机器没有显示"⇒ 测试**静默跳过**
+        # （那边 `_SHARED_ROOT` 的注释记着 2026-08-20 的实测：skip 数在 4/5/6 之间跳）。
+        # 2026-08-28 又撞了一次，这次是**变红**不是跳过：`test_failure_visibility.py`
+        # 加了十来条建窗口的测试，本文件这几处"每条测试新建一个根"的老写法正好把总数
+        # 推过上限，于是本文件里**随机一条**红，而红的理由跟它测的事毫无关系。
+        from tests.test_gui_common import _tk_or_skip
 
-        self.root = tkinter.Tk()
-        self.root.withdraw()
-
-    def tearDown(self) -> None:
-        self.root.destroy()
+        self.root = _tk_or_skip(self)
 
     def test_stacked_builds_every_section(self) -> None:
         module = LAYOUTS["stacked"]
@@ -491,13 +494,16 @@ class WidgetKitWiring(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        import tkinter
+        # 🚨 **复用 `tests.test_gui_common` 那个进程级共用根**，别在这里 `tkinter.Tk()`。
+        # Windows 上一个进程开到几十个 Tk 根之后 `Tk()` 开始抛
+        # `Can't find a usable init.tcl` —— 而那被当成"这台机器没有显示"⇒ 测试**静默跳过**
+        # （那边 `_SHARED_ROOT` 的注释记着 2026-08-20 的实测：skip 数在 4/5/6 之间跳）。
+        # 2026-08-28 又撞了一次，这次是**变红**不是跳过：`test_failure_visibility.py`
+        # 加了十来条建窗口的测试，本文件这几处"每条测试新建一个根"的老写法正好把总数
+        # 推过上限，于是本文件里**随机一条**红，而红的理由跟它测的事毫无关系。
+        from tests.test_gui_common import _tk_or_skip
 
-        self.root = tkinter.Tk()
-        self.root.withdraw()
-
-    def tearDown(self) -> None:
-        self.root.destroy()
+        self.root = _tk_or_skip(self)
 
     def make_kit(self, accept_hints: bool = True):
         """假共用层：记下每个 section 收到的布局提示，返回真 widget 好让 pack 生效。"""
@@ -660,13 +666,16 @@ class TabbedRunCount(unittest.TestCase):
     """Run count 面板：草图 1b 用它换掉「设定和 run 不同屏」的代价。"""
 
     def setUp(self) -> None:
-        import tkinter
+        # 🚨 **复用 `tests.test_gui_common` 那个进程级共用根**，别在这里 `tkinter.Tk()`。
+        # Windows 上一个进程开到几十个 Tk 根之后 `Tk()` 开始抛
+        # `Can't find a usable init.tcl` —— 而那被当成"这台机器没有显示"⇒ 测试**静默跳过**
+        # （那边 `_SHARED_ROOT` 的注释记着 2026-08-20 的实测：skip 数在 4/5/6 之间跳）。
+        # 2026-08-28 又撞了一次，这次是**变红**不是跳过：`test_failure_visibility.py`
+        # 加了十来条建窗口的测试，本文件这几处"每条测试新建一个根"的老写法正好把总数
+        # 推过上限，于是本文件里**随机一条**红，而红的理由跟它测的事毫无关系。
+        from tests.test_gui_common import _tk_or_skip
 
-        self.root = tkinter.Tk()
-        self.root.withdraw()
-
-    def tearDown(self) -> None:
-        self.root.destroy()
+        self.root = _tk_or_skip(self)
 
     def test_panel_shows_counts_from_the_bridge(self) -> None:
         bridge = StubBridge(
@@ -905,13 +914,16 @@ class SplitDividerIsDraggable(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        import tkinter
+        # 🚨 **复用 `tests.test_gui_common` 那个进程级共用根**，别在这里 `tkinter.Tk()`。
+        # Windows 上一个进程开到几十个 Tk 根之后 `Tk()` 开始抛
+        # `Can't find a usable init.tcl` —— 而那被当成"这台机器没有显示"⇒ 测试**静默跳过**
+        # （那边 `_SHARED_ROOT` 的注释记着 2026-08-20 的实测：skip 数在 4/5/6 之间跳）。
+        # 2026-08-28 又撞了一次，这次是**变红**不是跳过：`test_failure_visibility.py`
+        # 加了十来条建窗口的测试，本文件这几处"每条测试新建一个根"的老写法正好把总数
+        # 推过上限，于是本文件里**随机一条**红，而红的理由跟它测的事毫无关系。
+        from tests.test_gui_common import _tk_or_skip
 
-        self.root = tkinter.Tk()
-        self.root.withdraw()
-
-    def tearDown(self) -> None:
-        self.root.destroy()
+        self.root = _tk_or_skip(self)
 
     def _build_split(self):
         """用**真的** `GuiState` 而不是 StubBridge。

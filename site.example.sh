@@ -27,8 +27,13 @@
 # ignored (they never break the GUI).
 
 # The whole dsub submit line, verbatim -- what the GUI shows in the "Donau
-# submit" box when it opens. The account and the queue are the two things worth
-# storing here: they are what you would otherwise retype on every box.
+# submit" box when it opens.
+#
+# SINCE 2026-08-28 YOU USUALLY DO NOT NEED THIS FILE AT ALL. The GUI now opens
+# with a real, submittable account and queue built in (gui.state
+# DEFAULT_SUBMIT_ACCOUNT / DEFAULT_SUBMIT_QUEUE), so a fresh box works out of
+# the box. Write this file only when YOUR account or queue differs from that
+# default -- which is the whole reason the override still exists.
 #
 # The GUI exposes this line for editing, so what you put here is a starting
 # point, not a lock. Two things still override it, in this order:
@@ -36,8 +41,9 @@
 #   * setting "Official run dir" replaces the line with the triplet parsed out
 #     of that run's remote_run_ewave.sh -- the script that actually ran is a
 #     better source than any default, including this one.
-# So if you never set this, the GUI still gets the real account and queue the
-# moment you point it at an official run -- this file only saves you the wait.
+# So if you never set this, the GUI already starts from a working default, and
+# it still gets the site's own account and queue the moment you point it at an
+# official run -- this file only matters when both of those are wrong for you.
 #
 # Shape (flags and order are what sched.donau builds):
 #   dsub -A <account> -q <queue> -R "cpu=<n>;mem=<n>"

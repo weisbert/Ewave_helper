@@ -9,8 +9,11 @@
 
 1. **形状是真的** —— 模板本身能过 `sched.donau.parse_dsub_prefix`，flag 名与那边同源。
    模板要是过不了自己的解析器，用户改完两个词照样提交不了，而报错离病根很远。
-2. **值是假的，且换不掉就不许真提交** —— 账号 / 队列是站点身份，不进源码（硬约束 1b）；
-   放过占位符的话，这个默认值只是把「空着」换成「一批必然被 dsub 拒掉的作业」。
+2. **开箱就能提交** —— 用户 2026-08-28 把账号/队列改成了真值（`gui.state`
+   `DEFAULT_SUBMIT_ACCOUNT` / `DEFAULT_SUBMIT_QUEUE`，硬约束 1b 的唯一例外）。
+   从前这里的契约是「值是假的、换不掉就不许提交」，起因是同一天部署实测的卡手：
+   占位符意味着每台新机器都得先配一次。**占位符闸门本身没删** —— 它现在守的是
+   "有人手工把 `ACCOUNT` 打回框里"，第 2 节两条测试盯着它还活着。
 3. **一有站点坐标就让位** —— 官方 run 目录里那条提交前缀整条顶掉模板，
    而模板里那条**例子**资源串**不许**顶掉官方那条真的。
 
@@ -43,21 +46,20 @@ from gui.state import GuiState
 # ★ 手写的期望（防自证配方 2：期望值不许由被测代码算出来）
 # --------------------------------------------------------------------------
 
-EXPECTED_TEMPLATE_ARGV: list[str] = [
-    "dsub",
-    "-A",
-    "ACCOUNT",
-    "-q",
-    "QUEUE",
-    "-R",
-    "cpu=20;mem=100000",
-]
-"""模板 shlex 分词之后必须逐字是这几个 token。
+EXPECTED_TEMPLATE_TOKEN_COUNT = 7
+"""默认命令 shlex 分词之后必须恰好这么多个 token：`dsub -A x -q y -R z`（手数）。"""
 
-`-R` 的值抄自 `docs/spec_example.yaml` 那条**例子**串（不是红区实测值）；
-账号 / 队列是占位符（硬约束 1b）。这张表手写出来是为了让「模板变了」这件事必须
-有人显式改测试，而不是测试跟着代码一起漂。
-"""
+EXPECTED_TEMPLATE_RESOURCES = "cpu=20;mem=100000"
+"""`-R` 的值。抄自 `docs/spec_example.yaml` 那条**例子**串，**不是**红区实测值 ——
+`sched.donau` 模块 docstring 第 3 条：别把某一次的快照当默认值。
+资源该由官方 run 目录顶掉，所以它留在这里当例子是对的。"""
+
+# ⚠️ 账号 / 队列**故意不在本文件里写出来**。它们 2026-08-28 起是真值
+# （`gui.state.DEFAULT_SUBMIT_ACCOUNT`，硬约束 1b 的例外条），而把一个站点取值
+# 抄进第二个文件就是把例外从"两行"扩成"到处都是"—— 那正是那条例外明确禁止的外推。
+# 于是这里改成**结构式判据**：位置对、flag 名与 donau 同源、值非空且不是占位符。
+# 代价是"账号具体是哪个串"没有测试盯着；那件事该由用户看一眼默认值决定，
+# 不该由一份会跟着漂的测试来复述。
 
 # --------------------------------------------------------------------------
 # 假站点坐标（字段全是假路径 —— `SiteFacts` 里装的全是站点身份，硬约束 1b）
@@ -156,8 +158,18 @@ class _BridgeTest(unittest.TestCase):
 
 class TemplateShape(unittest.TestCase):
     def test_template_parses_as_a_dsub_prefix(self) -> None:
-        """模板 = 一条**可执行命令的模板**，不是示意图。"""
-        self.assertEqual(parse_dsub_prefix(gui_state.DEFAULT_SUBMIT_COMMAND), EXPECTED_TEMPLATE_ARGV)
+        """默认值 = 一条**能直接执行的命令**，不是示意图（2026-08-28 起连值都是真的）。
+
+        结构式判据，见文件顶上那段注释：位置 / token 数 / 资源串是手写的，
+        账号和队列只验"非空且不是占位符"——它们的具体取值不在本文件里复述。
+        """
+        argv = parse_dsub_prefix(gui_state.DEFAULT_SUBMIT_COMMAND)
+        self.assertEqual(len(argv), EXPECTED_TEMPLATE_TOKEN_COUNT)
+        self.assertEqual(argv[6], EXPECTED_TEMPLATE_RESOURCES)
+        for position in (2, 4):
+            with self.subTest(position=position):
+                self.assertTrue(argv[position].strip(), "账号/队列不许是空的")
+                self.assertNotIn(argv[position], gui_state.SUBMIT_PLACEHOLDERS)
 
     def test_template_parses_as_a_dsub_prefix_negative(self) -> None:
         """反向：同一个解析器必须**拒掉**一条形似而实非的模板。
@@ -195,17 +207,30 @@ class TemplateShape(unittest.TestCase):
 
 
 class Placeholders(_BridgeTest):
-    def test_untouched_template_is_reported_as_placeholders(self) -> None:
-        bridge = self._bridge(resources="", official=False)
-        self.assertEqual(bridge.submit_command_placeholders(), ("ACCOUNT", "QUEUE"))
-        self.assertIn("placeholder", bridge.submit_command_error())
+    def test_the_default_is_submittable_out_of_the_box(self) -> None:
+        """★ 2026-08-28 翻面的那条契约：**开箱就能提交，一个字都不用改。**
 
-    def test_untouched_template_is_reported_as_placeholders_negative(self) -> None:
-        """反向：两个都换成真值 ⇒ 一句红字都不许剩（否则界面永远在报警，等于没报）。"""
+        起因是同一天在别人机器上部署时实测的卡手 —— 占位符默认值意味着每台新机器
+        都得先配一次，而那一步没人猜得到该填什么。
+        """
         bridge = self._bridge(resources="", official=False)
-        bridge.set_submit_command("dsub -A my_acct -q my_queue -R cpu=4;mem=100")
         self.assertEqual(bridge.submit_command_placeholders(), ())
         self.assertEqual(bridge.submit_command_error(), "")
+
+    def test_the_default_is_submittable_out_of_the_box_negative(self) -> None:
+        """反向：把占位符**手工打回框里** ⇒ 闸门照样拦、照样标红。
+
+        这条守的是"闸门还活着"。默认值不再触发它之后，很容易顺手把它删掉 ——
+        而删掉之后，一个把账号改错成 `ACCOUNT` 的人会拿到 N 条彼此无关的 dsub 拒绝，
+        每一条都离病根很远。
+        """
+        bridge = self._bridge(resources="", official=False)
+        bridge.set_submit_command(
+            "dsub -A %s -q %s -R cpu=4;mem=100"
+            % (gui_state.SUBMIT_ACCOUNT_PLACEHOLDER, gui_state.SUBMIT_QUEUE_PLACEHOLDER)
+        )
+        self.assertEqual(bridge.submit_command_placeholders(), ("ACCOUNT", "QUEUE"))
+        self.assertIn("placeholder", bridge.submit_command_error())
 
     def test_half_edited_command_still_counts_as_a_placeholder(self) -> None:
         """账号填了、队列忘了 —— 这条命令和模板已经不同，却照样一个 job 都提交不成。
@@ -217,25 +242,29 @@ class Placeholders(_BridgeTest):
         self.assertEqual(bridge.submit_command_placeholders(), ("QUEUE",))
 
     def test_submit_is_refused_while_placeholders_remain(self) -> None:
-        """真提交那条路必须**在发出任何东西之前**抛。"""
+        """真提交那条路必须**在发出任何东西之前**抛（占位符是手工打回去的）。"""
         bridge = self._bridge(resources="", official=True)
+        bridge.set_submit_command(
+            "dsub -A %s -q %s -R cpu=4;mem=100"
+            % (gui_state.SUBMIT_ACCOUNT_PLACEHOLDER, gui_state.SUBMIT_QUEUE_PLACEHOLDER)
+        )
         with self.assertRaises(EwaveBatchError) as caught:
             bridge.start(dry_run=False)
         self.assertIn("ACCOUNT", str(caught.exception))
         self.assertFalse(bridge.is_running(), "抛了却还把自己置成 running")
 
     def test_submit_is_refused_while_placeholders_remain_negative(self) -> None:
-        """反向：换成真账号 / 真队列之后，同一条路**不许**再抛。
+        """反向：**什么都不改**，同一条路不许抛 —— 默认值本身就该提交得出去。
 
-        没有这条的话，「永远抛」和「按占位符抛」看起来一样。
+        没有这条的话，「永远抛」和「按占位符抛」看起来一样；而它同时是
+        「开箱能用」这件事在**真提交那条路上**的判据（上面那条只验了红字）。
         """
         bridge = self._bridge(resources="", official=True)
-        bridge.set_submit_command("dsub -A my_acct -q my_queue -R cpu=4;mem=100")
         bridge.start(dry_run=False)
         self.assertTrue(bridge.is_running())
 
     def test_dry_run_is_allowed_with_the_template(self) -> None:
-        """dry-run 一个字节都不发出去，而「先看看命令长什么样」正是模板的用途。"""
+        """dry-run 一个字节都不发出去，所以它对占位符一向放行（这条没变）。"""
         bridge = self._bridge(resources="", official=True)
         bridge.start(dry_run=True)
         self.assertTrue(bridge.is_running())
@@ -350,16 +379,17 @@ class SiteLocal(unittest.TestCase):
         self.assertEqual(bridge.parallel(), 8)
 
     def test_site_local_supplies_the_opening_default_negative(self) -> None:
-        """反向：没有 site.local.sh ⇒ 退回占位符模板。
+        """反向：没有 site.local.sh ⇒ 退回内置默认值，而**那一条本身就能提交**。
 
-        盯着两件事：① 不是空串（那是这次要修的原病）；② 不是别处捡来的值 ——
+        盯着三件事：① 不是空串（2026-08-20 修的原病）；② 不是别处捡来的值 ——
         `$EWB_SITE_LOCAL` 指到不存在的文件时**不许**再去装机目录/CWD 兜底找一个，
-        否则"指错路径"的症状会变成"用了另一台机器的坐标"。
+        否则"指错路径"的症状会变成"用了另一台机器的坐标"；③ 退回去的那条没有占位符
+        （2026-08-28 翻面的契约：site.local.sh 从"必须配"降级成"账号不一样的人才配"）。
         """
         env = {"EWB_SITE_LOCAL": "/no/such/dir/site.local.sh"}
         bridge = GuiState(batch_root="./x", batch_name="b", env=env)
         self.assertEqual(bridge.submit_command, gui_state.DEFAULT_SUBMIT_COMMAND)
-        self.assertEqual(bridge.submit_command_placeholders(), ("ACCOUNT", "QUEUE"))
+        self.assertEqual(bridge.submit_command_placeholders(), ())
 
     def test_parser_tolerates_a_hand_written_file(self) -> None:
         """这文件是人手写的，读它的是 GUI 的构造函数 —— 多一行怪东西不该让界面起不来。"""
