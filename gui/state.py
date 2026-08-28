@@ -36,6 +36,7 @@ from dataclasses import replace
 from ewave_batch.core import cmd as cmd_module
 from ewave_batch.core import discover as discover_module
 from ewave_batch.core import layout as layout_module
+from ewave_batch.core import logparse as logparse_module
 from ewave_batch.core import matrix as matrix_module
 from ewave_batch.core import spec as spec_module
 from ewave_batch.model import (
@@ -2104,6 +2105,43 @@ class GuiState:
             if item.run_id == run_id:
                 return item
         return None
+
+    def run_log_files(self, run_id: str) -> tuple[str, ...]:
+        """这个 run 现在磁盘上有哪些日志可以看，按权威性排序（`ewave.log` 在最前）。
+
+        **空元组是正常状态**，不是错误：作业还在队列里排着的时候，一个日志文件都还没有。
+        界面据此显示「还没有日志」而不是报错。
+
+        坐标的两个来源，按新鲜度：跑这一批时 `self._plans` 里有现成的 `CommandPlan`；
+        从历史里点开一批看时它是空的 —— 那时靠 `Run.work_dir`（driver 填的）和
+        `Job.stdout_path`（提交时记的那份 `-o` 落点）。**两条都要有**，
+        否则"看历史批次的日志"这条路会静默地什么都不显示。
+        """
+        run = self.run(run_id)
+        if run is None:
+            return ()
+        plan = self._plans.get(run_id)
+        work_dir = (plan.work_dir if plan is not None else "") or run.work_dir
+        log_path = (plan.log_path if plan is not None else "") or (
+            run.job.stdout_path if run.job is not None else ""
+        )
+        ewave_dir = f"{work_dir}/{run.ewave_dir}" if work_dir and run.ewave_dir else ""
+        try:
+            return logparse_module.run_log_files(
+                ewave_dir=ewave_dir, run_log=log_path, run_dir=work_dir
+            )
+        except OSError:  # pragma: no cover - 网络盘抽风；看日志失败不该让界面炸
+            return ()
+
+    def run_log_tail(self, path: str) -> str:
+        """一份日志的末尾（`logparse.TAIL_BYTES` 字节）。读不动**不抛**，把原因当正文返回。
+
+        这个方法会被 `Output log` 那扇窗按轮询间隔反复调用 —— 「文件还没生成」
+        （作业在排队）是它最常见的返回，那是正常状态，不是异常。
+        """
+        if not path:
+            return ""
+        return logparse_module.read_log_tail(path)
 
     def plan_for(self, run_id: str) -> CommandPlan | None:
         return self._plans.get(run_id)

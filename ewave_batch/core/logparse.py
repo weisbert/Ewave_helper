@@ -71,8 +71,13 @@ __all__ = [
     "parse_emsolver_log",
     "parse_memory_estimate_mb",
     "merge_log_facts",
+    "parse_log_files",
     "parse_run_logs",
+    "run_log_files",
+    "collect_log_files",
+    "read_log_tail",
     "parse_port_order",
+    "TAIL_BYTES",
 ]
 
 
@@ -113,6 +118,13 @@ MAX_LOG_BYTES = 16 * 1024 * 1024
 MAX_SNP_SCAN_LINES = 50000
 """`parse_port_order` 最多扫多少行。几百频点 x 十几端口的 `.sNp` 约 7000 行数值块，
 留足余量；再多就是文件不对，没必要把整份读完。"""
+
+TAIL_BYTES = 64 * 1024
+"""`read_log_tail` 默认读末尾多少字节。**与 `MAX_LOG_BYTES` 不是一回事**：
+那个是"解析事实时最多读多少"（16 MB，防 mesh 日志刷屏），这个是"给人看多少"。
+
+64 KB 约 700 行，装得下一次崩溃的全部现场，又不会让界面每一拍去搬几 MB 文本 ——
+它会被 `Output log` 那扇窗按轮询间隔反复调用（`gui._ui._RunLogWindow`）。"""
 
 
 # --------------------------------------------------------------------------
@@ -746,14 +758,13 @@ def parse_run_logs(run_dir: str) -> LogFacts:
     日志缺失不抛异常（失败的 run 常常什么都没留），返回全 None 的 `LogFacts` 并在
     `warnings` 里说明。只读。
 
-    两条本函数自己的规矩：
+    本函数自己只管一条规矩：**看两层** —— `run_dir` 本身 + 它的直接子目录
+    （日志实际落在 `<corner>_<temp>/` 里，调用方手上常常只有 run 目录）。
+    解析与合并（含「失败一票否决」）在 `parse_log_files`。
 
-    1. **看两层**：`run_dir` 本身 + 它的直接子目录（日志实际在 `<corner>_<temp>/` 里）。
-    2. **失败一票否决**：任何一份日志报了 `ok=False`，合并结果就是 `False`，
-       哪怕另一份写满了 "done"。`merge_log_facts` 的先到先得管不了这件事
-       （它不知道还有别的来源），所以在这里补。
-       ⇒ 这正是 BRIEF §10 的现场：`ewave.log` 说 `Execute eresist done.`，
-       而 `emsolver.log` 里躺着 boost 异常。
+    ⚠️ 调用方如果手上有**具体某一个 run** 的坐标，该走 `run_log_files` +
+    `parse_log_files` 而不是这里：run 目录是 corner/temp 之间共享的，
+    对着它扫会把邻居的日志一起合并进来。
     """
     root = _posix(run_dir)
     if not root or not os.path.isdir(run_dir):
@@ -769,20 +780,116 @@ def parse_run_logs(run_dir: str) -> LogFacts:
             )
         )
 
+    return parse_log_files(paths)
+
+
+def parse_log_files(paths: Sequence[str]) -> LogFacts:
+    """一组**指名道姓的**日志文件 → 合并后的事实。只读，缺文件不抛。
+
+    从 `parse_run_logs` 里拆出来的，因为调用方分成了两类：
+
+    * 「给我一个目录，你自己去找」—— `parse_run_logs`，CLI 的 `status` 走这条；
+    * 「文件我已经挑好了」—— `sched.driver`，它必须**精确到这一个 run**
+      （run 目录是 corner/temp 之间共享的，扫目录会把邻居的日志合并进来），
+      挑法见 `run_log_files`。
+
+    「失败一票否决」这条规矩住在这里：任何一份日志说 `ok is False`，合并结果就是
+    `False`，哪怕另一份写满了 `Execute ... done.`。`merge_log_facts` 的先到先得
+    管不了这件事（它不知道还有别的来源）。
+    ⇒ BRIEF §10 的现场：`ewave.log` 说 done，`emsolver.log` 里躺着 boost 异常。
+    """
     parsed: list[LogFacts] = []
     for path in paths:
         text, note = _read_log(path)
         name = os.path.basename(path)
         facts = parse_ewave_log(text) if _is_main_log(name) else parse_emsolver_log(text)
-        facts.source_files = (path,)
+        facts.source_files = (_posix(path),)
         if note:
             facts.warnings = facts.warnings + (note,)
         parsed.append(facts)
-
+    if not parsed:
+        return LogFacts()
     merged = merge_log_facts(*parsed)
     if any(item.ok is False for item in parsed):
         merged.ok = False
     return merged
+
+
+def collect_log_files(root: str) -> tuple[str, ...]:
+    """`root` 和它**直接子目录**里的日志文件，按 (优先级, 路径) 排序。
+
+    `_collect_log_files` 的公开面 —— 界面要的是"有哪些日志可以看"这份**清单**
+    （拿去做下拉框），不是解析结果。
+    """
+    return tuple(_collect_log_files(root))
+
+
+def _order_key(path: str) -> tuple[int, str]:
+    """`run_log_files` 的排序键。认不出的日志排最后，不丢掉。"""
+    priority = _log_priority(os.path.basename(path))
+    return (len(LOG_FILE_NAMES) + 1 if priority is None else priority, _posix(path))
+
+
+def run_log_files(
+    *, ewave_dir: str = "", run_log: str = "", run_dir: str = ""
+) -> tuple[str, ...]:
+    """**一个 run 自己的**日志清单（去重 + 按优先级排）。三个来源，缺一不可。
+
+    | 来源 | 是什么 | 为什么单列 |
+    |---|---|---|
+    | `ewave_dir` | `<corner>_<temp>/`，eWave 自建的那层 | `ewave.log` / `emsolver.log` 在这里 |
+    | `run_log` | 我们自己捕获的那份 stdout（dsub `-o`） | 它在 **run_dir 里**，而且**崩得早时只有它**——eWave 还没来得及建目录 |
+    | `run_dir` | 退路 | 只在 `ewave_dir` 预测不出名字（空串）时才扫 |
+
+    🚨 **不许拿 `run_dir` 一把梭。** 同一个 run_dir 底下住着 N 个 corner/temp 组合
+    （`<axes-slug>` 按定义不含它们，见 `layout.compute_run_paths`）—— 扫它就是把邻居的
+    日志一起合并进来，然后报出一份张冠李戴的收敛结论。这条与 `cli._log_facts_for`
+    同源，两处必须一起改。
+
+    `run_log` 的优先级低于两份具名日志（`_log_priority` 已经这么排）：eWave 自己写的
+    那两份更权威，stdout 那份是它们不在时的救命稻草。
+    """
+    found: list[str] = []
+    if ewave_dir and os.path.isdir(ewave_dir):
+        found.extend(_collect_log_files(ewave_dir))
+    elif run_dir and os.path.isdir(run_dir):
+        found.extend(_collect_log_files(run_dir))
+    if run_log and os.path.isfile(run_log):
+        found.append(_posix(run_log))
+    return tuple(sorted(dict.fromkeys(found), key=_order_key))
+
+
+def read_log_tail(path: str, *, limit_bytes: int = TAIL_BYTES) -> str:
+    """一份日志的**末尾** `limit_bytes` 字节，给"实时看"用。读不动**不抛**，返回一句人话。
+
+    四条口径，每条都对应一个"看起来能用其实不能"的做法：
+
+    1. **只读末尾**：日志是追加写的，人要看的永远是最后那几十行；整份读进来只会
+       让界面每一拍搬几 MB。
+    2. **从中间切进来的第一行丢掉**：`seek` 落点几乎必然在某一行中间，留着它就是
+       让人读半句话（而且那半句话看起来像一条完整的、内容很怪的日志）。
+    3. **剥 ANSI**：eWave 即使 `--nogui` 也打色码（`strip_ansi` 的出处那条实测），
+       tkinter 的 Text 不认 escape，不剥就是满屏 `[0m`。
+    4. **不抛异常**：这个函数被界面按轮询间隔反复调用，而"文件还没生成"
+       （作业还在排队）是**正常状态**，不是错误。读不动就把原因当正文显示出来。
+    """
+    target = _posix(path)
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            if size > limit_bytes:
+                handle.seek(size - limit_bytes)
+            data = handle.read()
+    except OSError as exc:
+        return f"<cannot read {target}: {exc}>"
+    text = strip_ansi(data.decode("utf-8", errors="replace"))
+    if size > limit_bytes:
+        cut = text.find("\n")
+        text = text[cut + 1 :] if cut >= 0 else text
+        text = (
+            f"<... showing the last {len(data)} of {size} bytes of {target} ...>\n" + text
+        )
+    return text
 
 
 # --------------------------------------------------------------------------

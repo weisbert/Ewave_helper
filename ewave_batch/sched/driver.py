@@ -55,7 +55,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 
-from ..core import layout, matrix
+from ..core import layout, logparse, matrix
 from ..model import (
     BATCH_JSON_NAME,
     RUNS_CSV_NAME,
@@ -69,6 +69,7 @@ from ..model import (
     EwaveBatchError,
     Job,
     JobState,
+    LogFacts,
     PlanContext,
     Run,
     RunnerProtocol,
@@ -128,6 +129,15 @@ _SAMPLE_SUFFIX_MARK = "_sample."
 """扁平区里 `_sample` 那一份的接缝（`core.layout._flat_suffix` 产生的两种形状之一）。"""
 
 _MESSAGE_SEP = "; "
+
+_MAX_LOG_ERRORS_IN_MESSAGE = 3
+"""失败原因里最多带几条 eWave 自己的报错。
+
+上限存在的理由不是省地方，是**可读**：一次崩溃的日志能刷出上百条 `[error]`，
+而它们几乎全是同一个根因的回声。前几条就是根因；把一百条塞进 `Run.message`
+只会把"为什么失败"埋掉，而那正是这条 message 唯一的用途。
+全文永远在日志文件里，界面上有 `Output log` 那扇窗（`gui._ui._RunLogWindow`）。"""
+
 _MAX_MESSAGE_CHARS = 1200
 """`Run.message` 的上限。它每拍都被原子重写进 `batch.json`，塞一整份验收报告会让状态文件肿。"""
 
@@ -206,6 +216,26 @@ def _elapsed(start: str, end: str) -> float | None:
         return None
     delta = (b - a).total_seconds()
     return delta if delta >= 0 else None
+
+
+def _log_error_detail(facts: LogFacts | None) -> str:
+    """日志里的报错 → 一句能贴进 `Run.message` 的话。日志没自曝报错就返回空串。
+
+    **不判断成败，只转述。** `LogFacts.ok` 与"这个 run 成了"之间隔着产物验收
+    （`logparse` 模块 docstring 那张表），这里同理：把 eWave 说的话原样带出来，
+    结论仍然由 `verify_run_outputs` 下。
+    """
+    if facts is None:
+        return ""
+    errors = [" ".join(str(line).split()) for line in facts.errors if str(line).strip()]
+    if not errors:
+        return ""
+    shown = errors[:_MAX_LOG_ERRORS_IN_MESSAGE]
+    text = "eWave's own log says: " + _MESSAGE_SEP.join(shown)
+    extra = len(errors) - len(shown)
+    if extra > 0:
+        text += f" (+{extra} more like it in the log)"
+    return text
 
 
 def _clip(text: str) -> str:
@@ -562,10 +592,12 @@ class Driver:
             return True
         run.status = RunStatus.FAILED
         run.ended_at = run.ended_at or _utcnow()
+        said = _log_error_detail(self._attach_log_facts(run))
         run.message = _clip(
             f"the scheduler could not find job {job_id} for {seen} beats in a row, "
             "and the outputs do not verify either: "
             + _MESSAGE_SEP.join(verdict.reasons)
+            + ((". " + said) if said else "")
         )
         self._note(events, EventKind.FAILED, run.message, run=run)
         return True
@@ -579,6 +611,9 @@ class Driver:
         （BRIEF §10：eWave 崩了也 `exit=0`）。
         """
         report = verdict if verdict is not None else self._verify(run, events)
+        # 读日志放在**判成败之前**：失败时要拿它当失败原因，成功时它填 runs.csv 的
+        # converged / peak_memory_mb 两列。读不到就是 None，不影响下面任何一条判据。
+        facts = self._attach_log_facts(run)
         job = run.job
         run.ended_at = (job.ended_at if job is not None else "") or run.ended_at or _utcnow()
         elapsed = _elapsed(run.started_at, run.ended_at)
@@ -596,6 +631,13 @@ class Driver:
                 )
             elif code is not None:
                 detail += f". job exit code = {code}"
+            # ★ eWave 自己的原话排在**最后**：前面那半句说的是"我们怎么判定它失败的"，
+            #   这半句说的是"它自己说它怎么了" —— 后者才是人要拿去改的东西，
+            #   而 `_clip` 从尾巴上截，所以两者顺序反过来会先截掉有用的那半。
+            #   （所以 `_MAX_LOG_ERRORS_IN_MESSAGE` 卡得住，1200 字符也够。）
+            said = _log_error_detail(facts)
+            if said:
+                detail += ". " + said
             run.message = _clip(detail)
             self._note(events, EventKind.FAILED, run.message, run=run)
             return
@@ -1103,6 +1145,42 @@ class Driver:
                 return len(ctx.facts.official_port_spec.mapping)
             self._port_guard_skipped.add(design_key)
         return None
+
+    def _attach_log_facts(self, run: Run) -> LogFacts | None:
+        """把这个 run 的日志事实读进 `Run.log_facts` 并返回。**只读磁盘，读不到就当没有。**
+
+        ★ 存在的理由（2026-08-28，用户在师傅的机器上实测）：在这之前一个 failed 的 run
+        只说得出"产物验不过"，而**为什么**验不过（配额爆了 / mesh 崩了 / 许可证没拿到）
+        逐字躺在 eWave 自己的日志里，从来没人去读它。于是界面上的失败原因永远是
+        「outputs do not verify」—— 逐字正确，但对"我该改什么"零信息量。
+
+        三条口径：
+
+        1. **文件由 `logparse.run_log_files` 挑，不扫 run 目录**。run 目录是 corner/temp
+           之间共享的（`<axes-slug>` 按定义不含它们），扫它会把邻居的日志合并进来，
+           然后报出一份张冠李戴的结论。
+        2. **成功的 run 也读**。`runs.csv` 的 `converged` / `peak_memory_mb` /
+           `port_count` 三列本来就是从 `Run.log_facts` 来的（`layout.write_runs_csv`），
+           没人填它 ⇒ 那三列一直是空的。
+        3. **任何异常都吞掉**。这是诊断信息，不是判据 —— `done` 的唯一判据仍然是
+           `layout.verify_run_outputs`（BRIEF §10）。让读日志把一个已经跑完的批次
+           搞崩，是拿次要的东西赌主要的东西。
+        """
+        try:
+            paths = self._paths_for(run)
+        except Exception:  # noqa: BLE001 - 拼不出路径就是没日志可读，不该炸穿
+            return run.log_facts
+        try:
+            files = logparse.run_log_files(
+                ewave_dir=_posix(paths.ewave_dir),
+                run_log=_posix(paths.run_log),
+                run_dir=_posix(paths.run_dir),
+            )
+            if files:
+                run.log_facts = logparse.parse_log_files(files)
+        except OSError:  # pragma: no cover - 文件系统抽风
+            return run.log_facts
+        return run.log_facts
 
     def _finished(self) -> bool:
         if self._state.options.dry_run:

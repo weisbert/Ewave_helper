@@ -298,14 +298,18 @@ _LOG_NAV_KEYS: frozenset[str] = frozenset(
 """只读 Text 里**放行**的按键：移动光标和按住修饰键，一个都不改内容。"""
 
 MENU_ITEMS: tuple[str, ...] = (
+    "Output log",
     "Open output dir",
     "Copy command",
     "-",
     "Re-run this one",
     "Set as current",
 )
-"""右键菜单。「Open log」在草图里也有，这里合进 `Open output dir`
-（日志就在那个目录里，多一条只是多一次会走空的路径）。"""
+"""右键菜单。
+
+「Output log」排第一（2026-08-28 加，名字用用户自己的词）：在这之前"这个 run 为什么失败"在界面上
+**没有地方能回答** —— `Open output dir` 只是在文件管理器里打开一个目录，
+而红区的常态是纯 ssh 会话，那条路会走空。日志得在界面里直接看得见。"""
 
 NOT_IMPLEMENTED_SUFFIX = " (not implemented)"
 """接不上的菜单项后面加这个，并且**置灰**。
@@ -334,6 +338,34 @@ DISABLED_MENU_ITEMS: frozenset[str] = frozenset(
 CMD_ROWS_MIN = 2
 CMD_ROWS_MAX = 8
 """`Selected run -> Command` 那个框的行数区间。见 `show_detail`。"""
+
+REASON_ROWS_MIN = 2
+REASON_ROWS_MAX = 5
+"""`Selected run -> Reason` 那个框的行数区间。
+
+失败原因是**一句到几句话**：验收器的判词 + eWave 自己的原话（`sched.driver._log_error_detail`）。
+2 行装得下最常见的那条，5 行封顶是为了不把 Runs 表挤瘦 —— 再长的靠这个框自己滚，
+全文在 `Output log` 那扇窗里。"""
+
+RUNLOG_GEOMETRY = "1060x620"
+RUNLOG_ROWS = 26
+"""`Output log` 窗口的起始大小与正文行数。跟 Log 窗口同一套 —— 它们并排着用。"""
+
+RUNLOG_HINT = (
+    "Live tail of the selected run's own output log, refreshed on every poll. Read-only. "
+    "'Copy for sharing' replaces site names (library / cell / ptxt / paths) with "
+    "placeholders first."
+)
+
+RUNLOG_NO_SELECTION = "(no run selected - click a row in the Runs table)"
+
+RUNLOG_NO_FILE = (
+    "(no log file on disk yet)\n\n"
+    "This is normal while the job is still queued: eWave has not started, so it has not "
+    "written anything. It also happens when the submit itself failed - in that case "
+    "nothing was ever run, and the reason is the 'Reason' line above (and in the Log "
+    "window), not in here."
+)
 
 CMD_TREE_FLOOR_ROWS = 3
 """Command 框长高时，Runs 表至少得留下几行。见 `BaseApp._cmd_rows_within_budget`。
@@ -943,6 +975,305 @@ class _LogWindow:
         self.count_lbl.config(text="saved to %s" % os.path.basename(path))
 
 
+class _RunLogWindow:
+    """**Output log**（右键菜单 / `Selected run` 里那个按钮）—— 选中那个 run 自己的
+    日志，实时跟着看。
+
+    ★ 存在的理由（用户 2026-08-28，在师傅的机器上）：「我根本不知道返回的错到底是
+    什么……要实时的 log，也能返回 ewave 的报错」。在这之前界面能看见的只有两样：
+    driver 播的事件（Log 窗）和界面自己的动作（Developer log 窗）。而 **eWave 说了
+    什么**从来不在界面上 —— 它写在红区文件系统的 `<workDir>/<corner>_<temp>/ewave.log`
+    里，要看只能自己 ssh 过去 `tail`。这扇窗就是那个 `tail`。
+
+    四条设计口径：
+
+    1. **跟着选中的行走**，不钉在打开时那个 run 上。人的心智是"我在看这一条"，
+       而不是"我开了一扇看第 3 条的窗" —— 钉住的话，换一行之后这扇窗就在
+       **静默地**显示别人的日志，那是最坏的一种错。
+    2. **只读末尾**（`logparse.read_log_tail`，默认 64 KB）。它每一拍都被
+       `BaseApp._pump` 叫一次，整份读进来就是让界面按轮询间隔搬几 MB 文本。
+    3. **一个 run 可能有好几份日志**（`ewave.log` / `emsolver.log` / `mesh.log` /
+       我们自己捕获的那份 stdout），所以有个下拉框。默认选第一份 ——
+       `logparse.run_log_files` 已经按权威性排好了。用户选过之后**按文件名记住**，
+       否则每一拍刷新都把他跳回第一份。
+    4. **抬头带上失败原因**。日志文件和 `Run.message` 回答的是同一个问题的两半：
+       submit 就失败的 run 永远不会有日志文件（什么都没跑起来），那时候答案全在
+       message 里。两半放在一扇窗里，人才不用去猜该看哪儿。
+
+    `Copy for sharing` 与 Log 窗同一套脱敏（硬约束 1）：日志里逐字带着 library /
+    cell / ptxt / home 路径。
+    """
+
+    def __init__(self, app: "BaseApp") -> None:
+        self.app = app
+        self.run_id = ""
+        self._doc = ""
+        self._pick = ""
+        """用户选中那份日志的**文件名**（不是全路径）。路径每批都不一样，文件名不会。"""
+        self._files: tuple[str, ...] = ()
+
+        self.top = tk.Toplevel(app.top)
+        self.top.title("eWave Batch - Output log")
+        try:
+            self.top.geometry(RUNLOG_GEOMETRY)
+        except tk.TclError:  # pragma: no cover - 嵌进别人的窗口时
+            pass
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
+        self.follow = tk.BooleanVar(value=True)
+        self.pick_var = tk.StringVar(value="")
+
+        bar = ttk.Frame(self.top, padding=(8, 6))
+        bar.pack(side=tk.TOP, fill=tk.X)
+        ttk.Button(bar, text="Copy all", width=10, command=lambda: self._copy(False)).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(
+            bar, text="Copy for sharing", width=17, command=lambda: self._copy(True)
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bar, text="Save as...", width=11, command=self._save).pack(side=tk.LEFT)
+        ttk.Label(bar, text="Log file", style="Hint.TLabel").pack(side=tk.LEFT, padx=(12, 4))
+        self.combo = ttk.Combobox(
+            bar, textvariable=self.pick_var, state="readonly", width=24, values=()
+        )
+        self.combo.pack(side=tk.LEFT)
+        self.combo.bind("<<ComboboxSelected>>", self._on_pick)
+        ttk.Checkbutton(bar, text="Follow", variable=self.follow).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(bar, text="Close", width=8, command=self.close).pack(side=tk.RIGHT)
+        self.count_lbl = ttk.Label(bar, text="", style="Hint.TLabel")
+        self.count_lbl.pack(side=tk.RIGHT, padx=8)
+
+        # 抬头那一行：run + 状态。它有颜色，因为"这条到底成没成"要在读日志之前就答完。
+        self.verdict = tk.Label(
+            self.top,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            font=app.f_ui_b,
+            padx=8,
+            pady=4,
+            wraplength=1000,
+        )
+        self.verdict.pack(side=tk.TOP, fill=tk.X)
+
+        self.hint = ttk.Label(self.top, text=RUNLOG_HINT, style="Hint.TLabel", wraplength=1000)
+        self.hint.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(2, 6))
+        self.top.bind("<Configure>", self._refit_wraps, add="+")
+
+        wrap = ttk.Frame(self.top, padding=(8, 0))
+        wrap.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.text = tk.Text(
+            wrap,
+            height=RUNLOG_ROWS,
+            wrap="none",
+            font=app.f_mono,
+            relief=tk.SOLID,
+            bd=1,
+            background="#fbfbfb",
+            foreground="#222222",
+        )
+        yscroll = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.text.yview)
+        xscroll = ttk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=self.text.xview)
+        self.text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.text.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        _make_readonly(self.text)
+
+        if smoke_enabled():
+            self.top.withdraw()
+
+    def _refit_wraps(self, _event: object = None) -> None:
+        try:
+            width = max(200, self.top.winfo_width() - 24)
+        except tk.TclError:  # pragma: no cover - 窗口已经关掉
+            return
+        self.verdict.config(wraplength=width)
+        self.hint.config(wraplength=width)
+
+    # ------------------------------------------------------------- 生命周期
+    def alive(self) -> bool:
+        try:
+            return bool(self.top.winfo_exists())
+        except tk.TclError:  # pragma: no cover - 解释器收尾时
+            return False
+
+    def close(self) -> None:
+        try:
+            self.top.destroy()
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    def present(self) -> None:
+        if not self.alive() or smoke_enabled():
+            return
+        try:
+            self.top.deiconify()
+            self.top.lift()
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    # --------------------------------------------------------------- 内容
+    def set_run(self, run_id: str) -> None:
+        """换一条 run。换了就把缓存的文档清掉，逼下一次 `refresh` 真重画。"""
+        if run_id == self.run_id:
+            return
+        self.run_id = run_id or ""
+        self._doc = ""
+
+    def _on_pick(self, _event: object = None) -> None:
+        self._pick = self.pick_var.get().strip()
+        self.refresh(force=True)
+
+    def files(self) -> tuple[str, ...]:
+        """这个 run 现在磁盘上有哪些日志。bridge 没这个方法（旧的假 bridge）就当没有。"""
+        getter = getattr(self.app.bridge, "run_log_files", None)
+        if not callable(getter) or not self.run_id:
+            return ()
+        try:
+            return tuple(getter(self.run_id))
+        except Exception:  # noqa: BLE001 - 看日志失败不该让界面炸
+            return ()
+
+    def _chosen(self, files: tuple[str, ...]) -> str:
+        """要显示哪一份。用户选过的那个文件名还在就用它，否则第一份（最权威的那份）。"""
+        if not files:
+            return ""
+        if self._pick:
+            for path in files:
+                if os.path.basename(path) == self._pick:
+                    return path
+        return files[0]
+
+    def _sync_combo(self, files: tuple[str, ...], chosen: str) -> None:
+        """下拉框跟着文件清单走。**只在清单真变了时动它** —— 每拍重设一次
+        `values` 会把用户正拉开的下拉列表关掉。"""
+        if files != self._files:
+            self._files = files
+            self.combo.config(values=tuple(os.path.basename(path) for path in files))
+        name = os.path.basename(chosen) if chosen else ""
+        if self.pick_var.get() != name:
+            self.pick_var.set(name)
+
+    def document(self) -> str:
+        """屏幕上、剪贴板里、存盘文件里 —— **同一份**文本。"""
+        bridge = self.app.bridge
+        if not self.run_id:
+            return RUNLOG_NO_SELECTION + _NL
+        run = bridge.run(self.run_id)
+        status = getattr(getattr(run, "status", None), "value", "") or _DASH
+        message = " ".join(str(getattr(run, "message", "") or "").split())
+        files = self.files()
+        chosen = self._chosen(files)
+        self._sync_combo(files, chosen)
+
+        head = [
+            "# eWave Batch run log",
+            "# run        %s" % self.run_id,
+            "# status     %s" % status,
+            "# job        %s" % (getattr(getattr(run, "job", None), "job_id", "") or _DASH),
+            "# log file   %s" % (chosen or _DASH),
+        ]
+        if len(files) > 1:
+            head.append(
+                "# also here  %s"
+                % ", ".join(os.path.basename(p) for p in files if p != chosen)
+            )
+        if message:
+            # ★ 失败原因进抬头，不是可有可无的装饰：submit 就失败的 run **永远不会有
+            #   日志文件**（什么都没跑起来），那时这一行是这扇窗里唯一的内容。
+            head.append("# reason     %s" % message)
+        head.append(LOG_RULE)
+
+        if not chosen:
+            return _NL.join(head + [RUNLOG_NO_FILE]) + _NL
+        reader = getattr(bridge, "run_log_tail", None)
+        if not callable(reader):
+            return _NL.join(head + ["(this build's bridge cannot read log files)"]) + _NL
+        try:
+            body = reader(chosen)
+        except Exception as exc:  # noqa: BLE001 - 读不动就把原因显示出来
+            body = "<cannot read %s: %s>" % (chosen, exc)
+        return _NL.join(head + [body or "(the log file is empty)"]) + _NL
+
+    def verdict_text(self) -> tuple[str, str, str]:
+        """(那句话, 前景色, 背景色)。回答"这一条成没成"，在读日志之前。"""
+        run = self.app.bridge.run(self.run_id) if self.run_id else None
+        status = getattr(getattr(run, "status", None), "value", "")
+        if status == "failed":
+            return (
+                "This run FAILED. The reason is in the header below; if eWave itself said "
+                "anything, it is in the log body.",
+                RED,
+                "#f6d8d8",
+            )
+        if status == "done":
+            return ("This run finished and its outputs verified.", "#1a5c26", "#dcecdc")
+        if status in ("running", "pending"):
+            return (
+                "This run is still in flight - the log grows as eWave writes it. "
+                "'Follow' keeps the view pinned to the end.",
+                "#222222",
+                "#f0f0f0",
+            )
+        return ("%s" % (status or "no run selected"), "#222222", "#f0f0f0")
+
+    def refresh(self, force: bool = False) -> None:
+        """重画。内容没变就**什么都不做** —— 否则用户刚选中的那一段每拍都被清掉。"""
+        if not self.alive():
+            return
+        doc = self.document()
+        message, foreground, background = self.verdict_text()
+        self.verdict.config(text=message, fg=foreground, bg=background)
+        self.count_lbl.config(text="%d lines" % doc.count(_NL))
+        if doc == self._doc and not force:
+            return
+        self._doc = doc
+        first, _last = self.text.yview()
+        self.text.delete("1.0", tk.END)
+        self.text.insert("1.0", doc)
+        self.text.yview_moveto(1.0 if self.follow.get() else first)
+
+    # --------------------------------------------------------------- 动作
+    def _copy(self, masked: bool) -> None:
+        """整份进剪贴板。`masked` = 先过一遍脱敏表（硬约束 1）。"""
+        doc = self._doc or self.document()
+        note = "copied %d lines" % doc.count(_NL)
+        if masked:
+            table = self.app.bridge.redaction_map()
+            doc = gui_state.redact(doc, table)
+            note = "copied %d lines, %d site names masked" % (doc.count(_NL), len(table))
+        try:
+            self.top.clipboard_clear()
+            self.top.clipboard_append(doc)
+            self.top.update()
+        except tk.TclError as exc:  # pragma: no cover - 没有剪贴板的环境
+            note = "could not copy: %s" % exc
+        self.count_lbl.config(text=note)
+
+    def _save(self) -> None:
+        """存盘。存的是**原文**（没脱敏）：文件留在这台机器上，脱敏是"发出去"才要的。"""
+        if smoke_enabled():
+            return
+        stem = (self.run_id or "run").replace("/", "_").replace("\\", "_")
+        path = filedialog.asksaveasfilename(
+            parent=self.top,
+            title="Save output log",
+            defaultextension=".log",
+            initialfile="%s.log" % stem,
+            filetypes=[("Log file", "*.log"), ("Text file", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline=_NL) as handle:
+                handle.write(self.document())
+        except OSError as exc:
+            _error("Cannot save the output log", str(exc))
+            return
+        self.count_lbl.config(text="saved to %s" % os.path.basename(path))
+
+
 class _TraceWindow:
     """**Developer log** —— 用户点了什么 → 界面做了什么 → 报了什么错，一条一行。
 
@@ -1199,6 +1530,14 @@ class BaseApp:
         self.settings_grid: ttk.Frame | None = None
         self.sw_combo: ttk.Combobox | None = None
         self.log_btn: ttk.Button | None = None
+        # Reason 那一行的三个控件。**只有建了 detail 框的布局才有**（现在是 split）——
+        # 别的布局照样能跑，失败原因走 Log / Output log 两扇窗。
+        self.reason_lbl: ttk.Label | None = None
+        self.reason_holder: ttk.Frame | None = None
+        self.reason_text: tk.Text | None = None
+        self._reason_shown = False
+        self._runlog: "_RunLogWindow | None" = None
+        """Output log 窗口。同 `_log`：**最多一扇**。"""
         self._log: _LogWindow | None = None
         """Log 窗口。**最多一扇** —— 用户按第二次 Log 是"我要看日志"，
         不是"我要两份日志"，而两扇窗只有一扇会被 `_pump()` 刷新。"""
@@ -2635,8 +2974,73 @@ class BaseApp:
         self.cmd_text.configure(yscrollcommand=cmd_scroll.set, state="disabled")
         self.cmd_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         cmd_scroll.pack(side=tk.LEFT, fill=tk.Y)
+
+        # ---- Reason：这个 run 为什么失败 --------------------------------
+        # 🚨 2026-08-28 用户在师傅的机器上实测出来的洞，原话是「我根本不知道返回的错
+        #    到底是什么」。在这之前一个 failed 的 run 在主界面上只有一个红色的状态字，
+        #    **为什么失败一个字都没有** —— 而 `Run.message` 里逐字躺着 dsub 的 stderr
+        #    （`sched.donau.submit` 三道闸原样带出来的）/ 产物验收器的判词 / eWave
+        #    自己的报错（`sched.driver._log_error_detail`），只是从来没有控件显示它。
+        #    信息一直都在，缺的只是这十几行。
+        self.reason_lbl = ttk.Label(box, text="Reason", width=9, anchor=tk.NW)
+        self.reason_holder = ttk.Frame(box)
+        self.reason_text = tk.Text(
+            self.reason_holder,
+            height=REASON_ROWS_MIN,
+            wrap="word",
+            font=self.f_mono,
+            relief=tk.SOLID,
+            bd=1,
+            background="#fdf3f3",
+            foreground=RED,
+        )
+        reason_scroll = ttk.Scrollbar(
+            self.reason_holder, orient=tk.VERTICAL, command=self.reason_text.yview
+        )
+        self.reason_text.configure(yscrollcommand=reason_scroll.set, state="disabled")
+        self.reason_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        reason_scroll.pack(side=tk.LEFT, fill=tk.Y)
+
+        # 「Output log」在这里而不是只在右键菜单里：右键菜单是发现不了的东西，而这恰恰是
+        # 出事之后第一个要按的按钮。红区常态是纯 ssh 会话，`Open output dir` 那条路
+        # 会走空（没有文件管理器），日志必须在界面里直接看得见。
+        ttk.Button(box, text="Output log", width=11, command=self.show_run_log).grid(
+            row=3, column=1, sticky=tk.W, pady=(5, 0)
+        )
         box.columnconfigure(1, weight=1)
         return box
+
+    def _set_reason(self, message: str) -> None:
+        """`Selected run -> Reason` 那一行。**空就整行收起来。**
+
+        为什么收起来而不是显示 `-`：一个常驻的空红框会让人以为"失败了但没写原因"，
+        而真相通常是这个 run 根本没失败。这一行**出现本身**就是一句话。
+
+        文本先折成一段（`" ".join(split())`）：核心那些错误信息自带换行（一句
+        "什么坏了" + 一句 `Next:` 该怎么办），而这个框只有 2-5 行高，
+        照原样换行会把 `Next:` 顶到看不见的地方。`wrap="word"` 负责折行。
+        """
+        widget = self.reason_text
+        if widget is None or self.reason_lbl is None or self.reason_holder is None:
+            return
+        text = " ".join(str(message or "").split())
+        if not text:
+            if self._reason_shown:
+                self.reason_lbl.grid_remove()
+                self.reason_holder.grid_remove()
+                self._reason_shown = False
+            return
+        widget.config(state="normal")
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", text)
+        widget.config(state="disabled")
+        rows = max(REASON_ROWS_MIN, min(REASON_ROWS_MAX, len(text) // 88 + 1))
+        if int(widget.cget("height")) != rows:
+            widget.config(height=rows)
+        if not self._reason_shown:
+            self.reason_lbl.grid(row=2, column=0, sticky=tk.NW, pady=(4, 0))
+            self.reason_holder.grid(row=2, column=1, sticky="ew", pady=(4, 0))
+            self._reason_shown = True
 
     # ----------------------------------------------------------- action bar
     def build_actionbar(
@@ -3351,6 +3755,9 @@ class BaseApp:
     def show_detail(self) -> None:
         selection = self.tree.selection()
         if not selection:
+            # 没选中就把 Reason 收起来 —— 留着上一个 run 的失败原因，等于把它挂到
+            # 一个没人选中的行上，比不显示更坏。
+            self._set_reason("")
             return
         run_id = selection[0]
         self.out_var.set(_label(self.bridge.out_dir(run_id)))
@@ -3367,6 +3774,8 @@ class BaseApp:
             self.cmd_text.config(height=rows)
         self.cmd_text.config(state="disabled")
         run = self.bridge.run(run_id)
+        self._set_reason(getattr(run, "message", "") if run is not None else "")
+        self._runlog_refresh(run_id)
         if self.detail_box is not None and run is not None:
             self.detail_box.config(text=" Selected run - %s  [%s] " % (run.run_id, run.status.value))
 
@@ -3517,6 +3926,9 @@ class BaseApp:
         self._timer = None
         report = self.bridge.tick()
         self.refresh_tree()
+        # ★ 「实时」不能只对表格成立。人盯着的是失败原因和那份日志 ——
+        #   表格每拍在动而 Reason / Output log 停在提交那一刻，是最难受的一种半吊子。
+        self._refresh_selection()
         self.update_status()
         self.sync_buttons()
         if report is not None and report.finished:
@@ -3542,6 +3954,55 @@ class BaseApp:
             self._log_refresh()
             return
         self.show_log()
+
+    def _selected_run_id(self) -> str:
+        """Runs 表里选中的那个 run_id（没选中 = 空串）。"""
+        try:
+            selection = self.tree.selection()
+        except tk.TclError:  # pragma: no cover - 控件已经没了
+            return ""
+        return selection[0] if selection else ""
+
+    def _refresh_selection(self) -> None:
+        """选中那个 run 的 Reason / Output log 跟着刷一拍。
+
+        `show_detail` 只在**建了 detail 框的布局**里有意义（现在是 split）——
+        别的布局没有 `cmd_text`，照调会每拍抛一次 `AttributeError`。
+        Output log 那扇窗与布局无关，永远刷。
+        """
+        if getattr(self, "cmd_text", None) is not None:
+            self.show_detail()
+        else:
+            self._runlog_refresh(self._selected_run_id())
+
+    def show_run_log(self) -> object:
+        """打开（或前置）**Output log** 窗口：选中那个 run 自己的日志，实时跟。
+
+        ★ 与另外两扇窗的分工（三扇窗，各答一个问题）：
+
+        | 窗口 | 讲什么 | 答哪个问题 |
+        |---|---|---|
+        | Log | driver 事件：提交 / 完成 / 失败 | "这一批走到哪了" |
+        | **Output log** | **eWave 自己写的那几份日志的末尾** | **"这一条为什么失败"** |
+        | Developer log | 界面事件：点击 / 弹框 / 被吞掉的异常 | "界面刚才为什么怪" |
+
+        在这之前第二行是空的：eWave 的报错只存在于红区文件系统上的
+        `<workDir>/<corner>_<temp>/ewave.log`，而界面从不读它。
+        """
+        if self._runlog is None or not self._runlog.alive():
+            self._runlog = _RunLogWindow(self)
+        self._runlog.set_run(self._selected_run_id())
+        self._runlog.refresh(force=True)
+        self._runlog.present()
+        return self._runlog
+
+    def _runlog_refresh(self, run_id: str = "") -> None:
+        """Output log 窗口开着就跟着刷；没开就什么都不做（**不为了刷新去开窗**）。"""
+        window = self._runlog
+        if window is None or not window.alive():
+            return
+        window.set_run(run_id or self._selected_run_id())
+        window.refresh()
 
     def show_log(self) -> object:
         """打开（或前置）Log 窗口。已经开着就只刷新 + 提到最前，**不开第二扇**。"""
@@ -3959,6 +4420,9 @@ class BaseApp:
             return
         if action == "Open output dir":
             self._reveal("Output dir", self.bridge.out_dir(run_id))
+            return
+        if action == "Output log":
+            self.show_run_log()
             return
 
     DEFAULTS_COLS: tuple[tuple[str, str, int], ...] = (

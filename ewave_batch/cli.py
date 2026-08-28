@@ -782,23 +782,38 @@ _STATUS_COLUMNS: tuple[str, ...] = ("run", "status", "wall(s)", "job", "conv", "
 
 
 def _log_facts_for(run: Run, run_dir: str, ewave_dir: str, *, read_logs: bool) -> LogFacts | None:
-    """这个 run 的日志事实。state 里有就用 state 的，没有再去磁盘上现读（只读）。
+    """这个 run 的日志事实。**磁盘优先，`batch.json` 里那份兜底。**（只读，不写任何文件。）
+
+    两个来源都是真的，只是新鲜度和存活期不同：
+
+    | 来源 | 新鲜度 | 什么时候它是唯一的一份 |
+    |---|---|---|
+    | 磁盘 | 现在这一刻 | 作业还在写；或者跑完之后有人手工补跑过什么 |
+    | `Run.log_facts` | 这个 run 走到终态那一刻（`sched.driver._attach_log_facts` 存的） | run 目录已经被 `archive --clean` 清掉了 |
+
+    ⇒ 谁也不能单独用。磁盘读得出来就以磁盘为准，读不出的字段由 state 补上
+    （`merge_log_facts` 先到先得）。`--no-logs` 只关掉磁盘那一半 —— 它省的是 IO，
+    不是"假装我们什么都不知道"。
 
     读的是 `<corner>_<temp>/` 那一层而不是 `run_dir`：同一个 `run_dir` 底下住着 N 个
     corner/temp 组合（`<axes-slug>` 按定义不含它们），而 `parse_run_logs` 会连**直接子目录**
     一起读 —— 对着 `run_dir` 读就是把邻居的日志也合并进来，然后报出一份张冠李戴的收敛结论。
+    这条与 `core.logparse.run_log_files` 同源，两处必须一起改。
     """
-    if run.log_facts is not None:
+    disk: LogFacts | None = None
+    if read_logs:
+        target = ewave_dir or run_dir
+        if target and os.path.isdir(target):
+            try:
+                disk = logparse_module.parse_run_logs(target)
+            except OSError:  # pragma: no cover - 读日志失败不该让 status 崩
+                disk = None
+    if disk is None:
         return run.log_facts
-    if not read_logs:
-        return None
-    target = ewave_dir or run_dir
-    if not target or not os.path.isdir(target):
-        return None
-    try:
-        return logparse_module.parse_run_logs(target)
-    except OSError:  # pragma: no cover - 读日志失败不该让 status 崩
-        return None
+    if run.log_facts is None:
+        return disk
+    # 磁盘在前 = 磁盘优先（`merge_log_facts` 先到先得），state 只补磁盘没说的字段。
+    return logparse_module.merge_log_facts(disk, run.log_facts)
 
 
 def _handle_status(args: argparse.Namespace) -> int:
