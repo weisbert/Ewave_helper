@@ -38,6 +38,7 @@ from ewave_batch.core import discover as discover_module
 from ewave_batch.core import layout as layout_module
 from ewave_batch.core import logparse as logparse_module
 from ewave_batch.core import matrix as matrix_module
+from ewave_batch.core import sitepin as sitepin_module
 from ewave_batch.core import spec as spec_module
 from ewave_batch.model import (
     BASE_GROUP,
@@ -385,6 +386,46 @@ def session_path(env: Mapping[str, str] | None = None) -> str:
     if explicit:
         return explicit
     return os.path.join(layout_module.install_root(), SESSION_NAME).replace(chr(92), "/")
+
+
+def _flat(value: object) -> str:
+    """一个钉住字段的**可比较文本**。dict 排序后拍平，其余转字符串。
+
+    存在的理由是 `site_facts_preview` 要判"这一行会不会变" —— 拿 dict 直接比会因为
+    键序不同而报出一堆假变化，而假变化会让人不敢按那个按钮。
+    """
+    if isinstance(value, dict):
+        return ", ".join(f"{k}={v}" for k, v in sorted(value.items()))
+    return str(value or "")
+
+
+SITE_FACTS_ENV = "EWB_SITE_FACTS"
+"""显式指一份钉住的站点坐标（给 doctor / 测试用）。给了就**只**认它，不再往下找。"""
+
+
+def site_facts_pin_path(env: Mapping[str, str] | None = None) -> str:
+    """钉住的站点坐标存哪 —— `<install>/site_facts.local.json`。
+
+    口径与 `session_path` 逐字相同（装机目录下、不跟 cwd 走、可用环境变量指到别处），
+    理由也相同：从哪个目录起界面都该看到同一份坐标。
+
+    与它旁边那两个文件的分工，**别混**：
+
+    | 文件 | 装什么 | 谁写的 |
+    |---|---|---|
+    | `site.local.sh` | 整条 dsub 命令 | 人手写 |
+    | `session.local.json` | 上次那份**设定**（designs / 轴 / 组） | 界面自动存 |
+    | `site_facts.local.json` | 钉住的**站点坐标**（ptxt / gdsout 模板 / 默认表） | 用户点了 Adopt 才写 |
+
+    第三份是 2026-08-28 方案 A 加的：装机时 load 一次官方目录把它钉下来，
+    此后 `Official run dir` 降级成可选。**它不许被自动写** —— 见
+    `core.sitepin.save_pin` 上抄自 Auto_ext 的那条自我约束。
+    """
+    environ: Mapping[str, str] = os.environ if env is None else env
+    explicit = str(environ.get(SITE_FACTS_ENV, "")).strip()
+    if explicit:
+        return explicit
+    return sitepin_module.pin_path(layout_module.install_root())
 
 
 def default_submit_command(env: Mapping[str, str] | None = None) -> str:
@@ -743,6 +784,19 @@ class GuiState:
         self._learned: FlagDict = {}
         self._facts: dict[str, SiteFacts] = {}
         self._notes: list[str] = []
+        self._pinned_facts = SiteFacts()
+        """钉在这台机器上的**站点级**坐标（`<install>/site_facts.local.json`）。
+
+        方案 A（用户 2026-08-28）的落点：装机时 load 一次官方目录把它钉下来，
+        此后 `Official run dir` 是可选的。空 `SiteFacts` = 还没钉过，那是全新机器的
+        正常状态，不是错误。**里面永远没有端口表** —— 见 `core.sitepin` 的红线。"""
+        self._pinned_sources: dict[str, str] = {}
+        """每个钉住的字段是 `pinned` / `env` / `missing`。界面据此画不同图标 ——
+        这是本方案对"钉住的值会过期"那个老问题的全部回答：不检测，但让人看得见。"""
+        self._pinned_missing: tuple[str, ...] = ()
+        """钉文件里引用了、而这台机器上没有的环境变量名。
+        非空 = 这份坐标是在**别的机器**上钉的，得说出来。"""
+        self._load_pinned_facts()
         self._events: list[DriverEvent] = []
         self._driver: DriverProtocol | None = None
         self._viewed: BatchState | None = None
@@ -2300,12 +2354,19 @@ class GuiState:
         offdir = self.official_run_dir.strip() or next(
             (d.official_run_dir.strip() for d in self._designs if d.official_run_dir.strip()), ""
         )
-        if not offdir:
+        # ★ 2026-08-28 方案 A：**钉过坐标的机器上不再拦**。
+        #   从前这一条是第一道门，而它在别人机器上部署时「非常卡手」——
+        #   新机器上没人猜得到该填哪个目录。现在只有"既没填、也没钉"才挡路。
+        #   ⚠️ 判据用 `site_facts_are_pinned()`（能不能拼出命令），不是"钉文件在不在"：
+        #      一份缺 ptxt 的钉文件放行 = 把用户送进一表 failed，正是本方法要防的事。
+        if not offdir and not self.site_facts_are_pinned():
             problems.append(
-                "Official run dir is empty, so the site coordinates (ewave path, ports, "
-                "ptxt, queue) are unknown and no command can be assembled." + _NL +
-                "  Next: fill in 'Official run dir' at the top, or use 'Browse...' to pick "
-                "the design dir the official GUI already ran once (it contains gdsout_setup)."
+                "Official run dir is empty and this box has no site coordinates pinned "
+                "yet, so ptxt / the gdsout template / the default flags are unknown and "
+                "no command can be assembled." + _NL +
+                "  Next: fill in 'Official run dir' at the top (or 'Browse...' to pick the "
+                "design dir the official GUI already ran once - it contains gdsout_setup), "
+                "then Tools -> Adopt site coordinates so this box never asks again."
             )
         if not dry_run:
             # ★ 落点这两条只在**真提交**时问：dry-run 一个字节都不写，
@@ -2854,6 +2915,146 @@ class GuiState:
             self._spec = replace(self._spec, source_path="", source_sha256="")
         return True
 
+    # ---- 钉住的站点坐标（方案 A）-----------------------------------------
+
+    def _load_pinned_facts(self) -> None:
+        """开局读一次钉文件。**读坏了不抛** —— 记一条 note，当作没钉过。
+
+        一个读不了的坐标文件不该让界面起不来（同 `default_submit_command` 那条规矩）；
+        而它确实读坏了这件事必须出声，否则用户会以为坐标还钉着，
+        然后对着一屏"拼不出命令"发呆。
+        """
+        path = site_facts_pin_path(self._env)
+        try:
+            data = sitepin_module.load_pin(path)
+        except EwaveBatchError as exc:
+            self._note(f"{path}: {exc}")
+            return
+        if not data:
+            return
+        facts, sources, missing = sitepin_module.resolve_pinned(data, env=self._env)
+        self._pinned_facts = facts
+        self._pinned_sources = sources
+        self._pinned_missing = missing
+        if missing:
+            self._note(
+                "the pinned site coordinates reference environment variable(s) this box "
+                "does not set: %s - those paths will not resolve. "
+                "Next: source the setup script, or adopt an official run dir here."
+                % ", ".join(missing)
+            )
+
+    def site_facts_are_pinned(self) -> bool:
+        """这台机器上的坐标够不够拼出命令。
+
+        判据是**能不能用**，不是"文件在不在"：一份钉了却缺 ptxt 的文件等于没钉，
+        而 `preflight` 拿这个答案决定要不要拦住用户 —— 答错的代价是
+        「放他跑，然后每个 run 都在拼命令那一步炸掉」，正是 preflight 存在的理由。
+
+        三样缺一不可，每一样都没有第二个来源（BRIEF P9 / D1c / §11 规则 1）：
+        ptxt（版本目录+文件名模板）、gdsout 模板、默认表。
+        """
+        facts = self._pinned_facts
+        has_ptxt = bool(facts.ptxt or (facts.ptxt_dir and facts.ptxt_name_template))
+        return bool(has_ptxt and facts.gdsout_template and facts.production_flags)
+
+    def site_facts_status(self) -> tuple[tuple[str, str, str], ...]:
+        """钉住的坐标现在长什么样：`(字段名, 值, 来源)`，来源是 `core.sitepin.SOURCE_*`。
+
+        给界面画那张"哪些是钉的、哪些是这台机器现读的、哪些根本没有"的表。
+        值里的长路径**不截断** —— 这张表存在的意义就是让人核对路径。
+        """
+        rows: list[tuple[str, str, str]] = []
+        for name in sitepin_module.PIN_FIELDS:
+            source = self._pinned_sources.get(name, sitepin_module.SOURCE_MISSING)
+            value = getattr(self._pinned_facts, name, "")
+            if isinstance(value, dict):
+                value = ", ".join(f"{k}={v}" for k, v in sorted(value.items()))
+            rows.append((name, str(value or ""), source))
+        return tuple(rows)
+
+    def site_facts_preview(self) -> tuple[tuple[str, str, str], ...]:
+        """按下 Adopt 会把什么改成什么：`(字段名, 现在钉的, 将要钉的)`。
+
+        **只返回会变的行。** 一张二十行、十九行左右两列一样的表读起来像没变化，
+        而用户要回答的问题是"这次采纳会动什么"。
+
+        照 Auto_ext `core/env_import` 的自我约束：本方法**不写盘**。
+        「一个环境值是站点事实，采纳它是一个决定」—— 决定由用户在对话框上做。
+        """
+        live = self._live_facts_for_adopt()
+        if live is None:
+            return ()
+        after, _sources, _missing = sitepin_module.resolve_pinned(
+            sitepin_module.pin_from_facts(live, env=self._env), env=self._env
+        )
+        rows: list[tuple[str, str, str]] = []
+        for name in sitepin_module.PIN_FIELDS:
+            old = _flat(getattr(self._pinned_facts, name, ""))
+            new = _flat(getattr(after, name, ""))
+            if old != new:
+                rows.append((name, old, new))
+        return tuple(rows)
+
+    def _live_facts_for_adopt(self) -> SiteFacts | None:
+        """要拿来钉的那一份 —— **现读的官方目录**，没有就 None。
+
+        刻意不拿 `_facts_for` 的结果：那一份已经把钉住的值合并进去了，
+        再钉一次就是把旧值抄给自己，于是"采纳"永远显示"无变化"。
+        """
+        offdir = self.official_run_dir.strip() or next(
+            (d.official_run_dir.strip() for d in self._designs if d.official_run_dir.strip()), ""
+        )
+        if not offdir:
+            return None
+        try:
+            return (
+                self._discover(offdir)
+                if self._discover is not None
+                else discover_module.discover_site_facts(offdir, env=self._env)
+            )
+        except EwaveBatchError as exc:
+            self._note(f"{offdir}: {exc}")
+            return None
+
+    def adopt_site_facts(self) -> str:
+        """把现读的官方目录里那份**站点级**坐标钉到这台机器上。返回写到哪。
+
+        只在用户显式点了才调（界面上是 `Tools -> Adopt site coordinates...`，
+        而且先给他看 `site_facts_preview()` 那张表）。没有官方目录 → `EwaveBatchError`。
+        """
+        live = self._live_facts_for_adopt()
+        if live is None:
+            raise EwaveBatchError(
+                "there is no official run dir to adopt from - nothing was written.\n"
+                "  Next: fill in 'Official run dir' (once is enough), then adopt again."
+            )
+        path = site_facts_pin_path(self._env)
+        written = sitepin_module.save_pin(path, live, env=self._env)
+        # 立刻回读：钉完之后界面上那张表必须显示**文件里**的东西，
+        # 而不是内存里那份 —— 两者不一致时，能骗过人的恰恰是内存里那份。
+        self._pinned_facts = SiteFacts()
+        self._pinned_sources = {}
+        self._pinned_missing = ()
+        self._load_pinned_facts()
+        self._facts.clear()
+        return written
+
+    def forget_site_facts(self) -> str:
+        """删掉钉文件（`Tools -> Forget site coordinates`）。返回删掉的路径，没有就空串。"""
+        path = site_facts_pin_path(self._env)
+        self._pinned_facts = SiteFacts()
+        self._pinned_sources = {}
+        self._pinned_missing = ()
+        self._facts.clear()
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                return path
+        except OSError as exc:  # pragma: no cover - 只读文件系统
+            self._note(f"cannot remove {path}: {exc}")
+        return ""
+
     def _facts_for(self, design: Design) -> SiteFacts:
         """这个 design 的站点坐标。解析不了 → 空 `SiteFacts` + 一条 note。
 
@@ -2875,11 +3076,26 @@ class GuiState:
                 )
             except EwaveBatchError as exc:
                 self._note(f"{offdir}: {exc}")
-        else:
+        elif not self.site_facts_are_pinned():
             self._note(
-                "No official run dir given - site coordinates (ports, ptxt, queue) are "
-                "unknown, so commands cannot be assembled yet."
+                "No official run dir given and nothing pinned on this box - site "
+                "coordinates (ptxt, gdsout template, defaults) are unknown, so commands "
+                "cannot be assembled yet. Next: set 'Official run dir' once, then "
+                "Tools -> Adopt site coordinates."
             )
+        # ★ 钉住的坐标**垫在下面**：官方目录给了什么就用什么，没给的由钉住的补上
+        #   （`sitepin.merge_facts` 是逐字段的）。两条都要成立：
+        #   ① 没有官方目录时，钉住的那份就是全部 —— 这正是方案 A 要的"official 可选"；
+        #   ② 有官方目录时它照样赢，因为**实际跑过的那次**比任何缓存都准，
+        #      而且端口表只可能从这条路来（钉文件里按定义没有它）。
+        facts = sitepin_module.merge_facts(self._pinned_facts, facts)
+        facts.official_run_dir = offdir
+        # 工具路径宁可现读：`command -v` 换了模块版本自己跟上，钉住的不会。
+        for field_name, tool in (("ewave_bin", "ewave"), ("strmout_bin", "strmout")):
+            if not getattr(facts, field_name, ""):
+                found = discover_module.find_tool(tool, env=self._env)
+                if found:
+                    setattr(facts, field_name, found)
         # ⚠️ 模板里那条 `-R` 是**例子**，不许顶掉官方 run 目录里真的那条 ——
         #    只有用户真动过这个框，命令里的 `-R` 才算「用户说了算」。
         resources = "" if self._submit_is_template else self.resources()

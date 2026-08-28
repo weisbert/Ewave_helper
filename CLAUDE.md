@@ -47,6 +47,14 @@ eWave 是公司的商用 3D EM 场求解器（抽电感/走线用）。官方 GU
      先问用户，别拿这条当先例自行推广。
    - 走两条路取代：**site-local 配置**（`site.example.sh` 进 git，`site.local.sh` 不进）
      或 **运行时发现**（从官方 run 目录解析、`command -v`、环境变量）。
+   - **第三条路（2026-08-28 加，方案 A）：把运行时发现的结果「钉」在装机的那台机器上**
+     —— `core/sitepin.py` + `<install>/site_facts.local.json`（不进 git，`deploy.sh` 保着）。
+     它不是第三种坐标来源，是把第二条路的结果**存一次**，好让官方 run 目录从「每次必填」
+     降成可选（起因：08-28 在别人机器上部署，那一格卡手）。两条不可动的约束：
+     ① 只钉**站点级**的（换个 design 不变的），`sitepin.PIN_FIELDS` 是白名单，
+     `NEVER_PIN_FIELDS` 是黑名单，两张表必须穷尽 `SiteFacts`（有测试盯着）；
+     ② 🚨 **端口表永远不钉** —— `-p` 的顺序就是 `.sNp` 每一位的含义。
+     钉下来的路径存的是 `${VAR}` 引用不是值，所以那个文件里的坐标比想象的少。
    - 运行时发现优于配置项：官方 run 目录里本来就有全部坐标（`gdsout_setup` →
      library/topCell/view/layerMap；`run_ewave_*.sh` → ptxt/key/corner/temp/端口表；
      `remote_run_ewave.sh` → dsub 三元组），既没有标识符进仓库，也没有手抄错的可能。

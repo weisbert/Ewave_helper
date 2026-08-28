@@ -157,7 +157,7 @@ mkdir -p "$INCOMING" "$STAGING" "$BACKUPS"
 # site.local.sh 同一类：装好之后才产生、包里没有、被搬走就是静默丢失 ——
 # 症状是用户开机发现 designs / 官方目录 / 勾选全空了，而"自动保存"这个功能
 # 恰恰是为了让他不必再填一次。
-PRESERVE=(".deploy" "site.local.sh" "session.local.json" "ewave_batches")
+PRESERVE=(".deploy" "site.local.sh" "site_facts.local.json" "session.local.json" "ewave_batches")
 if [[ -f "$DEPLOY/preserve.list" ]]; then
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     _line="${_line%%#*}"

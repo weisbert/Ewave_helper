@@ -1813,6 +1813,7 @@ class BaseApp:
             "Re-run failed": self.do_resume,
             "Use these settings": self.do_adopt_settings,
             "Extraction defaults...": self.show_defaults,
+            "Site coordinates...": self.show_site_facts,
             "Show log...": self.show_log,
             "Developer log...": self.show_trace,
             "About": self.show_about,
@@ -1827,6 +1828,8 @@ class BaseApp:
                 (
                     "Show log...",
                     "Developer log...",
+                    "-",
+                    "Site coordinates...",
                     "Extraction defaults...",
                     "Check environment (doctor)",
                 ),
@@ -4162,6 +4165,147 @@ class BaseApp:
         dlg.grab_set()
         self.top.wait_window(dlg)  # type: ignore[attr-defined]
         return answer["value"]
+
+    SITE_FACTS_COLS: tuple[tuple[str, str, int], ...] = (
+        ("field", "Coordinate", 170),
+        ("value", "Value on this box", 430),
+        ("source", "Where from", 90),
+    )
+    """`Site coordinates` 那张表的三列。第三个数是下限，真宽度按内容现算。"""
+
+    SITE_FACTS_ROWS = 14
+    """表显示几行 —— `core.sitepin.PIN_FIELDS` 的条数（再多靠滚动条）。"""
+
+    def show_site_facts(self) -> object:
+        """**Tools → Site coordinates…** —— 这台机器上钉了什么，以及要不要重钉。
+
+        ★ 用户 2026-08-28 拍板的方案 A 在界面上的全部落点：装机时 load 一次官方目录、
+        把站点级坐标钉下来，此后 `Official run dir` 是可选的。在这之前那一格是第一道门，
+        而它在别人机器上部署时「非常卡手」—— 新机器上没人猜得到该填哪个目录。
+
+        这扇窗回答三个问题，顺序就是用户会问的顺序：
+
+        1. **现在能不能跑？**（顶上那句带颜色的结论）
+        2. **每个坐标是哪来的？**（表里的 `Where from` 列：钉的 / 这台机器的环境变量 /
+           根本没有）—— 这一列是本方案对「钉住的值会过期」的全部回答：
+           不承诺检测过期，承诺让人一眼看出这个值是钉的还是现读的。
+        3. **按 Adopt 会改掉什么？**（表下面那段预览，**只列会变的行**）
+
+        `Adopt` 之前必须先看见预览，这条是抄 Auto_ext `core/env_import.py` 的自我约束：
+        「一个环境值是站点事实，采纳它是一个决定」—— 所以它不自动发生。
+        """
+        bridge = self.bridge
+        dlg = tk.Toplevel(self.top)
+        dlg.title("eWave Batch - Site coordinates")
+        dlg.transient(self.top)  # type: ignore[arg-type]
+
+        verdict = tk.Label(dlg, anchor=tk.W, justify=tk.LEFT, font=self.f_ui_b, padx=8, pady=5)
+        verdict.pack(side=tk.TOP, fill=tk.X)
+
+        hint = ttk.Label(
+            dlg,
+            style="Hint.TLabel",
+            wraplength=680,
+            justify=tk.LEFT,
+            text=(
+                "'pinned' = stored on this box by a previous Adopt.  'env' = read from "
+                "this box's environment every time (the pinned value is only a $VAR "
+                "reference).  'missing' = nowhere to be found.  Pinned values do NOT "
+                "follow a PDK upgrade on their own - adopt again after one."
+            ),
+        )
+        hint.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(2, 6))
+
+        wrap = ttk.Frame(dlg, padding=(8, 4))
+        wrap.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        columns = tuple(col[0] for col in self.SITE_FACTS_COLS)
+        tree = ttk.Treeview(wrap, columns=columns, show="headings", height=self.SITE_FACTS_ROWS)
+        for key, head, width in self.SITE_FACTS_COLS:
+            tree.heading(key, text=head)
+            tree.column(key, width=width, anchor=tk.W, stretch=(key == "value"))
+        _scrolled_tree_grid(wrap, tree)
+        tree.tag_configure("missing", foreground="#8a6d00")
+        tree.tag_configure("env", foreground="#1a5c26")
+
+        preview = tk.Label(dlg, anchor=tk.W, justify=tk.LEFT, font=self.f_mono, padx=8, pady=4)
+        preview.pack(side=tk.TOP, fill=tk.X)
+
+        def redraw() -> None:
+            tree.delete(*tree.get_children())
+            for name, value, source in bridge.site_facts_status():
+                tree.insert(
+                    "", tk.END, values=(name, _label(value), source), tags=(source,)
+                )
+            _fit_tree_columns(
+                tree,
+                columns,
+                head_font=self.f_ui_b,
+                cell_font=self.f_mono,
+                floors={key: width for key, _head, width in self.SITE_FACTS_COLS},
+            )
+            if bridge.site_facts_are_pinned():
+                verdict.config(
+                    text=("This box has its site coordinates pinned - 'Official run dir' "
+                          "is optional from here on."),
+                    fg="#1a5c26",
+                    bg="#dcecdc",
+                )
+            else:
+                verdict.config(
+                    text=("Nothing usable is pinned on this box yet. Set 'Official run dir' "
+                          "once, then press Adopt below - after that it is optional."),
+                    fg=RED,
+                    bg="#f6d8d8",
+                )
+            rows = bridge.site_facts_preview()
+            if not rows:
+                preview.config(text="Adopt would change nothing (or there is no official "
+                                    "run dir to adopt from).")
+            else:
+                shown = "\n".join(
+                    "  %s: %s -> %s" % (name, _label(old) or "<empty>", _label(new) or "<empty>")
+                    for name, old, new in rows[:6]
+                )
+                more = "" if len(rows) <= 6 else "\n  ... and %d more" % (len(rows) - 6)
+                preview.config(text="Adopt would change %d coordinate(s):\n%s%s"
+                                    % (len(rows), shown, more))
+
+        def do_adopt() -> None:
+            try:
+                path = bridge.adopt_site_facts()
+            except EwaveBatchError as exc:
+                _error("Cannot adopt the site coordinates", str(exc))
+                return
+            redraw()
+            self.update_status()
+            _info("Site coordinates pinned", "Written to %s" % path)
+
+        def do_forget() -> None:
+            if not _confirm(
+                "Forget the site coordinates?",
+                "This box will need an 'Official run dir' again until you adopt one.",
+            ):
+                return
+            bridge.forget_site_facts()
+            redraw()
+            self.update_status()
+
+        bar = ttk.Frame(dlg, padding=(8, 6))
+        bar.pack(side=tk.TOP, fill=tk.X)
+        ttk.Button(bar, text="Adopt from official run dir", width=26, command=do_adopt).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(bar, text="Forget", width=9, command=do_forget).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bar, text="Close", width=9, command=dlg.destroy).pack(side=tk.RIGHT)
+
+        redraw()
+        _center_on_parent(dlg, self.top)
+        if smoke_enabled():
+            dlg.withdraw()
+            return dlg
+        dlg.grab_set()
+        self.top.wait_window(dlg)  # type: ignore[attr-defined]
+        return dlg
 
     def do_rename_batch(self) -> None:
         """改**下一批**的名字。**永远可以改** —— 它还没落过盘。
