@@ -112,13 +112,14 @@ GROUP_OVERRIDABLE_AXES: tuple[str, ...] = (
     "corner",
     "temperature",
     "mesh",
-    "simplify2d",
+    "layer2d",
+    "layermesh",
     "fullWave",
     "equalCurrent",
 )
 """一个 run group **可以**自己定的轴。界面上就是 Settings 里带覆盖勾选框的那几行。
 
-★ `simplify2d` 在里面，但它的**层清单不在** —— 组能自己定"降到多粗"（轴的取值），
+★ `layer2d` / `layermesh` 在里面，但它们的**层清单不在** —— 组能自己定开不开、多粗（轴的取值），
 不能自己定"降哪几层"（`LayerModel`，整批一份，同两个 tolerance 那条理由）。
 一个组自己换一套层清单意味着两个组的 `--3d` 不同却共用同一套目录命名口径，
 而"哪几层是 2D"根本不进 slug —— 那就是让目录名说不出真相。
@@ -172,7 +173,8 @@ DEFAULT_AXIS_SELECTION: dict[str, tuple[str, ...]] = {
     "fullWave": ("off", "on"),
     "equalCurrent": ("off",),
     "mesh": ("0.5",),
-    "simplify2d": (matrix_module.SIMPLIFY2D_OFF,),
+    "layer2d": (matrix_module.LAYER_AXIS_OFF,),
+    "layermesh": (matrix_module.LAYER_AXIS_OFF,),
     "relativeTolerance": ("1e-05",),
     "relativeCurrentTolerance": ("0.001",),
 }
@@ -205,19 +207,25 @@ SWEEP_AXIS_FLAGS: tuple[str, ...] = ("--multiSweep", "--logarithmicSweep", "--di
 MESH_FLAGS: tuple[str, ...] = ("-e", "-d", "--viaMergeSpace")
 """网格密度轴掌管的三个 flag（BRIEF §10：**唯一改 mesh 的轴**）。
 
-⚠️ 三个都是**短名**。`simplify2d` 轴写的是长名 `--edgeDist`（逐层），两者在 eWave
+⚠️ 三个都是**短名**。`layermesh` 轴写的是长名 `--edgeDist`（逐层），两者在 eWave
 是同一个选项的两种写法，命令行上"全局 + 逐层"同时出现是文档化的用法。
-**别把这里改成长名** —— 一改就撞键，见 `core.matrix.SIMPLIFY2D_FLAGS`。"""
+**别把这里改成长名** —— 一改就撞键，见 `core.matrix.LAYERMESH_FLAGS`。"""
 
-DEFAULT_THIN_MAX_FACTOR = "1"
-"""`--thinMaxfactor` 那一格的初值（nm）。**eWave 的工具语义，不是站点身份。**
+DEFAULT_THIN_MAX_FACTOR = ""
+"""`--thinMaxfactor` 那一格的初值（nm）。**空 = 不下发这个 flag。**
+
+初值是空的，因为它现在是一个**独立**的全局开关（用户 2026-08-31 要求把三件事分开）：
+不再跟着某根轴一起生效，所以给它一个非空初值就等于"每个人的每一批都被悄悄改了网格"。
+想复现红区 2026-08-28 那一版就在 Advanced 里填 `1`。
+
+原文（eWave 的工具语义，不是站点身份）：
 
 eWave 的默认是 200nm，含义是"薄于此的金属自动把 --maxFactor 压到 2"，于是薄金属层的
 网格暴涨 —— 那正是交指电容那种场景慢下来的原因。给一个很小的值等于宣布"没有层算薄"。
 `1` 是红区 2026-08-28 实测那一版用的取值（total 元素数降到 880,652）。
 
-⚠️ 它**只在 simplify2d 取了非 off 的值时**才会进命令行（`matrix.simplify2d_flags_for`）——
-所以这个初值不改变任何老批次的行为。清空它 = 不给这个 flag。"""
+⚠️ 它是**全局**的、不逐层 ⇒ 既不属于 layer2d 也不属于 layermesh，
+由 `core.spec.spec_to_batch` 并进默认表层。清空 = 不给这个 flag。"""
 
 _NL = chr(10)
 
@@ -597,6 +605,45 @@ def redact(text: str, table: Mapping[str, str]) -> str:
     return out
 
 
+LEGACY_SIMPLIFY2D_AXIS = "simplify2d"
+"""2026-08-31 上午那一版里的轴名 —— 它一根轴同时干了 `--3d` 和逐层 `--edgeDist`。
+当天下午按用户要求拆成了 `layer2d` + `layermesh`。
+
+留着这个常量只为**迁移**：那一版存下来的 `session.local.json` / spec 里有这个名字，
+不认它的话那份设定会静默消失（界面回到全 off，而用户以为"上次那份"还在）。
+"""
+
+
+def _migrate_legacy_simplify2d(
+    selection: dict[str, tuple[str, ...]],
+) -> dict[str, tuple[str, ...]]:
+    """老的 `simplify2d` 勾选 → 新的 `layer2d` + `layermesh`。
+
+    老取值是 `off` 或一个 µm 数，含义是"降 2D **并且**把网格换成这个数"：
+
+        off  ->  layer2d=off,  layermesh=off
+        4    ->  layer2d=on,   layermesh=4
+
+    ⇒ 迁过来的批次跑出来的命令与老版本**逐字相同**，只是现在两件事可以分开调了。
+    新的轴名已经有取值时**不动**（那是用户在新版界面上自己选的，比迁移来的准）。
+    """
+    legacy = selection.pop(LEGACY_SIMPLIFY2D_AXIS, ())
+    if not legacy:
+        return selection
+    if not selection.get(matrix_module.AXIS_LAYER2D):
+        selection[matrix_module.AXIS_LAYER2D] = _dedup(
+            [
+                matrix_module.LAYER_AXIS_OFF
+                if value == matrix_module.LAYER_AXIS_OFF
+                else matrix_module.LAYER2D_ON
+                for value in legacy
+            ]
+        )
+    if not selection.get(matrix_module.AXIS_LAYERMESH):
+        selection[matrix_module.AXIS_LAYERMESH] = _dedup(legacy)
+    return selection
+
+
 def _dedup(values: Sequence[str]) -> tuple[str, ...]:
     """保序去重。笛卡尔积里出现两个一样的取值 = 两个 run 抢同一个目录。"""
     seen: list[str] = []
@@ -816,12 +863,11 @@ class GuiState:
         """官方 run 目录 → 从它的 eWave 日志里读到的层清单。**按目录缓存**：
         界面每敲一个键就 `recompute()` 一次，不缓存就是每个键一次磁盘解析（同 `_facts`）。"""
         self._layer_model = LayerModel(thin_max_factor=DEFAULT_THIN_MAX_FACTOR)
-        """`simplify2d` 轴的层清单（整批一份，不按组分）。
+        """两根层轴的层清单 + 薄金属阈值（整批一份，不按组分）。
 
         **两个清单一开始都是空的** —— 层名是 PDK 坐标，源码里一个字都不许有
         （CLAUDE.md 硬约束 1b）。空清单 + 默认只勾了 `off` ⇒ 这根轴对命令行毫无贡献，
-        与加它之前逐字相同。`thin_max_factor` 有初值是安全的：它同样只在选了非 off
-        的取值时才进命令行。"""
+        与加它之前逐字相同。`thin_max_factor` 初值是空的（它是独立开关，见那个常量）。"""
         self._extra_text = ""
         self._default_overrides: FlagDict = {}
         self._options = BatchOptions()
@@ -1017,7 +1063,7 @@ class GuiState:
             run.work_dir = paths.run_dir
             axis_error = self._design_axis_errors.get(run.design_key)
             if axis_error:
-                # 这个 design 的 simplify2d 轴造不出来 ⇒ 它的每个 run 都拼不出命令。
+                # 这个 design 的层轴造不出来 ⇒ 它的每个 run 都拼不出命令。
                 # 摆在**按 run 显示**的那条通道上（`Selected run -> Command`），
                 # 与"官方目录解析不了"同一个位置、同一种看法。
                 self._plan_errors[run.run_id] = axis_error
@@ -1073,7 +1119,7 @@ class GuiState:
         return contexts
 
     def _axes_for_design(self, design: Design, axes: Sequence[Axis]) -> tuple[Axis, ...]:
-        """把批次的轴换成**这个 design 的**：只有 `simplify2d` 那一根会变。
+        """把批次的轴换成**这个 design 的**：只有两根层轴会变。
 
         `PlanContext` 本来就是 per-design 的，而 `cmd.resolve_axis_flags` 查的正是
         `ctx.axes` —— 所以"同名同取值、flag 不同"这件事架构上原生支持，
@@ -1087,27 +1133,30 @@ class GuiState:
         ⚠️ 只在 `learn=True`（预览/plan）时调。打开**历史批次**时轴必须用批次自己冻着的
         那份 —— 拿今天的日志重算就是"resume 之后 --3d 悄悄换了"。
         """
-        values = [
-            av.value
-            for axis in axes
-            if axis.name == matrix_module.AXIS_SIMPLIFY2D
-            for av in axis.values
-        ]
-        if not values or all(v == matrix_module.SIMPLIFY2D_OFF for v in values):
-            # 这根轴不在、或者整批都是 off ⇒ 它对命令行没有贡献，不用按 design 重算。
-            return tuple(axes)
-        try:
-            rebuilt = matrix_module.simplify2d_axis(
-                self.effective_layer_model_for(design), values
-            )
-        except EwaveBatchError as exc:
-            self._design_axis_errors[matrix_module.design_key(design)] = (
-                "%s: %s" % (exc.__class__.__name__, exc)
-            )
-            return tuple(axes)
-        return tuple(
-            rebuilt if axis.name == matrix_module.AXIS_SIMPLIFY2D else axis for axis in axes
-        )
+        builders = {
+            matrix_module.AXIS_LAYER2D: matrix_module.layer2d_axis,
+            matrix_module.AXIS_LAYERMESH: matrix_module.layermesh_axis,
+        }
+        out = list(axes)
+        model = None
+        for index, axis in enumerate(out):
+            build = builders.get(axis.name)
+            if build is None:
+                continue
+            values = [av.value for av in axis.values]
+            if all(v == matrix_module.LAYER_AXIS_OFF for v in values):
+                # 整批都是 off ⇒ 这根轴对命令行没有贡献，不用按 design 重算（也就不读日志）。
+                continue
+            if model is None:
+                model = self.effective_layer_model_for(design)
+            try:
+                out[index] = build(model, values)
+            except EwaveBatchError as exc:
+                self._design_axis_errors[matrix_module.design_key(design)] = (
+                    "%s: %s" % (exc.__class__.__name__, exc)
+                )
+                return tuple(axes)
+        return tuple(out)
 
     # ==================================================== 结果侧：历史与「在看哪一批」
     # ★ 本段**只读磁盘**或只动 `_viewed`，一个设定都不碰。
@@ -2143,28 +2192,46 @@ class GuiState:
         也就是加这个方法之前的行为。那时我们对它一无所知，用已知的最大集合比用空集好。
         """
         stack = self.layer_stack_for(design).conductors or self.available_layers()
-        keep = tuple(name for name in self._layer_model.simplify if name in stack)
-        return replace(self._layer_model, stack=stack, simplify=keep)
+        return replace(
+            self._layer_model,
+            stack=stack,
+            simplify=tuple(n for n in self._layer_model.simplify if n in stack),
+            mesh_layers=tuple(n for n in self._layer_model.mesh_layers if n in stack),
+        )
 
     def layer_model(self) -> LayerModel:
-        """`simplify2d` 轴的层清单（整批一份）。界面拿它回填那三个输入框。"""
+        """两根层轴的层清单（整批一份）。界面拿它回填勾选框。"""
         return self._layer_model
 
-    def set_simplify_layers(self, names: Sequence[str]) -> None:
-        """界面上勾了哪几层降 2D。**顺序按 `available_layers()` 归一**，不按点击顺序 ——
-        命令行因此与用户点的先后无关，两次跑的 `cmd.sh` 可以逐字比。
+    def _ordered_layers(self, names: Sequence[str]) -> tuple[str, ...]:
+        """勾选 → **按 `available_layers()` 归一顺序**的元组。
 
-        勾了一个 `available_layers()` 里没有的名字（手填过又被删掉）会原样留着，
-        由 `core.matrix.validate_layer_model` 去报"它不在叠层里"—— 那条消息比这里能说的具体。
+        不按点击顺序：命令行因此与用户点的先后无关，两次跑的 `cmd.sh` 可以逐字比。
+        勾了一个 `available_layers()` 里没有的名字（手填过又被删掉）原样留在末尾，
+        由 `core.matrix.validate_layer_model` 去报"它不在叠层里"——
+        那条消息比这里能说的具体。
         """
         wanted = [str(name).strip() for name in names if str(name).strip()]
         known = self.available_layers()
         ordered = [name for name in known if name in wanted]
         ordered += [name for name in wanted if name not in known]
-        self._layer_model = replace(self._layer_model, simplify=tuple(ordered))
+        return tuple(ordered)
+
+    def set_2d_layers(self, names: Sequence[str]) -> None:
+        """**降成 2D 的层**（`layer2d` 轴 → `--3d`）。"""
+        self._layer_model = replace(self._layer_model, simplify=self._ordered_layers(names))
         self._invalidate()
 
-    def set_layer_model(self, stack: str = "", simplify: str = "", thin: str = "") -> None:
+    def set_mesh_layers(self, names: Sequence[str]) -> None:
+        """**换网格的层**（`layermesh` 轴 → 逐层 `--edgeDist`）。
+
+        ⚠️ 与 `set_2d_layers` 是**两份独立的清单**（用户 2026-08-31 指出）——
+        "降 2D"和"换网格"在 eWave 里是两个选项，工具不许替用户把它们绑在一起。
+        """
+        self._layer_model = replace(self._layer_model, mesh_layers=self._ordered_layers(names))
+        self._invalidate()
+
+    def set_layer_globals(self, stack: str = "", thin: str = "") -> None:
         """整叠金属层 / 想降成 2D 的层 / 薄金属阈值 ← 界面的三个输入框（都是文本）。
 
         **只做词法**（拆分、去空白、保序）。"这个层名在不在叠层里""降完还剩不剩 3D 层"
@@ -2174,24 +2241,21 @@ class GuiState:
         ⚠️ 整批一份，**不按组分**：组能自己定"降到多粗"，不能自己定"降哪几层"
         （理由见 `GROUP_OVERRIDABLE_AXES`）。所以这个方法不看 `_active_group`。
         """
-        self._layer_model = LayerModel(
+        self._layer_model = replace(
+            self._layer_model,
             stack=parse_layer_list(stack),
-            simplify=parse_layer_list(simplify),
             thin_max_factor=str(thin).strip(),
         )
         self._invalidate()
 
-    def layer_model_text(self) -> tuple[str, str, str]:
-        """`layer_model()` 的界面形态：`(extra_layers, simplify, thin)` 三个字符串。
+    def layer_model_text(self) -> tuple[str, str]:
+        """`layer_model()` 里两个**输入框**的内容：`(extra_layers, thin_max_factor)`。
 
         ⚠️ 第一格是 **extra layers**（日志里没有、用户自己补的），不是整份叠层 ——
-        整份叠层由 `available_layers()` 给，界面上是一行只读文字 + 一排勾选框。
+        整份叠层由 `available_layers()` 给，界面上是一行只读文字 + 两排勾选框。
+        两份层清单本身不在这里（它们是勾选，见 `layer_model().simplify` / `.mesh_layers`）。
         """
-        return (
-            self.extra_layers_text(),
-            render_layer_list(self._layer_model.simplify),
-            self._layer_model.thin_max_factor,
-        )
+        return (self.extra_layers_text(), self._layer_model.thin_max_factor)
 
     def extra_layers_text(self) -> str:
         """已知的层里**日志没给出**的那些 —— Advanced 里那一格的内容。
@@ -2220,7 +2284,7 @@ class GuiState:
             where,
         )
 
-    def simplify2d_preview(self) -> str:
+    def layer_flags_preview(self) -> str:
         """当前设定下，一个"降 2D"的取值会往命令行上加什么。**界面上直接显示它。**
 
         为什么值得单独有一个方法：`--3d` 是工具**算出来的补集**，而用户只填了想降的那几层。
@@ -2230,17 +2294,26 @@ class GuiState:
         算不出来（清单不全 / 冲突）→ 返回那条 `SpecError` 的第一行，界面标红。
         全是 off ⇒ 返回空串（这根轴此刻什么都不加，没什么可预览的）。
         """
-        values = [
-            value
-            for value in self._selection.get(matrix_module.AXIS_SIMPLIFY2D, ())
-            if value != matrix_module.SIMPLIFY2D_OFF
-        ]
-        if not values:
-            return ""
-        try:
-            flags = matrix_module.simplify2d_flags_for(self.effective_layer_model(), values[0])
-        except EwaveBatchError as exc:
-            return str(exc).splitlines()[0]
+        model = self.effective_layer_model()
+        flags: FlagDict = {}
+        for axis_name, build in (
+            (matrix_module.AXIS_LAYER2D, matrix_module.layer2d_flags_for),
+            (matrix_module.AXIS_LAYERMESH, matrix_module.layermesh_flags_for),
+        ):
+            live = [
+                value
+                for value in self._selection.get(axis_name, ())
+                if value != matrix_module.LAYER_AXIS_OFF
+            ]
+            if not live:
+                continue
+            try:
+                flags.update(build(model, live[0]))
+            except EwaveBatchError as exc:
+                return str(exc).splitlines()[0]
+        thin = str(self._layer_model.thin_max_factor).strip()
+        if thin:
+            flags[matrix_module.THIN_MAX_FACTOR_FLAG] = thin
         return " ".join(
             _render_flag_token(name, value) for name, value in flags.items() if value is not False
         )
@@ -2457,12 +2530,16 @@ class GuiState:
                 ("fullWave", "mode"),
             ):
                 parts.append(f"{len(selection.get(name, ()))} {label}")
-            # ★ mesh 和 simplify2d **只在真的在扫**（取值多于一个）时才写进来。
+            # ★ mesh 和两根层轴**只在真的在扫**（取值多于一个）时才写进来。
             #   不写的话这一行会算错：`1 corner x 3 temp x 2 mode = 12` —— 左边连乘是 6，
-            #   而右边那个 12 是真的（simplify2d 扫了两个值）。等号两边对不上就是界面在说谎，
-            #   而这恰恰是 simplify2d 最常见的用法（基线 + 一个降级变体）。
+            #   而右边那个 12 是真的（层轴扫了两个值）。等号两边对不上就是界面在说谎，
+            #   而那恰恰是这两根轴最常见的用法（基线 + 一个变体）。
             #   默认两根轴都只有一个取值 ⇒ 常态下这一行与从前逐字相同。
-            for name, label in (("mesh", "mesh"), (matrix_module.AXIS_SIMPLIFY2D, "2d")):
+            for name, label in (
+                ("mesh", "mesh"),
+                (matrix_module.AXIS_LAYER2D, "2d"),
+                (matrix_module.AXIS_LAYERMESH, "lmesh"),
+            ):
                 count = len(selection.get(name, ()))
                 if count > 1:
                     parts.append(f"{count} {label}")
@@ -3089,11 +3166,13 @@ class GuiState:
         """轴名 + 取值 -> `Axis`，走**界面自己的**构造器（flag 由它们算，只有一份实现）。"""
         if name == "mesh":
             return mesh_axis(values)
-        if name == matrix_module.AXIS_SIMPLIFY2D:
+        if name == matrix_module.AXIS_LAYERMESH:
+            return matrix_module.layermesh_axis(self.effective_layer_model(), values)
+        if name == matrix_module.AXIS_LAYER2D:
             # 内置目录里那根只有 `off` —— 别的取值要层清单才造得出来（层名是 PDK 坐标，
             # 源码里一个字都不许有）。不走这一条分支的话，一个组想覆盖成 "4"
             # 会被 `axis_from_catalog` 判成"这根轴不认识这个取值"而拒掉。
-            return matrix_module.simplify2d_axis(self.effective_layer_model(), values)
+            return matrix_module.layer2d_axis(self.effective_layer_model(), values)
         if name == "freq":
             return sweep_axis(self._sweep.get("mode", "adaptive"), values)
         return axis_from_catalog(name, values)
@@ -3150,14 +3229,19 @@ class GuiState:
         mesh_values = self._selection.get("mesh", ())
         if mesh_values:
             axes.append(mesh_axis(mesh_values))
-        # simplify2d 紧跟在 mesh 后面：它写的是**逐层的** --edgeDist，而 mesh 写的是
-        # 全局的 -e —— 命令行上"先全局、后逐层"正是 eWave 手册里那个例子的顺序
-        # （--edgeDist=2 --edgeDist=M1,0.8），也是红区 2026-08-28 跑通的那条的形状。
-        simplify_values = self._selection.get(matrix_module.AXIS_SIMPLIFY2D, ())
-        if simplify_values:
-            axes.append(
-                matrix_module.simplify2d_axis(self.effective_layer_model(), simplify_values)
-            )
+        # 两根层轴紧跟在 mesh 后面。它们是**两件独立的事**（用户 2026-08-31 指出）：
+        #   layer2d   -> --3d       哪几层用 2D 建模
+        #   layermesh -> --edgeDist 哪几层换多大的网格（逐层）
+        # layermesh 写的是长名，而 mesh 写的是全局的短名 -e —— 命令行上"先全局、后逐层"
+        # 正是 eWave 手册那个例子的顺序，也是红区 2026-08-28 跑通的那条的形状。
+        model = self.effective_layer_model()
+        for name, build in (
+            (matrix_module.AXIS_LAYER2D, matrix_module.layer2d_axis),
+            (matrix_module.AXIS_LAYERMESH, matrix_module.layermesh_axis),
+        ):
+            values = self._selection.get(name, ())
+            if values:
+                axes.append(build(model, values))
         for name in ("fullWave", "equalCurrent", "relativeTolerance", "relativeCurrentTolerance"):
             values = self._selection.get(name, ())
             if values:
@@ -3525,7 +3609,7 @@ class GuiState:
                 # 三个名字一个语义 —— 认名字就会漏掉两个，然后它们变成一份谁也不看的死数据。
                 continue
             selection[axis.name] = tuple(av.value for av in axis.values)
-        return selection
+        return _migrate_legacy_simplify2d(selection)
 
     def _sweep_from_axes(self, axes: Sequence[Axis]) -> dict[str, str]:
         """spec 里的扫频轴 → 界面上那几个格子。认不出就原样保留界面的值。"""

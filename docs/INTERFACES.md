@@ -132,50 +132,62 @@ CLI 用 `sched.driver.run_batch` 的 `while` 驱动它，GUI 用 tkinter 的 `af
 
 ---
 
-## simplify2d：把哪几层降成 2D 换速度（用户 2026-08-31 拍板）
+## 两根层轴：`layer2d` 和 `layermesh`（用户 2026-08-31）
 
-eWave 的 `--3d` 是**保持 3D 的白名单**：没列进去的层**静默**退成 2D。
-而用户想的是反过来的一句话 ——「把这几层降下去省时间」。
+### 为什么是两根
 
-用户 2026-08-28 手写白名单时漏了一层，那层被无声无息地降成 2D，
-run 照样跑完、数字还挺像，是事后一层一层数元素数才发现的。
+它们在 eWave 里是两个独立的选项：
 
-**模型**：用户只说想降哪几层，白名单由工具算 ——
+| 轴 | flag | 管什么 | 取值 |
+|---|---|---|---|
+| `layer2d` | `--3d`（保持 3D 的白名单） | 那几层用不用 3D 结构建模 | `on` / `off` |
+| `layermesh` | `--edgeDist`（逐层） | 那几层的网格多大 | 一串 µm 数 / `off` |
 
-```
---3d = LayerModel.stack - LayerModel.simplify
-```
+当天上午先做成了一根 `simplify2d`（取值 = µm 数，顺带把层降 2D）。用户当场指出那是把
+两个功能区捏在了一起：**「只想降 2D、网格不动」表达不出来，也没法分别扫**。拆开之后
+四种组合都在，而且各占一个目录（`2d-on__lmesh-off/` 之类）。
 
-于是"漏写一个层"的后果从「那层被降级」变成「那层留在 3D」= 不改变。
-这是加 `LayerModel.stack` 这个字段的**全部**理由：不知道整叠有哪些层就算不出补集。
+⚠️ 两根轴掌管的 flag 必须**不相交** —— 撞了就等于没拆（后展开的把前一根盖掉）。
+锁在 `tests/test_layer_axes.py::TwoIndependentThings`。
 
-### 而 `stack` 也**不该让用户打**（用户 2026-08-31：「你不能指望用户自己填写 --3d 这样的指令」）
+⚠️ 两份**层清单也是独立的**（`LayerModel.simplify` / `.mesh_layers`）。实际用起来多半
+勾一样的层，但那是用户的选择，不是工具替他做的决定。
 
-它从官方 run 目录的 eWave 日志里读出来（`core.discover.find_layer_stack` →
-`core.logparse.parse_layer_stack`）。日志里两段合起来就是权威答案：
+### `--thinMaxfactor` 是第三件事
+
+它是**全局**的、不逐层 ⇒ 既不属于 `layer2d` 也不属于 `layermesh`。由
+`core.spec.spec_to_batch` 并进**默认表层**（`_defaults_with_layer_globals`），
+界面上住在 Advanced，初值**空**（= 不下发）。挂到某一根轴上就是把不相干的事绑在一起，
+那正是这次拆分要修的毛病。放默认表层而不是轴层，是因为它不进目录名 —— 它不是 run 的身份。
+
+### `--3d` 是算出来的补集，不是用户输入
+
+eWave 的 `--3d` 是「保持 3D 的白名单」，没列进去的层**静默**退 2D；而用户想的是
+「把这几层降下去」。让工具算 `stack - simplify` 之后，"漏写一个层"的后果从
+「那层被无声降级」变成「那层留在 3D」= 不改变。2026-08-28 那个坑因此在结构上不存在。
+
+### 层清单从 eWave 日志里读，不让用户打
+
+（用户 2026-08-31：「你不能指望用户自己填写 `--3d` 这样的指令」）
+`core.discover.find_layer_stack` → `core.logparse.parse_layer_stack`，日志两段合起来是权威答案：
 
 | 段 | 给出什么 |
 |---|---|
-| `begin to eval experssion: <层>=…` | 整个 PDK 的层 + **顺序（自下而上）**；紧跟 `the experssion belongs to via` 的那些是 via |
-| `basis function are sorted from largest to smallest as follows:` | 这个 design **真正 mesh 到**的层 + 各自占了多少元素 |
+| `begin to eval experssion: <层>=…` | 整个 PDK 的层 + **顺序（自下而上）**；紧跟 `the experssion belongs to via` 的是 via |
+| `basis function are sorted from largest to smallest as follows:` | 这个 design **真正 mesh 到**的层 + 各自元素占比 |
 
-`conductors` = 两段的交集减去 via。于是界面上那一格是**一排勾选框**，
-每个层名后面跟着它的元素占比（`<层> 20%`）—— 那不是装饰，那正是"该降哪几层"的
-决策依据：占 20% 的降下去才省时间，占 <5% 的降了只是改变了没打算改的东西。
+`conductors` = 两段的交集减去 via。界面上是**两排勾选框**，层名后面跟着元素占比
+（`<层> 20%`）—— 那是"该动哪几层"的决策依据，不是装饰。
 
-⚠️ 两段线索**缺一就返回空**并给一句人话，**不猜**：只有第二段分不出 via，
-只有第一段不知道这个 design 用了哪些。猜错 = `--3d` 少一层 = 那层静默退 2D。
-
-⚠️ via **不进 `--3d`**：手册说那个 flag 管的是 metal layer，红区验证过的那条命令里
-也只有金属。判据只能是日志里那句话，**不许按名字猜**（实测的叠层里有不以 `V` 开头的 via）。
-
-⚠️ 层清单是 **per-design** 的（不同 cell 用到的层不一样），而且**绝不进 `core.sitepin`**
-（理由与端口表同款：钉住的会过期，过期 = 少一层 = 静默 2D）。
+⚠️ 两段线索**缺一就返回空**并给一句人话，**不猜**。
+⚠️ via **不进 `--3d`**，判据只能是日志里那句话，**不许按名字猜**（实测叠层里有不以 `V` 开头的 via）。
+⚠️ 勾选框在那一行**关着时整块收起来** —— Settings 在 split 版住在一个不滚动的左栏里，
+两排 12 个勾选框会把 Advanced 顶出窗口。默认两行都 off ⇒ 常态下只多两行高。
 
 ### 选择面 vs 下发面：故意不是同一个东西
 
-2026-08-31 实测到的缺陷：层清单当初是批次级的（取自批次那一格、或第一个 design），
-却给**所有** design 共用 —— 而 `SiteFacts` 是 per-design 取的，两边口径不一致：
+层清单当初是批次级的（取自批次那一格、或第一个 design），却给**所有** design 共用 ——
+而 `SiteFacts` 是 per-design 取的，两边口径不一致：
 
 ```
 CELL_A 的日志: LOW1, LOW2, TOP1
@@ -183,87 +195,35 @@ CELL_B 的日志: LOW1, LOW2, TOP1, EXTRA_TOP
 共用的 --3d  : LOW1,TOP1          <- CELL_B 的 EXTRA_TOP 不在里面 => 被静默降成 2D
 ```
 
-也就是这个功能要消灭的那类错误，在多 design 这一层原样重造了一遍。修法：
-
 | 面 | 是什么 | 谁给 |
 |---|---|---|
-| **选择面** | 界面上那排勾选框 = 全部 design 读到的**并集** | `gui.state.available_layers()` |
-| **下发面** | 每个 design 各自的 `--3d` = **它自己的** stack 减去 simplify∩stack | `gui.state.effective_layer_model_for(design)` |
+| **选择面** | 界面上那两排勾选框 = 全部 design 读到的**并集** | `gui.state.available_layers()` |
+| **下发面** | 每个 design 各自的 flag = **它自己的** stack，两份清单都按它收窄 | `gui.state.effective_layer_model_for(design)` |
 
 落点是 `_axes_for_design`：`PlanContext` 本来就是 per-design 的，而
 `cmd.resolve_axis_flags` 查的正是 `ctx.axes` ⇒「同名同取值、flag 不同」架构上原生支持，
-不需要新占位符，**也不影响 slug**（slug 只看取值，仍是 `off` / `4`）。
+不需要新占位符，**也不影响 slug**（slug 只看取值）。
 
 三条边界：
 
-* 勾了一个某个 design 没有的层 → 对它就是不生效，**不是错误**（多 design 批次里很自然）；
-* 读不到某个 design 自己的层 → 退回批次并集（= 加这条修之前的行为），
-  那时我们对它一无所知，用已知的最大集合比用空集好；
+* 勾了一个某个 design 没有的层 → 对它就是不生效，**不是错误**；
+* 读不到某个 design 自己的层 → 退回批次并集（用已知的最大集合比用空集好）；
 * 造不出轴 → 记进 `_design_axis_errors`，由 `plan()` 转成**这个 design 每个 run 的**
-  plan error。走这条通道是有意的：`plan()` 的承诺是"某个 design 拼不出命令，
-  界面照常显示矩阵"，在那里抛异常会把整块预览打掉。
-* ⚠️ **只在 `learn=True` 时按 design 重算。** 打开历史批次时轴必须用批次自己冻着的那份 ——
-  拿今天的日志重算就是「resume 之后 `--3d` 悄悄换了」。
+  plan error。`plan()` 的承诺是"某个 design 拼不出命令，界面照常显示矩阵"，
+  在那里抛异常会把整块预览打掉。
+* ⚠️ **只在 `learn=True` 时按 design 重算。** 打开历史批次时轴必须用批次自己冻着的那份。
 
 ### 「只增不减」只在同一个官方目录内成立
 
-`available_layers()` 里"已知的"那一半（`_layer_model.stack`，上次存盘 / 手工补的）
-在**换官方目录**时会被丢掉（`set_official_run_dir`）。不丢的话旧 design 的层名会一直堆着
-——2026-08-31 实测：存过一次 session 再换目录，勾选框里会多出三个死层名，`--3d` 里也带着
-它们，而"eWave 会忽略不认识的层名"我们**没有证据**。
+`available_layers()` 里"已知的"那一半（上次存盘 / 手工补的）在**换官方目录**时会被丢掉。
+不丢的话旧 design 的层名会一直堆着，而"eWave 会忽略不认识的层名"我们**没有证据**。
 丢的条件是"新目录真读到了层"：读不到就留着旧的，那时它是唯一的来源。
 
-界面上剩下的手打入口只有 Advanced 里的 `extra layers`（日志没列到的层），
-正常情况下它是空的。
+### 老 spec / session 的迁移
 
-**三个 flag，一根轴**（`core.matrix.SIMPLIFY2D_FLAGS`）：
-
-| flag | 取值 | 谁给 |
-|---|---|---|
-| `--3d` | `stack - simplify`，按 stack 顺序 | 算的 |
-| `--edgeDist` | `"<层>,<值> <层>,<值> …"`，同样按 stack 顺序 | 算的，`<值>` = 轴的取值 |
-| `--thinMaxfactor` | `LayerModel.thin_max_factor` | 用户填，空则不给 |
-
-轴的取值 = 那几层用多大的 edge mesh（µm），外加一个 `off`。
-`off` 那一格三个 flag 全给 `False`（显式缺席）⇒ 命令行与**根本没有这根轴**逐字相同，
-基线才是真基线。
-
-### 🚨 `-e`（全局）与 `--edgeDist`（逐层）必须同时活着
-
-红区 2026-08-28 真跑通的那条命令是这个形状：
-
-```
-… -e 0.5 -d 0.5 …  --3d=<保持 3D 的层>  --edgeDist='<层>,4 <层>,4 …'  --thinMaxfactor=1
-   ^^^^^ 全局（mesh 轴）                  ^^^^^^^^^^ 逐层（simplify2d 轴）
-```
-
-同一个选项的两种写法同时出现是 eWave **文档化**的用法
-（help 原文：`--edgeDist=2 --edgeDist=M1,0.8` = 「M1 用 0.8，其余用全局 2」）。
-
-它成立的全部依据是 **mesh 轴写短名 `-e`、simplify2d 轴写长名 `--edgeDist`** ——
-两个不同的 dict 键，于是两条都进命令行。**谁把 mesh 轴改成长名，两根轴就撞同一个键**，
-后合并的那个把前一个整个吃掉：要么全局网格丢了、要么逐层覆盖丢了，而两种都跑得完。
-锁在 `tests/test_simplify2d.py::GlobalAndPerLayerCoexist::test_mesh_axis_still_writes_the_short_name`。
-
-配套两条：
-
-* `core.cmd.RENDER_LAST` 让 `--edgeDist` **排在所有 flag 之后**渲染。
-  `sorted()` 默认会把它排到 `-e` 前面（ASCII 下 `--` < `-e`），和验证过的那条命令反过来。
-  eWave 多半按形状分辨（裸数字 = 全局、`层,值` = 那一层），但那是推理，
-  本机没有 eWave 验证不了（硬约束 3）⇒ **照抄验证过的形状**。
-* `core.discover.FLAG_ALIASES` 让「学默认表」按**选项**剔除而不是按字符串剔除。
-  本站点官方脚本恰好写短名（`-e 0.4`），换一个写长名的站点，`--edgeDist=0.4` 会被学进
-  默认表、与 mesh 轴的 `-e` 不撞键 ⇒ 两条都下发，而"轴赢"这件事就不再由合并顺序保证了。
-
-### 层清单是**批次级**的，不是轴的取值
-
-`LayerModel` 挂在 `BatchSpec` 上，不挂在 `Axis` 上，也**不按 run group 分**：
-组能自己定"降到多粗"（轴的取值，进 slug），不能自己定"降哪几层" ——
-后者不进 slug，两个组用不同的 `--3d` 就是让目录名说不出两个 run 的差别。
-
-层名是 PDK 叠层坐标（CLAUDE.md 硬约束 1b）⇒ **源码里一个默认值都没有**。
-`builtin_axis_catalog()` 里那根轴因此只有 `off` 一个取值，别的取值由
-`core.matrix.simplify2d_axis(model, values)` 现造，界面和 spec 走同一条路。
+上午那一版的轴名是 `simplify2d`。`gui.state._migrate_legacy_simplify2d` 把它翻成两根
+（`off → 2d off + lmesh off`；`4 → 2d on + lmesh 4`），迁过来的批次跑出来的命令
+**与老版本逐字相同**。不迁的话那份设定会静默消失，而用户以为"上次那份"还在。
 
 ---
 
@@ -830,7 +790,8 @@ def tick(self) -> TickReport | None: ...
 | `core.cmd.BUILTIN_DEFAULT_FLAGS` | P1 | 内置兜底默认（BRIEF §6「已知的生产默认值」那一串）。**只许 flag 名和通用数值**，零站点坐标 |
 | `core.cmd.DEFAULT_DIFF_IGNORE` | P1 | 与参考命令比对时默认忽略的 flag（路径/站点相关的那几个）。**精确名，不许前缀** |
 | `core.cmd.RENDER_LAST` | P1 | 排在所有别的 flag 之后渲染的 flag（目前只有 `--edgeDist`）。理由见「simplify2d」那一节：`sorted()` 会把逐层的 `--edgeDist` 排到全局的 `-e` **前面**，和红区验证过的那条命令反过来，而本机验证不了 |
-| `core.matrix.SIMPLIFY2D_FLAGS` | P1 | `simplify2d` 轴掌管的三个 flag（`--3d` / `--edgeDist` / `--thinMaxfactor`）。⚠️ `--edgeDist` 是**长名**，mesh 轴掌管的是短名 `-e` —— 故意的，别统一 |
+| `core.matrix.LAYER2D_FLAGS` / `LAYERMESH_FLAGS` | P1 | 两根层轴各自掌管的 flag。**必须不相交** —— 撞了就等于没拆。⚠️ `--edgeDist` 是**长名**，mesh 轴掌管的是短名 `-e` —— 故意的，别统一 |
+| `core.matrix.THIN_MAX_FACTOR_FLAG` | P1 | `--thinMaxfactor`。**全局、不逐层 ⇒ 不属于任何一根轴**，走默认表层 |
 | `core.logparse.LAYER_BASIS_HEADER` / `LAYER_VIA_MARKER` | P4 | eWave 日志里那两句话，层清单靠它们定位。改了就读不到层，界面退回手填 —— 而「手填」正是用户点名不要的 |
 | `core.discover.FLAG_ALIASES` | P2 | eWave 里同一个选项的长短两种写法（`-e`/`--edgeDist`…）。**只**用于学默认表时按选项剔除，**不**参与轴与轴之间的冲突判定（`mesh` 和 `simplify2d` 各写一种是有意的）|
 | `core.cmd.KEY_FLAG` | P1 | `--key` 的 flag 名。**取值永远来自 `SiteFacts.key`，源码里零写死**（硬约束 1b）。`build_flag_layers` 把它补进默认表层；`facts.key` 为空则**什么都不加** —— 宁可缺，也不许编一个假 key |

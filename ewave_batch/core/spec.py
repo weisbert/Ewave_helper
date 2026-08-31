@@ -78,6 +78,7 @@ _TOP_KEYS: tuple[str, ...] = (
 _LAYER_MODEL_KEYS: tuple[str, ...] = (
     "stack",
     "simplify",
+    "mesh_layers",
     "thin_max_factor",
 )
 """`layer_model:` 底下的合法键。三样都是**用户敲的层名/数值**，源码里没有默认值
@@ -200,19 +201,24 @@ axes:
 #   **界面上不用填它** —— 工具从官方 run 目录的 eWave 日志里读（那里本来就有），
 #   界面画成一排勾选框。手写 spec 时才需要自己列，写法如下。
 #
-#   配套的是 simplify2d 这根轴（写在上面的 axes: 里），取值 = 那几层用多大的
-#   edge mesh（µm），off = 整叠留 3D。一批里同时写 off 和一个数就能做基线/降级对比。
+#   配套的是**两根**轴（写在上面的 axes: 里），它们是两件独立的事：
+#     layer2d    on / off        把 simplify: 那几层降成 2D          -> --3d
+#     layermesh  off / µm 数     给 mesh_layers: 那几层换网格        -> 逐层 --edgeDist
+#   分开是有意的（用户 2026-08-31）：捏成一根的话「只想降 2D、网格不动」表达不出来。
 #
 #   ⚠️ 只有 simplify2d 取了非 off 的值时这一块才会进命令行；
 #      simplify 里的层名必须都在 stack 里 —— eWave 对不认识的层名**不报错**，
 #      就是不生效，于是那层照旧 3D 而目录名说它降了。
 # ---------------------------------------------------------------------------
 # layer_model:
-#   stack:    [LOW1, LOW2, LOW3, LOW4, TOP1, TOP2]   # 整叠金属层，从下到上
-#   simplify: [LOW2, LOW3, LOW4]                     # 其中想降成 2D 的
-#   thin_max_factor: "1"                             # --thinMaxfactor（nm），空 = 不给
+#   stack:       [LOW1, LOW2, LOW3, LOW4, TOP1, TOP2]  # 整叠金属层，从下到上
+#   simplify:    [LOW2, LOW3, LOW4]                    # 降成 2D 的
+#   mesh_layers: [LOW2, LOW3, LOW4]                    # 换网格的（**另一份清单**）
+#   thin_max_factor: "1"          # --thinMaxfactor（nm），全局、不属于任何一根轴，空 = 不给
 # axes:
-#   simplify2d: [off, "4"]          # 基线 + 那几层用 4µm 的降级版，两个 run 各自一个目录
+#   layer2d:   [off, on]          # 基线 + 降 2D 的版本
+#   layermesh: [off, "4"]         # 基线 + 那几层用 4µm 的版本
+#   # 两根都写 ⇒ 2x2 四个组合，各自一个目录（2d-on__lmesh-4/ 之类）
 
 # ---------------------------------------------------------------------------
 # groups —— run group：base 之上的「单点变体」。可选，不写就只有 base 一组，
@@ -431,6 +437,23 @@ def spec_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _defaults_with_layer_globals(spec: BatchSpec) -> FlagDict:
+    """`spec.defaults` + `LayerModel` 里那些**全局**（不逐层、不成轴）的 flag。
+
+    目前只有一个：`--thinMaxfactor`。它是薄金属阈值，作用于整份网格而不是某几层，
+    所以**既不属于 `layer2d` 也不属于 `layermesh`**（用户 2026-08-31 指出那两件事
+    该分开，这一件是第三件）。放默认表层而不是轴层，是因为它不进目录名 ——
+    它不是 run 的身份，改它不该让每个 run 换一个目录。
+
+    显式写在 `defaults:` 里的同名值**赢** —— 那是用户在更下游手动定的。
+    """
+    out: FlagDict = dict(spec.defaults)
+    thin = str(spec.layer_model.thin_max_factor).strip()
+    if thin and matrix.THIN_MAX_FACTOR_FLAG not in out:
+        out[matrix.THIN_MAX_FACTOR_FLAG] = thin
+    return out
+
+
 def spec_to_batch(spec: BatchSpec, *, batch_root: str, tool_version: str = "") -> BatchState:
     """`BatchSpec` → 全新的 `BatchState`（run 全是 `READY`，还没建目录）。
 
@@ -494,7 +517,7 @@ def spec_to_batch(spec: BatchSpec, *, batch_root: str, tool_version: str = "") -
         runs=runs,
         streamout=streamout,
         options=spec.options,
-        defaults=dict(spec.defaults),
+        defaults=_defaults_with_layer_globals(spec),
         extra_flags=dict(spec.extra_flags),
         provenance=provenance,
     )
@@ -899,6 +922,7 @@ def _parse_layer_model(raw: object, where: str) -> LayerModel:
     return LayerModel(
         stack=_layer_list(raw.get("stack"), "stack", place),
         simplify=_layer_list(raw.get("simplify"), "simplify", place),
+        mesh_layers=_layer_list(raw.get("mesh_layers"), "mesh_layers", place),
         thin_max_factor=_opt_str(raw.get("thin_max_factor"), "thin_max_factor", place),
     )
 
@@ -939,6 +963,8 @@ def _layer_model_to_mapping(model: LayerModel) -> dict:
         out["stack"] = list(model.stack)
     if model.simplify:
         out["simplify"] = list(model.simplify)
+    if model.mesh_layers:
+        out["mesh_layers"] = list(model.mesh_layers)
     if model.thin_max_factor:
         out["thin_max_factor"] = model.thin_max_factor
     return out

@@ -49,7 +49,8 @@ GROUP_OVERRIDABLE_EXPECTED = (
     "corner",
     "temperature",
     "mesh",
-    "simplify2d",
+    "layer2d",
+    "layermesh",
     "fullWave",
     "equalCurrent",
 )

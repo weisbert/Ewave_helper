@@ -32,7 +32,7 @@ from typing import ClassVar, Protocol, runtime_checkable
 # 版本
 # --------------------------------------------------------------------------
 
-INTERFACE_VERSION = 4
+INTERFACE_VERSION = 5
 """冻结接口的版本。任何 `[interface-change]` commit 都要 +1。
 
 * 1 → 2（P2 复审返工）：**只加符号 + 改注释，没动任何已有签名** ——
@@ -45,6 +45,12 @@ INTERFACE_VERSION = 4
   （**默认空 = 逐字保持老行为**，所以老调用方不用改，但签名变了 ⇒ 必须 +1）。
   理由：全批次一个笛卡尔积表达不了「typical@3 温度 + typical@55 关 eqI + typical@55 开 fw」
   这种「基线 + 几个单点变体」，硬凑要跑 12 个 run 里 7 个是废的，而一个 run 是 10 核/100GB/35 分钟。
+* 4 → 5（拆成两根轴，用户 2026-08-31 指出）：`simplify2d` 一根轴同时干了两件事 ——
+  把层降成 2D（`--3d`）和给那些层换网格（`--edgeDist`）。它们在 eWave 里是两个独立的
+  选项，捏在一起的后果是"只想降 2D 不想动网格"表达不出来，也没法分别扫。
+  拆成 `layer2d`（on/off）+ `layermesh`（off / µm），`LayerModel` 相应多一个
+  `mesh_layers`；`--thinMaxfactor` 是第三件事（全局、不逐层），从轴上摘下来，
+  改由 `spec_to_batch` 并进默认表层。
 * 3 → 4（2D 简化，用户 2026-08-31 拍板）：新增 `LayerModel`，`BatchSpec` 加一个
   `layer_model` 字段（**默认空 = 逐字保持老行为**）。老调用方不用改，但签名变了 ⇒ 必须 +1。
   理由：`--3d` 是**保持 3D 的白名单**，而用户想的是「把哪几层降成 2D」——
@@ -599,21 +605,32 @@ class LayerModel:
     """
 
     stack: tuple[str, ...] = ()
-    """这个 PDK 的**全部**金属层名，从下到上。填一次，换 PDK 才动。"""
+    """这个 design 的**全部**金属层名，从下到上。由工具从 eWave 日志读，用户不填。"""
     simplify: tuple[str, ...] = ()
-    """其中想降成 2D 的那几层。必须是 `stack` 的子集 —— 不是的话说明有一边写错了，
-    而"错的那个层名"在命令行里是看不出来的（eWave 不认识的层名它不报错，就是不生效）。"""
+    """**降成 2D 的层**（`layer2d` 轴 → `--3d` 的补集）。"""
+    mesh_layers: tuple[str, ...] = ()
+    """**换网格的层**（`layermesh` 轴 → 逐层 `--edgeDist`）。
+
+    ⚠️ 与 `simplify` **是两份独立的清单**（用户 2026-08-31 指出）：
+    「把这几层降成 2D」和「给这几层换网格」在 eWave 里是两个选项，
+    捏成一份的后果是"只想降 2D 不想动网格"表达不出来，也没法分别扫。
+    实际用起来两份多半一样，但那是用户的选择，不是工具替他做的决定。
+    """
     thin_max_factor: str = ""
     """`--thinMaxfactor` 的取值（nm）。空 = 不给这个 flag。
 
     默认 200nm 的含义是"薄于此的金属自动把 `--maxFactor` 压到 2"，于是薄金属层的网格
     会暴涨；给一个很小的值（红区 2026-08-28 实测用的是 1）等于宣布"没有层算薄"，
-    `--maxFactor` 留在 8。它是**全局**的，不逐层，所以放在这儿而不是跟着层清单走。
+    `--maxFactor` 留在 8。
+
+    🚨 它是**全局**的、不逐层，所以**既不属于 `layer2d` 也不属于 `layermesh`** ——
+    由 `core.spec.spec_to_batch` 并进默认表层，界面上住在 Advanced。
+    挂在某一根轴上就是把两件不相干的事绑在一起（那正是 4 → 5 拆分要修的毛病）。
     """
 
     def is_empty(self) -> bool:
-        """三个字段全空 = 这个功能没开。`spec` 靠它决定要不要把这一块写进文件。"""
-        return not (self.stack or self.simplify or self.thin_max_factor)
+        """全空 = 这个功能没开。`spec` 靠它决定要不要把这一块写进文件。"""
+        return not (self.stack or self.simplify or self.mesh_layers or self.thin_max_factor)
 
 
 @dataclass
