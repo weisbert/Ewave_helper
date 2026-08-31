@@ -146,11 +146,19 @@ GROUP_SUMMARY_CAP_CHARS = 43
 口径是字符数不是像素数，理由同 `RUN_COL_CAP_CHARS`。
 """
 
+LAYER_COLUMNS = 6
+"""「2D 层」那排勾选框一行摆几个。
+
+一个叠层十来层，一行摆完会把左栏顶到窗口外（同 `GROUP_COL_CAP_CHARS` 那条理由）；
+6 个一行 ⇒ 常见的十二层金属正好两行。
+"""
+
 GROUP_ROW_AXES: dict[str, tuple[str, ...]] = {
     "corner": ("corner",),
     "temperature": ("temperature",),
     "fullWave": ("fullWave",),
     "mesh": ("mesh",),
+    "simplify2d": ("simplify2d",),
     "advanced": ("equalCurrent",),
 }
 """Settings 里**一行**对应哪几根轴 —— 那个"覆盖"勾选框是按行给的，不是按轴给的。
@@ -159,6 +167,11 @@ GROUP_ROW_AXES: dict[str, tuple[str, ...]] = {
 
 * `freq`：界面上它不是一个取值列表而是一整排格子（模式 + start/stop/step/points），
   一个组要换扫频等于换四个格子的组合，塞进"勾一下就覆盖"的模型里表达不了。
+★ `simplify2d` **在**这张表里，但它只覆盖得了"降到多粗"（轴的取值）——
+"降哪几层"（`gui.state` 的 `LayerModel`）整批一份，编辑别的组时那个框是灰的。
+理由与两个 tolerance 同款：层清单一旦按组分，两个组的 `--3d` 就不一样了，
+而"哪几层是 2D"**不进 slug** ⇒ 目录名说不出两个 run 的差别。
+
 * `relativeTolerance` / `relativeCurrentTolerance`：它们与 equalCurrent 挤在同一个
   Advanced 折叠块里，一度是跟着那个勾选框一起覆盖的 —— 但那样一勾就会把**当前的**
   tolerance 值钉成这个组的显式取值，之后用户改 base 的 tolerance，这个组会**静默**
@@ -1726,6 +1739,15 @@ class BaseApp:
         self.m_edge = tk.StringVar(value=mesh[0])
         self.m_vert = tk.StringVar(value=mesh[1])
         self.m_via = tk.StringVar(value=mesh[2])
+        extra_text, _simplify_text, thin_text = self.bridge.layer_model_text()
+        self.s2d = tk.StringVar(value=", ".join(selection.get("simplify2d", ())))
+        self.s2d_extra = tk.StringVar(value=extra_text)
+        self.s2d_thin = tk.StringVar(value=thin_text)
+        self.s2d_layer_vars: dict[str, tk.BooleanVar] = {}
+        """层名 → "这层降 2D 吗"。**动态建**（层名来自 eWave 日志，源码里一个都没有），
+        见 `_sync_layer_boxes`。"""
+        self.s2d_layer_sig: tuple[str, ...] = ()
+        """上一次画勾选框用的层清单。变了才重建 —— 每次 recompute 都重建会闪。"""
         self.eq_on = tk.BooleanVar(value=("on" in selection.get("equalCurrent", ())))
         self.eq_off = tk.BooleanVar(value=("off" in selection.get("equalCurrent", ())))
         self.tol_r = tk.StringVar(value=(selection.get("relativeTolerance") or ("",))[0])
@@ -2577,18 +2599,23 @@ class BaseApp:
                 variable=var,
                 command=lambda k=key: self.on_override_toggle(k),
             )
-            check.grid(row=row, column=0, sticky=tk.W)
+            check.grid(row=row, column=0, sticky=tk.NW, pady=2)
             self.ovr_boxes[key] = check
             _Tooltip(check, OVERRIDE_TIP % label)
+        # `tk.NW` 而不是 `tk.W`：有的行不止一行高（「Simplify to 2D」那排层勾选框占两三行），
+        # 居中对齐会让标签飘到行中间、和它右边第一行控件对不上。
+        # 单行的行两者没有区别（格子高度就是标签高度）。
         ttk.Label(parent, text=label, width=width, anchor=tk.W).grid(  # type: ignore[arg-type]
-            row=row, column=1, sticky=tk.W, pady=2
+            row=row, column=1, sticky=tk.NW, pady=2
         )
         box = ttk.Frame(parent)  # type: ignore[arg-type]
         box.grid(row=row, column=2, sticky=tk.W)
         if key:
             self.srow_boxes[key] = box
         count = ttk.Label(parent, text="-> 1", style="Count.TLabel", anchor=tk.E, width=6)  # type: ignore[arg-type]
-        count.grid(row=row, column=3, sticky=tk.E, padx=(10, 0))
+        # `tk.NE` 同 `tk.NW`：多行高的行（「Simplify to 2D」）里，居中会让 `-> N` 飘到
+        # 行中间，和它数的那一行对不上。单行的行没有区别。
+        count.grid(row=row, column=3, sticky=tk.NE, padx=(10, 0), pady=2)
         ttk.Separator(parent, orient=tk.HORIZONTAL).grid(  # type: ignore[arg-type]
             row=row, column=0, columnspan=4, sticky="sew"
         )
@@ -2700,25 +2727,55 @@ class BaseApp:
             entry.pack(side=tk.LEFT, padx=(0, 10))
             entry.bind("<KeyRelease>", lambda _e: self.recompute())
 
+        # ★ 「把哪几层降成 2D」。放在 Mesh 正下方是因为它写的是**逐层的** --edgeDist，
+        #   而 Mesh 写的是全局的 -e —— 命令行上"先全局、后逐层"就是这个顺序。
+        box_s, self.cnt_s2d = self._srow(grid, 5, "Simplify to 2D", lw, key="simplify2d")
+        s2d_line = ttk.Frame(box_s)
+        s2d_line.pack(anchor=tk.W)
+        # 只有取值那一格归这一行的"覆盖"勾选框管（`_srow` 默认把整个 box 都算进去）。
+        # 层清单是整批一份的，编辑别的组时它跟两个 tolerance 一样整块置灰。
+        s2d_values = ttk.Frame(s2d_line)
+        s2d_values.pack(side=tk.LEFT)
+        self.srow_boxes["simplify2d"] = s2d_values
+        entry = ttk.Entry(
+            s2d_values, textvariable=self.s2d, width=12 if compact else 16, font=self.f_mono
+        )
+        entry.pack(side=tk.LEFT)
+        entry.bind("<KeyRelease>", lambda _e: self.recompute())
+        ttk.Label(s2d_values, text="um, or 'off'", style="Hint.TLabel").pack(side=tk.LEFT, padx=5)
+        # ★ 层名**不让用户打**（用户 2026-08-31：「你不能指望用户自己填写 --3d 这样的指令」）。
+        #   它们由 `core.discover.find_layer_stack` 从官方 run 目录的 eWave 日志里读出来，
+        #   这里只负责把它们画成勾选框。控件是**动态建**的 —— 源码里一个层名都没有
+        #   （硬约束 1b），所以这一格在 build 阶段必然是空的，由 `_sync_layer_boxes` 填。
+        self.s2d_layer_box = ttk.Frame(box_s)
+        self.s2d_layer_box.pack(anchor=tk.W, fill=tk.X, pady=(2, 0))
+        # 算出来的那串 --3d / --edgeDist 直接摆在下面。
+        # `--3d` 是**工具算的补集**，而用户只填了想降的那几层 —— 算错了（叠层漏一层、
+        # 层名拼错）在命令行上是看不出来的：eWave 不认识的层名它不报错，就是不生效。
+        # 所以把结果摆出来让人核对。用 tk.Label（前景色走 style 会污染别的标签，同 extra_warn）。
+        self.s2d_preview = tk.Label(
+            box_s, font=self.f_mono, fg=HINT, anchor=tk.W, justify=tk.LEFT, wraplength=620
+        )
+
         # Advanced：收起来是一行摘要，展开是真控件（第 3 层「逃生口」住在这儿）
         adv_check = ttk.Checkbutton(
             grid,
             variable=self._new_override_var("advanced"),
             command=lambda: self.on_override_toggle("advanced"),
         )
-        adv_check.grid(row=5, column=0, sticky=tk.W)
+        adv_check.grid(row=6, column=0, sticky=tk.W)
         self.ovr_boxes["advanced"] = adv_check
         # ★ 这一个只管 equalCurrent（两个 tolerance 只属于 base）—— 提示语里说清楚，
         #   否则用户会以为勾上之后这个组连 tolerance 一起自己定了。
         _Tooltip(adv_check, OVERRIDE_TIP % "equalCurrent (tolerances stay on base)")
         adv_head = ttk.Frame(grid)
-        adv_head.grid(row=5, column=1, columnspan=2, sticky=tk.W, pady=(2, 0))
+        adv_head.grid(row=6, column=1, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.adv_btn = ttk.Button(adv_head, text="+ Advanced", width=13, command=self.toggle_adv)
         self.adv_btn.pack(side=tk.LEFT)
         self.adv_summary = ttk.Label(adv_head, text="", style="Off.TLabel")
         self.adv_summary.pack(side=tk.LEFT, padx=8)
         self.cnt_adv = ttk.Label(grid, text="-> 1", style="Off.TLabel", anchor=tk.E, width=6)
-        self.cnt_adv.grid(row=5, column=3, sticky=tk.E, padx=(10, 0))
+        self.cnt_adv.grid(row=6, column=3, sticky=tk.E, padx=(10, 0))
 
         self.adv_body = ttk.Frame(grid)
         row = ttk.Frame(self.adv_body)
@@ -2745,6 +2802,33 @@ class BaseApp:
             entry = ttk.Entry(self.tol_box, textvariable=var, width=9, font=self.f_mono)
             entry.pack(side=tk.LEFT, padx=(0, 14))
             entry.bind("<KeyRelease>", lambda _e: self.recompute())
+
+        # 「整叠金属层」和 thinMaxfactor —— 填一次、换 PDK 才动，所以收在 Advanced 里。
+        # ⚠️ 它们跟 Extra flags 一样**整批一份**，编辑别的组时照样能改（不进 srow_boxes）。
+        # 「层清单是哪来的」—— 一行**只读**文字。做成只读是有意的：它显示的是
+        # 读到的那份，做成输入框就会和 `extra layers` 变成同一份清单的两个副本，
+        # 而两个副本必然漂，漂的方向是 --3d 少一层 = 那层静默退 2D。
+        self.s2d_source = tk.Label(
+            self.adv_body, font=self.f_ui, fg=HINT, anchor=tk.W, justify=tk.LEFT, wraplength=620
+        )
+        self.s2d_source.pack(anchor=tk.W, fill=tk.X, pady=(4, 0))
+
+        stack_row = ttk.Frame(self.adv_body)
+        stack_row.pack(anchor=tk.W, fill=tk.X, pady=(2, 0))
+        ttk.Label(stack_row, text="extra layers").pack(side=tk.LEFT, padx=(0, 4))
+        stack_entry = ttk.Entry(stack_row, textvariable=self.s2d_extra, font=self.f_mono)
+        stack_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        stack_entry.bind("<KeyRelease>", lambda _e: self.recompute())
+        _Tooltip(
+            stack_entry,
+            "Normally empty - the metal layers are read from the official run dir's eWave log.\n"
+            "Type here only to add a layer that log did not list.",
+        )
+        ttk.Label(stack_row, text="thinMaxfactor").pack(side=tk.LEFT, padx=(4, 3))
+        thin_entry = ttk.Entry(stack_row, textvariable=self.s2d_thin, width=6, font=self.f_mono)
+        thin_entry.pack(side=tk.LEFT)
+        thin_entry.bind("<KeyRelease>", lambda _e: self.recompute())
+        ttk.Label(stack_row, text="nm", style="Hint.TLabel").pack(side=tk.LEFT, padx=(3, 0))
 
         extra_row = ttk.Frame(self.adv_body)
         extra_row.pack(anchor=tk.W, fill=tk.X, pady=(4, 0))
@@ -2779,7 +2863,7 @@ class BaseApp:
             self.adv_btn.config(text="+ Advanced")
             self.adv_summary.pack(side=tk.LEFT, padx=8)
         else:
-            self.adv_body.grid(row=6, column=0, columnspan=4, sticky=tk.W + tk.E)
+            self.adv_body.grid(row=7, column=0, columnspan=4, sticky=tk.W + tk.E)
             self.adv_btn.config(text="- Advanced")
             self.adv_summary.pack_forget()
         self.adv_open = not self.adv_open
@@ -3149,6 +3233,35 @@ class BaseApp:
             "mesh",
             [gui_state.mesh_axis_value(self.m_edge.get(), self.m_vert.get(), self.m_via.get())],
         )
+        self._push_axis(
+            "simplify2d",
+            "simplify2d",
+            gui_state.parse_value_list(self.s2d.get()),
+        )
+        # 层清单整批一份 ⇒ 与扫频、两个 tolerance 同款：**只有编辑 base 时才回写**。
+        # 编辑别的组时那两个框是灰的、装的是 base 的值，回写它们最好是 no-op，
+        # 最坏是把界面上某个被别处清空的框当成用户的输入写进基线。
+        if self._active_is_base():
+            # 🚨 **勾选框和模型不同步时不许回写勾选状态。**
+            #   那排勾选框是**动态建**的（层名来自日志，源码里没有），所以在
+            #   `_sync_layer_boxes` 跑过之前 `s2d_layer_vars` 是空的 ——
+            #   而"一个控件都还没有"和"用户把每一层都取消勾选了"在这里长得一模一样。
+            #   不挡的话第一次 recompute 就会把读回来的那份选择清空，
+            #   而界面上什么都不会显示出错。判据是**结构**（控件集合 == 模型的层清单），
+            #   不是时序（"等 sync 跑过一次"那种约定会在下一次重构里悄悄失效）。
+            in_sync = self.s2d_layer_sig == tuple(self.bridge.available_layers())
+            ticked = (
+                gui_state.render_layer_list(
+                    [name for name, var in self.s2d_layer_vars.items() if var.get()]
+                )
+                if in_sync
+                else gui_state.render_layer_list(self.bridge.layer_model().simplify)
+            )
+            b.set_layer_model(
+                stack=self.s2d_extra.get(),
+                simplify=ticked,
+                thin=self.s2d_thin.get(),
+            )
         self._push_base_axis("relativeTolerance", [self.tol_r.get()])
         self._push_base_axis("relativeCurrentTolerance", [self.tol_c.get()])
         # 扫频和两个 tolerance 一样只属于 base（见 `GROUP_ROW_AXES` 的注释）。
@@ -3239,6 +3352,10 @@ class BaseApp:
         tol_box = getattr(self, "tol_box", None)
         if tol_box is not None:
             _set_enabled(tol_box, base)
+        # 层清单同理：组能自己定"降到多粗"，不能自己定"降哪几层"（见 `GROUP_ROW_AXES`）。
+        layer_box = getattr(self, "s2d_layer_box", None)
+        if layer_box is not None:
+            _set_enabled(layer_box, base)
         if base:
             for container in self.srow_boxes.values():
                 _set_enabled(container, True)
@@ -3333,6 +3450,8 @@ class BaseApp:
             self._guard(self._sync_counts)
             self._guard(self._sync_resources)
             self._guard(self._sync_extra_warning)
+            self._guard(self._sync_layer_boxes)
+            self._guard(self._sync_simplify2d_preview)
             self._guard(self._sync_groups_panel)
             self.refresh_tree()
             # ★ 必须在 `refresh_tree()` **之后**：判据是"表上有行、而现在的设定
@@ -3569,6 +3688,7 @@ class BaseApp:
             (self.cnt_mode, "fullWave"),
             (self.cnt_freq, "freq"),
             (self.cnt_mesh, "mesh"),
+            (self.cnt_s2d, "simplify2d"),
         ):
             label.config(text="-> %d" % counts.get(key, 0))
         advanced = max(
@@ -3650,6 +3770,85 @@ class BaseApp:
             self.dsub_warn.pack(fill=tk.X, pady=(4, 0))
         else:
             self.dsub_warn.pack_forget()
+
+    def _sync_layer_boxes(self) -> None:
+        """把「哪几层降 2D」画成一排勾选框。层名来自 `bridge.available_layers()`。
+
+        **源码里一个层名都没有**（硬约束 1b）⇒ 这些控件只能动态建。清单变了才重建
+        （每次 recompute 都重建会闪，而且会把用户刚点的那一下吃掉）。
+
+        每个层名后面跟着它占了多少网格元素（`<层> 20%`）—— 那不是装饰，
+        那是"该降哪几层"的**决策依据**：占 20% 的降下去才省时间，
+        占 <5% 的降了只是改变了没打算改的东西。读不到占比就只画名字。
+
+        一层都读不到（官方目录还没填 / 那个目录没跑过）→ 画一句话告诉人去哪填，
+        而不是留一片空白让人以为界面坏了。
+        """
+        box = getattr(self, "s2d_layer_box", None)
+        if box is None:
+            return
+        layers = tuple(self.bridge.available_layers())
+        if layers != self.s2d_layer_sig:
+            self.s2d_layer_sig = layers
+            self.s2d_layer_vars = {}
+            for child in box.winfo_children():
+                child.destroy()
+            if not layers:
+                tk.Label(
+                    box,
+                    text="2D layers   (none yet - set the Official run dir above and they are "
+                    "read from its eWave log)",
+                    font=self.f_ui,
+                    fg=HINT,
+                    anchor=tk.W,
+                ).grid(row=0, column=0, columnspan=LAYER_COLUMNS, sticky=tk.W)
+            else:
+                ttk.Label(box, text="2D layers").grid(row=0, column=0, sticky=tk.W, padx=(0, 6))
+                shares = self.bridge.layer_shares()
+                for index, name in enumerate(layers):
+                    var = tk.BooleanVar(value=False)
+                    self.s2d_layer_vars[name] = var
+                    share = shares.get(name, "")
+                    ttk.Checkbutton(
+                        box,
+                        text=name + (" " + share if share else ""),
+                        variable=var,
+                        command=self.recompute,
+                    ).grid(
+                        row=1 + index // LAYER_COLUMNS,
+                        column=index % LAYER_COLUMNS,
+                        sticky=tk.W,
+                        padx=(0, 10),
+                    )
+        chosen = set(self.bridge.layer_model().simplify)
+        for name, var in self.s2d_layer_vars.items():
+            if var.get() != (name in chosen):
+                var.set(name in chosen)
+        source = getattr(self, "s2d_source", None)
+        if source is not None:
+            source.config(text=self.bridge.layer_source_text())
+
+    def _sync_simplify2d_preview(self) -> None:
+        """把 `--3d` / `--edgeDist` 算出来的那一串摆到 Settings 里。
+
+        **这不是装饰。** `--3d` 是「保持 3D 的白名单」，是工具拿「整叠 - 想降的」算的；
+        算错了在命令行上看不出来 —— eWave 不认识的层名它不报错，就是不生效
+        （用户 2026-08-28 手工数元素数才查出来的那个坑：白名单漏了一层）。摆出来才核对得了。
+
+        全是 off ⇒ 这根轴什么都不加，那一行整个收起来（常态下界面与从前一样高）。
+        算不出来 ⇒ 显示那条错误的第一行并标红，跟 Extra flags 撞轴同款处理。
+        """
+        preview = getattr(self, "s2d_preview", None)
+        if preview is None:
+            return
+        text = self.bridge.simplify2d_preview()
+        if not text:
+            preview.pack_forget()
+            return
+        bad = not text.startswith("-")
+        preview.config(text=("!  " if bad else "") + text, fg=RED if bad else HINT)
+        if not preview.winfo_manager():
+            preview.pack(anchor=tk.W, fill=tk.X, pady=(2, 0))
 
     def _sync_extra_warning(self) -> None:
         """Extra flags 撞轴 → **标红**（§11 规则 2；这是原生 GUI 覆盖坑的根因）。"""
@@ -4391,6 +4590,8 @@ class BaseApp:
             modes = selection.get("fullWave", ())
             self.mode_vars["Quasi-static"].set("off" in modes)
             self.mode_vars["Full wave"].set("on" in modes)
+        if want("simplify2d"):
+            self.s2d.set(", ".join(selection.get("simplify2d", ())))
         if want("mesh"):
             mesh = (selection.get("mesh") or ("0.4",))[0].split(gui_state.MESH_SEP)
             if len(mesh) == 1:

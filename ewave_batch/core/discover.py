@@ -30,14 +30,17 @@ import posixpath
 import re
 import shutil
 from collections.abc import Mapping
+from dataclasses import replace
+from types import MappingProxyType
 
 from ..model import (
     MECHANISM_FLAGS,
     DiscoveryError,
     FlagDict,
+    LayerStack,
     SiteFacts,
 )
-from . import matrix, template
+from . import logparse, matrix, template
 
 # --------------------------------------------------------------------------
 # 常量（全部私有 —— 冻结面 `model.FROZEN` 只认下面那 8 个函数，
@@ -345,21 +348,65 @@ def learn_default_flags(facts: SiteFacts) -> FlagDict:
     两条路的结果必须一致 —— 剔除是幂等的集合运算。
     """
     source = facts.production_flags or facts.official_flags
-    drop = set(_SITE_IDENTITY_FLAGS) | set(MECHANISM_FLAGS) | _axis_owned_flags()
+    drop = _with_aliases(set(_SITE_IDENTITY_FLAGS) | set(MECHANISM_FLAGS) | _axis_owned_flags())
     return {name: value for name, value in source.items() if name not in drop}
 
 
+def _with_aliases(names: set[str]) -> frozenset[str]:
+    """把一组 flag 名补全成"这些**选项**的全部写法"（见 `FLAG_ALIASES`）。
+
+    剔除的口径必须是**选项**而不是字符串：`-e` 和 `--edgeDist` 是同一个选项，
+    只剔一个写法等于没剔 —— 另一个写法照样进默认表，然后和轴层各写各的，两条都下发。
+    """
+    out = set(names)
+    for short, long in FLAG_ALIASES.items():
+        if short in out:
+            out.add(long)
+        if long in out:
+            out.add(short)
+    return frozenset(out)
+
+
+FLAG_ALIASES: Mapping[str, str] = MappingProxyType(
+    {
+        "-e": "--edgeDist",
+        "-d": "--vertDist",
+        "-m": "--meshFile",
+    }
+)
+"""eWave 里**同一个选项的两种写法**（短名 → 长名），出处是 help 原文里的
+`--edgeDist=value, -e value` / `--vertDist=value, -d value` / `--meshFile … 或缩写 -m`。
+
+只有一个用途：**学默认表时按选项剔除，而不是按字符串剔除**（见 `_axis_owned_flags`）。
+
+为什么需要：本站点官方 GUI 生成的脚本恰好写短名（`-e 0.4 -d 0.4`，见
+`references/probes/run_ewave_typical_-40_0.sh`），所以「按字符串剔 `-e`」一直没出事。
+换一个写长名的站点就会出事 —— `--edgeDist=0.4` 学进默认表，mesh 轴写的是 `-e`，
+两个键不撞、于是**两个都进命令行**，而 eWave 认哪一个是没定义的。
+后果是目录名说 mesh 0.5、实际可能跑的是 0.4，正是本工具要消灭的那类静默不一致。
+
+🚨 **这张表不参与轴与轴之间的冲突判定。** `simplify2d` 轴故意写长名 `--edgeDist`
+（逐层），`mesh` 轴写短名 `-e`（全局）—— 那是 eWave 文档化的「全局 + 逐层」用法
+（`--edgeDist=2 --edgeDist=M1,0.8`），两条同时出现是**有意的**，不是冲突。
+详见 `core.matrix.SIMPLIFY2D_FLAGS`。
+"""
+
+
 def _axis_owned_flags() -> frozenset[str]:
-    """内置轴目录里所有被轴掌管的 flag 名（`--corner` / `--temperature` / `-e` / …）。
+    """内置轴目录里所有被轴掌管的 flag 名（`--corner` / `--temperature` / `-e` / …），
+    **连同它们的长短名别名**。
 
     这些由轴层给（它们是 run 的身份、会进目录名），学进默认表就会出现
     「默认表说 25.0、轴说 125.0」这种两个层同时写同一个 flag 的局面 ——
     合并顺序保证轴赢，但默认表里留着一个永远不生效的值本身就是误导。
+
+    别名要一起剔的理由见 `FLAG_ALIASES`：不剔的话两个写法不撞键，于是**两条都下发**，
+    而"轴赢"这件事就不再由合并顺序保证了。
     """
     owned: set[str] = set()
     for axis in matrix.builtin_axis_catalog().values():
         owned.update(axis.flags)
-    return frozenset(owned)
+    return _with_aliases(owned)
 
 
 # --------------------------------------------------------------------------
@@ -615,6 +662,69 @@ def _read_run_script(
         "production_flags",
     ):
         source_files[name] = script_path
+
+
+LAYER_LOG_SUFFIX = ".log"
+"""从官方 run 目录里找 eWave 日志时认的后缀。"""
+
+LAYER_LOG_MAX_BYTES = 16 * 1024 * 1024
+"""一份日志最多读多少。与 `core.logparse.MAX_LOG_BYTES` 同一个数量级，
+这里是**从头读**（层清单在日志前半段，不像失败原因在末尾）。"""
+
+
+def find_layer_stack(directory: str) -> LayerStack:
+    """官方 run 目录 → 这个 design 的导体层清单（给 `--3d` 算补集用）。
+
+    **这个函数存在的全部理由是"别让用户手打层名"。** 层名是 PDK 叠层坐标，
+    源码里不许有（硬约束 1b），而让人一个个敲进去既烦又容易漏 ——
+    漏一个就是那层被静默降成 2D，正是 `simplify2d` 要消灭的东西。
+    答案本来就躺在官方 run 目录里：eWave 自己的日志会把层列全。
+
+    找日志的顺序（先找到、且解析得出东西的那份胜出）：
+
+    1. `run_ewave_*.log` —— 官方脚本捕获的 stdout。**首选**：那条命令行把 eWave 的
+       全部输出都收了，两段线索（层表达式 + 每层元素占比）都在里面。
+    2. `<corner>_<temp>/ewave.log` —— eWave 自己的主日志。退路：某些版本它比 stdout 短。
+
+    一份都解析不出来 → 返回带 `note` 的空 `LayerStack`（**不抛**）：
+    官方目录里没跑过、或者日志被清过，都是完全正常的状态，界面退回手填即可。
+    """
+    candidates: list[str] = []
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return LayerStack(note=f"cannot list {directory}")
+    for name in names:
+        if name.startswith(_RUNSH_GLOB_PREFIX) and name.endswith(LAYER_LOG_SUFFIX):
+            candidates.append(os.path.join(directory, name))
+    for name in names:
+        sub = os.path.join(directory, name)
+        if os.path.isdir(sub):
+            log = os.path.join(sub, logparse.EWAVE_LOG_NAME)
+            if os.path.isfile(log):
+                candidates.append(log)
+
+    notes: list[str] = []
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                text = handle.read(LAYER_LOG_MAX_BYTES)
+        except OSError as exc:  # pragma: no cover - 权限/竞态
+            notes.append(f"{path}: {exc}")
+            continue
+        stack = logparse.parse_layer_stack(text)
+        if not stack.is_empty():
+            return replace(stack, source=path, note="")
+        if stack.note:
+            notes.append(f"{path}: {stack.note}")
+    if not candidates:
+        notes.append(
+            f"{directory} has no {_RUNSH_GLOB_PREFIX}*{LAYER_LOG_SUFFIX} and no "
+            f"*/{logparse.EWAVE_LOG_NAME} - nothing has been run there yet?"
+        )
+    return LayerStack(note="; ".join(notes))
 
 
 def _find_run_scripts(directory: str) -> list[str]:

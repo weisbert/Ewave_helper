@@ -32,7 +32,7 @@ from typing import ClassVar, Protocol, runtime_checkable
 # 版本
 # --------------------------------------------------------------------------
 
-INTERFACE_VERSION = 3
+INTERFACE_VERSION = 4
 """冻结接口的版本。任何 `[interface-change]` commit 都要 +1。
 
 * 1 → 2（P2 复审返工）：**只加符号 + 改注释，没动任何已有签名** ——
@@ -45,6 +45,12 @@ INTERFACE_VERSION = 3
   （**默认空 = 逐字保持老行为**，所以老调用方不用改，但签名变了 ⇒ 必须 +1）。
   理由：全批次一个笛卡尔积表达不了「typical@3 温度 + typical@55 关 eqI + typical@55 开 fw」
   这种「基线 + 几个单点变体」，硬凑要跑 12 个 run 里 7 个是废的，而一个 run 是 10 核/100GB/35 分钟。
+* 3 → 4（2D 简化，用户 2026-08-31 拍板）：新增 `LayerModel`，`BatchSpec` 加一个
+  `layer_model` 字段（**默认空 = 逐字保持老行为**）。老调用方不用改，但签名变了 ⇒ 必须 +1。
+  理由：`--3d` 是**保持 3D 的白名单**，而用户想的是「把哪几层降成 2D」——
+  两者互为补集，工具要替用户算这个补集就必须知道整叠金属层有哪些。
+  这份「叠层 + 想降哪几层 + 薄金属阈值」既不是轴的取值（它对每个取值都一样）、
+  也不是 flag 默认表（它不是 flag），所以只能是批次级的一份配置。
 """
 
 SCHEMA_VERSION = 1
@@ -530,6 +536,87 @@ class Provenance:
 
 
 @dataclass
+class LayerStack:
+    """一份 eWave 日志说这个 design 有哪几层导体 —— `core.logparse.parse_layer_stack` 的产物。
+
+    **存在的理由是"别让用户手打层名"。** 层名是 PDK 叠层坐标（硬约束 1b）⇒ 源码里没有；
+    而让用户一个个敲进去既烦又容易漏，漏一个就是那层被静默降成 2D。
+    官方 run 目录里本来就有 eWave 自己写的日志，答案在里面 ——
+    这是硬约束 1b 那条「运行时发现优于配置项」的又一个落点。
+
+    🚨 **这是 per-design 数据，不是站点级的**（不同 cell 用到的层不一样）⇒
+    绝不进 `core.sitepin` 的 `PIN_FIELDS`，理由与端口表同款：钉住的会过期，
+    而过期的层清单意味着 `--3d` 少一层 = 那层静默退 2D。
+    """
+
+    conductors: tuple[str, ...] = ()
+    """这个 design 真正 mesh 到的**导体**层，**自下而上**（= eWave 自己的层表达式顺序）。
+    `--3d` 的白名单就从这里减去用户想降的那几层。"""
+    vias: tuple[str, ...] = ()
+    """其中被 eWave 标成 via 的那些。**不进 `--3d`** —— 手册说那个 flag 管的是 metal layer，
+    而红区 2026-08-28 验证过的那条命令里也只有金属。列出来是为了让人看见工具没在藏东西。"""
+    shares: dict[str, str] = field(default_factory=dict)
+    """层名 → 它占了多少网格元素（`"20%"` / `"<5%"`）。
+
+    **这是"该降哪几层"的决策依据**，不是装饰：占 20% 的那层降下去才省时间，
+    占 <5% 的降了只是改变了没打算改的东西。界面把它显示在每个层名旁边。"""
+    source: str = ""
+    """从哪份日志读出来的（绝对路径）。界面显示它，好让人知道这串层名是哪来的、
+    以及"换了 design 要不要重读"。**只在内存里**，不进任何存盘的结构。"""
+    note: str = ""
+    """解析不出来时的人话原因。空 = 正常。**不猜**：两段线索缺一就整个返回空，
+    因为猜错的后果是 `--3d` 少一层 → 那层静默退 2D。"""
+
+    def is_empty(self) -> bool:
+        return not (self.conductors or self.vias)
+
+
+@dataclass
+class LayerModel:
+    """把哪几层金属降成 2D —— `simplify2d` 轴的批次级配置（**不是**它的取值）。
+
+    ## 为什么需要 `stack`
+
+    eWave 的 `--3d` 是**保持 3D 的白名单**：没列进去的层**静默**退成 2D
+    （`references/probes/ewave_probe_2025.09.sp1.txt` 的 `--3d` 条目）。
+    而用户想的是反过来的一句话——「把中间那几层降成 2D 省时间」。
+
+    两者互为补集，所以工具要替用户算白名单就**必须**知道整叠金属层有哪些：
+
+        --3d = stack - simplify
+
+    这不是多要一个输入，这是把一类静默错误变成不可能：用户 2026-08-28 就踩过一次——
+    手写白名单时漏了一层，那层被无声无息地降成 2D，而 run 照样跑完、数字还挺像。
+    换成"只说想降哪几层"之后，**漏写的层留在 3D**（= 不改变），漏写不再是损失。
+
+    ## 三个字段都是用户敲进去的，源码里一个层名都没有
+
+    层名是 PDK 叠层的坐标（CLAUDE.md 硬约束 1b）⇒ 没有默认值，`gui.state` 也不许给。
+    它们跟着 `BatchSpec` 走：spec 文件是用户自己的，`session.local.json` 不进 git。
+
+    ⚠️ **空的 `LayerModel` 必须等于"这个功能没开"** —— 老 spec / 老 session 读回来
+    就是这个样子，而它们的行为必须与加这个字段之前**逐字相同**。
+    """
+
+    stack: tuple[str, ...] = ()
+    """这个 PDK 的**全部**金属层名，从下到上。填一次，换 PDK 才动。"""
+    simplify: tuple[str, ...] = ()
+    """其中想降成 2D 的那几层。必须是 `stack` 的子集 —— 不是的话说明有一边写错了，
+    而"错的那个层名"在命令行里是看不出来的（eWave 不认识的层名它不报错，就是不生效）。"""
+    thin_max_factor: str = ""
+    """`--thinMaxfactor` 的取值（nm）。空 = 不给这个 flag。
+
+    默认 200nm 的含义是"薄于此的金属自动把 `--maxFactor` 压到 2"，于是薄金属层的网格
+    会暴涨；给一个很小的值（红区 2026-08-28 实测用的是 1）等于宣布"没有层算薄"，
+    `--maxFactor` 留在 8。它是**全局**的，不逐层，所以放在这儿而不是跟着层清单走。
+    """
+
+    def is_empty(self) -> bool:
+        """三个字段全空 = 这个功能没开。`spec` 靠它决定要不要把这一块写进文件。"""
+        return not (self.stack or self.simplify or self.thin_max_factor)
+
+
+@dataclass
 class BatchSpec:
     """用户手写的 spec 解析之后的样子（YAML 或 JSON，见 `ewave_batch.core.spec`）。
 
@@ -550,6 +637,9 @@ class BatchSpec:
     extra_flags: FlagDict = field(default_factory=dict)
     """逃生口。含 `USER_FORBIDDEN_FLAGS` 里的键 → `FlagConflictError`。"""
     options: BatchOptions = field(default_factory=BatchOptions)
+    layer_model: LayerModel = field(default_factory=LayerModel)
+    """`simplify2d` 轴的批次级配置（整叠金属层 / 想降成 2D 的层 / 薄金属阈值）。
+    **空 = 这个功能没开**，行为与加这个字段之前逐字相同。"""
     source_path: str = ""
     source_sha256: str = ""
 
@@ -1987,6 +2077,8 @@ FROZEN: dict[str, tuple[str, ...]] = {
         "RunGroup",
         "BatchOptions",
         "Provenance",
+        "LayerStack",
+        "LayerModel",
         "BatchSpec",
         "SiteFacts",
         "GdsoutFields",
@@ -2094,6 +2186,7 @@ FROZEN: dict[str, tuple[str, ...]] = {
         "learn_default_flags",
         "find_tool",
         "suggest_official_dirs",
+        "find_layer_stack",
     ),
     "ewave_batch.core.logparse": (
         "strip_ansi",
@@ -2102,6 +2195,7 @@ FROZEN: dict[str, tuple[str, ...]] = {
         "merge_log_facts",
         "parse_run_logs",
         "parse_port_order",
+        "parse_layer_stack",
     ),
     "ewave_batch.core.template": (
         "split_command_line",

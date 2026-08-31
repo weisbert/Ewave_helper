@@ -43,6 +43,7 @@ from ..model import (
     AxisValue,
     BatchOptions,
     BatchSpec,
+    LayerModel,
     BatchState,
     Design,
     FlagConflictError,
@@ -71,7 +72,16 @@ _TOP_KEYS: tuple[str, ...] = (
     "defaults",
     "extra_flags",
     "options",
+    "layer_model",
 )
+
+_LAYER_MODEL_KEYS: tuple[str, ...] = (
+    "stack",
+    "simplify",
+    "thin_max_factor",
+)
+"""`layer_model:` 底下的合法键。三样都是**用户敲的层名/数值**，源码里没有默认值
+（层名是 PDK 坐标，CLAUDE.md 硬约束 1b）。"""
 
 _GROUP_KEYS: tuple[str, ...] = (
     "name",
@@ -176,6 +186,33 @@ axes:
   #   flag: --someFlag              # 每个取值渲染成 --someFlag=<取值>
   #   values: ["1", "2"]
   #   short: mk                     # slug 片段写成 mk-1 / mk-2
+
+# ---------------------------------------------------------------------------
+# layer_model —— 「把哪几层金属降成 2D」。可选，不写 = 这个功能没开。
+#
+#   eWave 的 --3d 是**保持 3D 的白名单**：没列进去的层**静默**退成 2D。
+#   而人想的是反过来的一句话 ——「把这几层降下去省时间」。所以这里只填想降的那几层，
+#   白名单由工具算：  --3d = stack - simplify
+#   于是"漏写一个层"的后果是「那层留在 3D」= 不改变，而不是「那层被无声降级」。
+#
+#   ⇒ 需要 stack:（这个 design 的**全部**金属层，从下到上）。
+#
+#   **界面上不用填它** —— 工具从官方 run 目录的 eWave 日志里读（那里本来就有），
+#   界面画成一排勾选框。手写 spec 时才需要自己列，写法如下。
+#
+#   配套的是 simplify2d 这根轴（写在上面的 axes: 里），取值 = 那几层用多大的
+#   edge mesh（µm），off = 整叠留 3D。一批里同时写 off 和一个数就能做基线/降级对比。
+#
+#   ⚠️ 只有 simplify2d 取了非 off 的值时这一块才会进命令行；
+#      simplify 里的层名必须都在 stack 里 —— eWave 对不认识的层名**不报错**，
+#      就是不生效，于是那层照旧 3D 而目录名说它降了。
+# ---------------------------------------------------------------------------
+# layer_model:
+#   stack:    [LOW1, LOW2, LOW3, LOW4, TOP1, TOP2]   # 整叠金属层，从下到上
+#   simplify: [LOW2, LOW3, LOW4]                     # 其中想降成 2D 的
+#   thin_max_factor: "1"                             # --thinMaxfactor（nm），空 = 不给
+# axes:
+#   simplify2d: [off, "4"]          # 基线 + 那几层用 4µm 的降级版，两个 run 各自一个目录
 
 # ---------------------------------------------------------------------------
 # groups —— run group：base 之上的「单点变体」。可选，不写就只有 base 一组，
@@ -365,6 +402,7 @@ def parse_spec_mapping(data: Mapping[str, object], *, source: str = "") -> Batch
         )
 
     options = _parse_options(data.get("options"), where)
+    layer_model = _parse_layer_model(data.get("layer_model"), where)
 
     return BatchSpec(
         batch_name=_opt_str(data.get("batch_name"), "batch_name", where),
@@ -375,6 +413,7 @@ def parse_spec_mapping(data: Mapping[str, object], *, source: str = "") -> Batch
         defaults=defaults,
         extra_flags=extra_flags,
         options=options,
+        layer_model=layer_model,
         source_path=source,
     )
 
@@ -763,6 +802,9 @@ def spec_to_mapping(spec: BatchSpec) -> dict:
     options = _options_to_mapping(spec.options)
     if options:
         out["options"] = options
+    layer_model = _layer_model_to_mapping(spec.layer_model)
+    if layer_model:
+        out["layer_model"] = layer_model
     return out
 
 
@@ -841,6 +883,65 @@ def _ports_to_spec_value(port_spec: PortSpec | None) -> object:
     if port_spec.signal_ports:
         body["signal"] = list(port_spec.signal_ports)
     return body
+
+
+def _parse_layer_model(raw: object, where: str) -> LayerModel:
+    """`layer_model:` → `LayerModel`。缺这一块 = 功能没开（**老 spec 逐字保持老行为**）。"""
+    if raw is None:
+        return LayerModel()
+    if not isinstance(raw, Mapping):
+        raise SpecError(
+            f"{where}: layer_model must be a mapping with stack: / simplify: / "
+            f"thin_max_factor:, got {_typename(raw)}"
+        )
+    place = f"{where}: layer_model"
+    _reject_unknown_keys(raw, _LAYER_MODEL_KEYS, where=place, what="layer_model field")
+    return LayerModel(
+        stack=_layer_list(raw.get("stack"), "stack", place),
+        simplify=_layer_list(raw.get("simplify"), "simplify", place),
+        thin_max_factor=_opt_str(raw.get("thin_max_factor"), "thin_max_factor", place),
+    )
+
+
+def _layer_list(value: object, field_name: str, where: str) -> tuple[str, ...]:
+    """一串层名。写成 list 或者 `"L2, L3"` 这种一行都认（手写 YAML 两种都常见）。
+
+    ⚠️ 只做**词法**：顺序保留、空项丢掉，"这个层名在不在叠层里"那类判断在
+    `core.matrix.validate_layer_model` —— 那一步要拿到 stack 和 simplify 两边才做得了。
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        items: list[object] = [chunk for chunk in value.replace(",", " ").split()]
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        items = list(value)
+    else:
+        raise SpecError(
+            f"{where}: {field_name} must be a list of layer names (or one comma-separated "
+            f"string), got {_typename(value)}"
+        )
+    out: list[str] = []
+    for item in items:
+        if isinstance(item, (Mapping, list, tuple)):
+            raise SpecError(f"{where}: {field_name} must be plain layer names, got {_typename(item)}")
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return tuple(out)
+
+
+def _layer_model_to_mapping(model: LayerModel) -> dict:
+    """`LayerModel` → 可写回文件的 dict。空的 → `{}`（那一块整个不写）。"""
+    if model.is_empty():
+        return {}
+    out: dict = {}
+    if model.stack:
+        out["stack"] = list(model.stack)
+    if model.simplify:
+        out["simplify"] = list(model.simplify)
+    if model.thin_max_factor:
+        out["thin_max_factor"] = model.thin_max_factor
+    return out
 
 
 def _options_to_mapping(options: BatchOptions) -> dict:

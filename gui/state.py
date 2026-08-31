@@ -49,6 +49,8 @@ from ewave_batch.model import (
     AxisValue,
     BatchOptions,
     BatchSpec,
+    LayerModel,
+    LayerStack,
     BatchState,
     CommandPlan,
     Design,
@@ -110,10 +112,16 @@ GROUP_OVERRIDABLE_AXES: tuple[str, ...] = (
     "corner",
     "temperature",
     "mesh",
+    "simplify2d",
     "fullWave",
     "equalCurrent",
 )
-"""一个 run group **可以**自己定的轴。界面上就是 Settings 里带覆盖勾选框的那五行。
+"""一个 run group **可以**自己定的轴。界面上就是 Settings 里带覆盖勾选框的那几行。
+
+★ `simplify2d` 在里面，但它的**层清单不在** —— 组能自己定"降到多粗"（轴的取值），
+不能自己定"降哪几层"（`LayerModel`，整批一份，同两个 tolerance 那条理由）。
+一个组自己换一套层清单意味着两个组的 `--3d` 不同却共用同一套目录命名口径，
+而"哪几层是 2D"根本不进 slug —— 那就是让目录名说不出真相。
 
 ⚠️ 三根轴故意不在这里，**它们只属于 base**（口径与 `gui/_ui.py` 的 `GROUP_ROW_AXES`
 逐字一致，`tests/test_gui_groups.py` 拿一条测试钉住这一点，防止两处漂）：
@@ -164,6 +172,7 @@ DEFAULT_AXIS_SELECTION: dict[str, tuple[str, ...]] = {
     "fullWave": ("off", "on"),
     "equalCurrent": ("off",),
     "mesh": ("0.5",),
+    "simplify2d": (matrix_module.SIMPLIFY2D_OFF,),
     "relativeTolerance": ("1e-05",),
     "relativeCurrentTolerance": ("0.001",),
 }
@@ -194,7 +203,21 @@ SWEEP_AXIS_FLAGS: tuple[str, ...] = ("--multiSweep", "--logarithmicSweep", "--di
 （`False` = 显式缺席，见 `docs/INTERFACES.md` 契约 1。）"""
 
 MESH_FLAGS: tuple[str, ...] = ("-e", "-d", "--viaMergeSpace")
-"""网格密度轴掌管的三个 flag（BRIEF §10：**唯一改 mesh 的轴**）。"""
+"""网格密度轴掌管的三个 flag（BRIEF §10：**唯一改 mesh 的轴**）。
+
+⚠️ 三个都是**短名**。`simplify2d` 轴写的是长名 `--edgeDist`（逐层），两者在 eWave
+是同一个选项的两种写法，命令行上"全局 + 逐层"同时出现是文档化的用法。
+**别把这里改成长名** —— 一改就撞键，见 `core.matrix.SIMPLIFY2D_FLAGS`。"""
+
+DEFAULT_THIN_MAX_FACTOR = "1"
+"""`--thinMaxfactor` 那一格的初值（nm）。**eWave 的工具语义，不是站点身份。**
+
+eWave 的默认是 200nm，含义是"薄于此的金属自动把 --maxFactor 压到 2"，于是薄金属层的
+网格暴涨 —— 那正是交指电容那种场景慢下来的原因。给一个很小的值等于宣布"没有层算薄"。
+`1` 是红区 2026-08-28 实测那一版用的取值（total 元素数降到 880,652）。
+
+⚠️ 它**只在 simplify2d 取了非 off 的值时**才会进命令行（`matrix.simplify2d_flags_for`）——
+所以这个初值不改变任何老批次的行为。清空它 = 不给这个 flag。"""
 
 _NL = chr(10)
 
@@ -611,6 +634,20 @@ def mesh_flags_for(value: str) -> FlagDict:
     return dict(zip(MESH_FLAGS, parts))
 
 
+def parse_layer_list(text: str) -> tuple[str, ...]:
+    """`"L2, L3 L4"` → `("L2", "L3", "L4")`。逗号和空白都当分隔符，**顺序保留**。
+
+    与 `parse_value_list` 同款口径，单独一个函数是因为返回 tuple ——
+    `LayerModel` 的字段是 tuple，而层清单会被原样存进 spec 再读回来。
+    """
+    return tuple(parse_value_list(text))
+
+
+def render_layer_list(names: Sequence[str]) -> str:
+    """`("L2", "L3")` → `"L2,L3"`。灌回输入框用（`_apply_spec` 那条路）。"""
+    return ",".join(str(name) for name in names)
+
+
 # --------------------------------------------------------------------------
 # 轴的构造 —— GUI 勾选 → model.Axis
 # --------------------------------------------------------------------------
@@ -772,6 +809,19 @@ class GuiState:
         """界面正在编辑哪个组。`set_axis_values()` / `axis_selection()` 作用于它 ——
         active = base 时这两个方法与加组之前**逐字相同**。"""
         self._sweep: dict[str, str] = dict(DEFAULT_SWEEP)
+        self._design_axis_errors: dict[str, str] = {}
+        """`design_key` → 这个 design 的轴为什么造不出来。由 `_build_contexts` 填，
+        `plan()` 转成它每个 run 的 plan error。见 `_axes_for_design`。"""
+        self._layer_stacks: dict[str, LayerStack] = {}
+        """官方 run 目录 → 从它的 eWave 日志里读到的层清单。**按目录缓存**：
+        界面每敲一个键就 `recompute()` 一次，不缓存就是每个键一次磁盘解析（同 `_facts`）。"""
+        self._layer_model = LayerModel(thin_max_factor=DEFAULT_THIN_MAX_FACTOR)
+        """`simplify2d` 轴的层清单（整批一份，不按组分）。
+
+        **两个清单一开始都是空的** —— 层名是 PDK 坐标，源码里一个字都不许有
+        （CLAUDE.md 硬约束 1b）。空清单 + 默认只勾了 `off` ⇒ 这根轴对命令行毫无贡献，
+        与加它之前逐字相同。`thin_max_factor` 有初值是安全的：它同样只在选了非 off
+        的取值时才进命令行。"""
         self._extra_text = ""
         self._default_overrides: FlagDict = {}
         self._options = BatchOptions()
@@ -876,6 +926,11 @@ class GuiState:
                 if name in self._selection:
                     self._selection[name] = tuple(str(v) for v in values)
         self._sweep = self._sweep_from_axes(spec.axes)
+        # ★ 层清单**必须**跟着 spec 走，而且要在 `_selection` 之后 —— 灌回来的勾选里
+        #   可能有一个非 off 的取值，那个取值只有配上层清单才造得出轴来。
+        #   老 spec / 老 session 没有这一块 ⇒ 空的 `LayerModel` = 功能没开，
+        #   而那时 `_selection` 里也只会有 off，两边一致。
+        self._layer_model = spec.layer_model
         self._extra_text = " ".join(_render_flag_token(k, v) for k, v in spec.extra_flags.items())
         self._default_overrides = dict(spec.defaults)
         self._options = spec.options
@@ -960,6 +1015,13 @@ class GuiState:
                 continue
             paths = layout_module.compute_run_paths(state.batch_dir, design, run)
             run.work_dir = paths.run_dir
+            axis_error = self._design_axis_errors.get(run.design_key)
+            if axis_error:
+                # 这个 design 的 simplify2d 轴造不出来 ⇒ 它的每个 run 都拼不出命令。
+                # 摆在**按 run 显示**的那条通道上（`Selected run -> Command`），
+                # 与"官方目录解析不了"同一个位置、同一种看法。
+                self._plan_errors[run.run_id] = axis_error
+                continue
             try:
                 self._plans[run.run_id] = ewave_tool.build_ewave_plan(
                     run, contexts[run.design_key]
@@ -984,9 +1046,11 @@ class GuiState:
         """
         contexts: dict[str, PlanContext] = {}
         frozen = dict(state.defaults)
+        self._design_axis_errors = {}
         for design in state.designs:
             key = matrix_module.design_key(design)
             facts = self._facts_for(design)
+            axes = self._axes_for_design(design, state.axes) if learn else tuple(state.axes)
             if learn:
                 defaults = dict(discover_module.learn_default_flags(facts))
                 if not self._learned:
@@ -1000,13 +1064,50 @@ class GuiState:
             contexts[key] = PlanContext(
                 design=design,
                 facts=facts,
-                axes=tuple(state.axes),
+                axes=axes,
                 defaults=defaults,
                 extra_flags=dict(state.extra_flags),
                 options=state.options,
                 batch_dir=state.batch_dir,
             )
         return contexts
+
+    def _axes_for_design(self, design: Design, axes: Sequence[Axis]) -> tuple[Axis, ...]:
+        """把批次的轴换成**这个 design 的**：只有 `simplify2d` 那一根会变。
+
+        `PlanContext` 本来就是 per-design 的，而 `cmd.resolve_axis_flags` 查的正是
+        `ctx.axes` —— 所以"同名同取值、flag 不同"这件事架构上原生支持，
+        不需要新占位符，也**不影响 slug**（slug 只看取值，仍是 `off` / `4`）。
+
+        造不出来（这个 design 的层清单撑不起选中的取值）→ 记进 `_design_axis_errors`，
+        由 `plan()` 转成**这个 design 每个 run 的** plan error。走这条通道是有意的：
+        `plan()` 的承诺是"某个 design 拼不出命令，界面照常显示矩阵"，
+        在这里抛异常会把整块预览打掉，而那比看不见错误更糟。
+
+        ⚠️ 只在 `learn=True`（预览/plan）时调。打开**历史批次**时轴必须用批次自己冻着的
+        那份 —— 拿今天的日志重算就是"resume 之后 --3d 悄悄换了"。
+        """
+        values = [
+            av.value
+            for axis in axes
+            if axis.name == matrix_module.AXIS_SIMPLIFY2D
+            for av in axis.values
+        ]
+        if not values or all(v == matrix_module.SIMPLIFY2D_OFF for v in values):
+            # 这根轴不在、或者整批都是 off ⇒ 它对命令行没有贡献，不用按 design 重算。
+            return tuple(axes)
+        try:
+            rebuilt = matrix_module.simplify2d_axis(
+                self.effective_layer_model_for(design), values
+            )
+        except EwaveBatchError as exc:
+            self._design_axis_errors[matrix_module.design_key(design)] = (
+                "%s: %s" % (exc.__class__.__name__, exc)
+            )
+            return tuple(axes)
+        return tuple(
+            rebuilt if axis.name == matrix_module.AXIS_SIMPLIFY2D else axis for axis in axes
+        )
 
     # ==================================================== 结果侧：历史与「在看哪一批」
     # ★ 本段**只读磁盘**或只动 `_viewed`，一个设定都不碰。
@@ -1551,7 +1652,19 @@ class GuiState:
             return
         self.official_run_dir = cleaned
         self._facts.clear()
+        # 层清单是 per-design 的（不同 cell 用到的层不一样）⇒ 换了目录必须重读。
+        # 留着旧的就是拿另一个 design 的层去算这个 design 的 --3d，可能少一层 ⇒ 静默 2D。
+        self._layer_stacks.clear()
         self._learned = {}
+        # ★ 存下来的那份叠层也要跟着丢 —— 否则它会**越堆越多**（2026-08-31 实测）：
+        #   `available_layers()` 是"读到的 ∪ 已知的"、只增不减，而"已知的"来自上一次
+        #   存盘。换个 design 之后旧层名照样出现在勾选框里、也照样进 `--3d`，
+        #   而"eWave 会忽略不认识的层名"这条我们**没有证据**。
+        #   条件是"新目录真读到了层"：读不到就留着旧的，那时它是唯一的来源
+        #   （方向与 `available_layers()` 的"只增不减"一致 —— 宁可多，不可无）。
+        if cleaned and self._layer_model.stack:
+            if discover_module.find_layer_stack(cleaned).conductors:
+                self._layer_model = replace(self._layer_model, stack=())
         self._invalidate()
 
     def set_designs(self, rows: Sequence[Sequence[str]]) -> None:
@@ -1926,6 +2039,212 @@ class GuiState:
         dead = "points" if spacing == "step" else "step"
         return tuple(name for name in fields if name != dead)
 
+    def layer_stack(self) -> LayerStack:
+        """**界面提示用**的那一份：批次级那一格（或第一个写了自己那份的 design）的层清单。
+
+        ⚠️ 拼命令**不走这一条** —— 那要 per-design（见 `layer_stack_for`）。
+        这里只服务 Advanced 里那行"从哪读的、有几层"的文字。
+        """
+        return self._layer_stack_at(self._layer_source_dir())
+
+    def layer_stack_for(self, design: Design) -> LayerStack:
+        """**这个 design 自己**的层清单。口径与 `_facts_for` 逐字相同（design 自己的目录优先）。
+
+        🚨 两者必须同源。不同源的后果是"命令行按 A 目录拼、层清单按 B 目录读" ——
+        2026-08-31 实测过：批次里第二个 design 多一层时，那层不在 `--3d` 里
+        ⇒ **被静默降成 2D**，正是这整个功能要消灭的东西，只是重造在了多 design 这一层。
+        """
+        return self._layer_stack_at(design.official_run_dir or self.official_run_dir)
+
+    def _layer_stack_at(self, offdir: str) -> LayerStack:
+        """某个官方目录的层清单，**按目录缓存**（界面每敲一个键就 recompute 一次）。"""
+        cleaned = str(offdir).strip()
+        if not cleaned:
+            return LayerStack(
+                note=(
+                    "no official run dir yet - point at one and the metal layers are read "
+                    "from its eWave log, so you never type them"
+                )
+            )
+        cached = self._layer_stacks.get(cleaned)
+        if cached is None:
+            cached = discover_module.find_layer_stack(cleaned)
+            self._layer_stacks[cleaned] = cached
+        return cached
+
+    def _layer_source_dir(self) -> str:
+        """从哪个目录读层清单：批次级那一格优先，否则第一个写了自己那份的 design。
+
+        与 `_facts_for` 的取法同源 —— 两者读的是**同一个**官方目录，
+        分歧会让"命令行是按 A 目录拼的、层清单是按 B 目录读的"，而那一眼看不出来。
+        """
+        if self.official_run_dir:
+            return self.official_run_dir
+        return next((d.official_run_dir for d in self._designs if d.official_run_dir), "")
+
+    def available_layers(self) -> tuple[str, ...]:
+        """界面上那排勾选框显示哪些层 = **每个 design 各自读到的 ∪ 已知的**。
+
+        取全部 design 的并集（而不是某一个的）是因为这一排是**批次级的选择面**：
+        批次里任何一个 design 有的层，都该能勾。真正下发时再按 design 收窄
+        （`effective_layer_model_for`）—— 选择面和下发面**故意不是同一个东西**。
+
+        "已知的"（`_layer_model.stack`）是上一次存盘 / 手工补的那部分，排在后面：
+
+        * 这台机器上官方目录还没填 —— 它此刻是唯一的来源；
+        * 用户在 Advanced 里补过一层（日志没列到的）。
+
+        **只增不减**是有意的：`--3d` 少一层 = 那层静默退 2D（这整个功能要消灭的东西），
+        多一层最多是命令行长一点。⚠️ 但"不减"只在**同一个官方目录**内成立 ——
+        换目录时 `set_official_run_dir` 会把存下来的那份丢掉，否则旧 design 的层名
+        会一直堆着（2026-08-31 实测）。
+        """
+        out: list[str] = []
+        for design in self._designs:
+            for name in self.layer_stack_for(design).conductors:
+                if name not in out:
+                    out.append(name)
+        if not self._designs:
+            for name in self.layer_stack().conductors:
+                if name not in out:
+                    out.append(name)
+        for name in self._layer_model.stack:
+            if name not in out:
+                out.append(name)
+        return tuple(out)
+
+    def layer_shares(self) -> dict[str, str]:
+        """层名 → 它占了多少网格元素（`"20%"`）。**这是"该降哪几层"的决策依据。**
+
+        读不到就是空 dict —— 界面照样画勾选框，只是不显示占比。
+        """
+        return dict(self.layer_stack().shares)
+
+    def effective_layer_model(self) -> LayerModel:
+        """**批次级**那一份：`stack` 用 `available_layers()`（全部 design 的并集）。
+
+        存 spec、算界面预览、以及"只有一个 design"时拼命令都走它。
+        多个 design 时真正下发的是 `effective_layer_model_for(design)`。
+        """
+        return replace(self._layer_model, stack=self.available_layers())
+
+    def effective_layer_model_for(self, design: Design) -> LayerModel:
+        """**这个 design** 下发时用的那份：`stack` 收窄到它自己的层，`simplify` 跟着取交集。
+
+        两件事都必须做：
+
+        * `stack` 换成这个 design 自己的 ⇒ `--3d` 是**它的**补集。用批次并集的话，
+          并集里那些它没有的层会被写进 `--3d`，而"eWave 会忽略不认识的层名"我们没有证据；
+          更糟的是反方向：并集少了它独有的一层，那层就被静默降成 2D。
+        * `simplify` 取交集 ⇒ 勾了一个这个 design 没有的层不是错误（多 design 批次里
+          很自然），它对这个 design 就是不生效。
+
+        读不到这个 design 自己的层（它的目录没跑过 / 日志被清过）⇒ **退回批次级那一份**，
+        也就是加这个方法之前的行为。那时我们对它一无所知，用已知的最大集合比用空集好。
+        """
+        stack = self.layer_stack_for(design).conductors or self.available_layers()
+        keep = tuple(name for name in self._layer_model.simplify if name in stack)
+        return replace(self._layer_model, stack=stack, simplify=keep)
+
+    def layer_model(self) -> LayerModel:
+        """`simplify2d` 轴的层清单（整批一份）。界面拿它回填那三个输入框。"""
+        return self._layer_model
+
+    def set_simplify_layers(self, names: Sequence[str]) -> None:
+        """界面上勾了哪几层降 2D。**顺序按 `available_layers()` 归一**，不按点击顺序 ——
+        命令行因此与用户点的先后无关，两次跑的 `cmd.sh` 可以逐字比。
+
+        勾了一个 `available_layers()` 里没有的名字（手填过又被删掉）会原样留着，
+        由 `core.matrix.validate_layer_model` 去报"它不在叠层里"—— 那条消息比这里能说的具体。
+        """
+        wanted = [str(name).strip() for name in names if str(name).strip()]
+        known = self.available_layers()
+        ordered = [name for name in known if name in wanted]
+        ordered += [name for name in wanted if name not in known]
+        self._layer_model = replace(self._layer_model, simplify=tuple(ordered))
+        self._invalidate()
+
+    def set_layer_model(self, stack: str = "", simplify: str = "", thin: str = "") -> None:
+        """整叠金属层 / 想降成 2D 的层 / 薄金属阈值 ← 界面的三个输入框（都是文本）。
+
+        **只做词法**（拆分、去空白、保序）。"这个层名在不在叠层里""降完还剩不剩 3D 层"
+        那类判断在 `core.matrix.validate_layer_model` —— 那一步要等到真去造轴时才做得了，
+        而且它的错误消息要能直接显示给用户看（同 `mesh_flags_for` 那条路）。
+
+        ⚠️ 整批一份，**不按组分**：组能自己定"降到多粗"，不能自己定"降哪几层"
+        （理由见 `GROUP_OVERRIDABLE_AXES`）。所以这个方法不看 `_active_group`。
+        """
+        self._layer_model = LayerModel(
+            stack=parse_layer_list(stack),
+            simplify=parse_layer_list(simplify),
+            thin_max_factor=str(thin).strip(),
+        )
+        self._invalidate()
+
+    def layer_model_text(self) -> tuple[str, str, str]:
+        """`layer_model()` 的界面形态：`(extra_layers, simplify, thin)` 三个字符串。
+
+        ⚠️ 第一格是 **extra layers**（日志里没有、用户自己补的），不是整份叠层 ——
+        整份叠层由 `available_layers()` 给，界面上是一行只读文字 + 一排勾选框。
+        """
+        return (
+            self.extra_layers_text(),
+            render_layer_list(self._layer_model.simplify),
+            self._layer_model.thin_max_factor,
+        )
+
+    def extra_layers_text(self) -> str:
+        """已知的层里**日志没给出**的那些 —— Advanced 里那一格的内容。
+
+        正常情况下它是空的（层全从日志读到了）。非空只有两种来路：
+
+        * 这台机器上官方目录还没填 / 那个目录没跑过 ⇒ 上次存盘的整份清单落在这里，
+          它此刻就是唯一的来源，**必须留着**；
+        * 用户手工补过一层（日志没列到的）。
+
+        减掉已读到的那部分是为了不让这一格变成"整份清单的第二个副本" ——
+        两个副本必然漂，而漂的方向是 `--3d` 少一层 = 那层静默退 2D。
+        """
+        discovered = set(self.layer_stack().conductors)
+        return render_layer_list([n for n in self._layer_model.stack if n not in discovered])
+
+    def layer_source_text(self) -> str:
+        """Advanced 里那行只读文字：整份叠层从哪读的、有几层。读不到就是那句人话 `note`。"""
+        stack = self.layer_stack()
+        if stack.is_empty():
+            return stack.note
+        where = os.path.basename(stack.source) or stack.source
+        return "%d metal layers + %d vias, read from %s" % (
+            len(stack.conductors),
+            len(stack.vias),
+            where,
+        )
+
+    def simplify2d_preview(self) -> str:
+        """当前设定下，一个"降 2D"的取值会往命令行上加什么。**界面上直接显示它。**
+
+        为什么值得单独有一个方法：`--3d` 是工具**算出来的补集**，而用户只填了想降的那几层。
+        算错了（叠层漏了一层、层名拼错了）在命令行上是看不出来的 —— eWave 不认识的层名
+        它不报错，就是不生效。所以把算出来的那一串摆到界面上，让人能一眼核对。
+
+        算不出来（清单不全 / 冲突）→ 返回那条 `SpecError` 的第一行，界面标红。
+        全是 off ⇒ 返回空串（这根轴此刻什么都不加，没什么可预览的）。
+        """
+        values = [
+            value
+            for value in self._selection.get(matrix_module.AXIS_SIMPLIFY2D, ())
+            if value != matrix_module.SIMPLIFY2D_OFF
+        ]
+        if not values:
+            return ""
+        try:
+            flags = matrix_module.simplify2d_flags_for(self.effective_layer_model(), values[0])
+        except EwaveBatchError as exc:
+            return str(exc).splitlines()[0]
+        return " ".join(
+            _render_flag_token(name, value) for name, value in flags.items() if value is not False
+        )
+
     def extra_flags_text(self) -> str:
         return self._extra_text
 
@@ -2138,6 +2457,15 @@ class GuiState:
                 ("fullWave", "mode"),
             ):
                 parts.append(f"{len(selection.get(name, ()))} {label}")
+            # ★ mesh 和 simplify2d **只在真的在扫**（取值多于一个）时才写进来。
+            #   不写的话这一行会算错：`1 corner x 3 temp x 2 mode = 12` —— 左边连乘是 6，
+            #   而右边那个 12 是真的（simplify2d 扫了两个值）。等号两边对不上就是界面在说谎，
+            #   而这恰恰是 simplify2d 最常见的用法（基线 + 一个降级变体）。
+            #   默认两根轴都只有一个取值 ⇒ 常态下这一行与从前逐字相同。
+            for name, label in (("mesh", "mesh"), (matrix_module.AXIS_SIMPLIFY2D, "2d")):
+                count = len(selection.get(name, ()))
+                if count > 1:
+                    parts.append(f"{count} {label}")
             return " x ".join(parts) + tail
         designs = len(self._designs)
         # 每组的 run 数都能被 design 数整除时才把 design 提到括号外 - 提不出来
@@ -2761,6 +3089,11 @@ class GuiState:
         """轴名 + 取值 -> `Axis`，走**界面自己的**构造器（flag 由它们算，只有一份实现）。"""
         if name == "mesh":
             return mesh_axis(values)
+        if name == matrix_module.AXIS_SIMPLIFY2D:
+            # 内置目录里那根只有 `off` —— 别的取值要层清单才造得出来（层名是 PDK 坐标，
+            # 源码里一个字都不许有）。不走这一条分支的话，一个组想覆盖成 "4"
+            # 会被 `axis_from_catalog` 判成"这根轴不认识这个取值"而拒掉。
+            return matrix_module.simplify2d_axis(self.effective_layer_model(), values)
         if name == "freq":
             return sweep_axis(self._sweep.get("mode", "adaptive"), values)
         return axis_from_catalog(name, values)
@@ -2817,6 +3150,14 @@ class GuiState:
         mesh_values = self._selection.get("mesh", ())
         if mesh_values:
             axes.append(mesh_axis(mesh_values))
+        # simplify2d 紧跟在 mesh 后面：它写的是**逐层的** --edgeDist，而 mesh 写的是
+        # 全局的 -e —— 命令行上"先全局、后逐层"正是 eWave 手册里那个例子的顺序
+        # （--edgeDist=2 --edgeDist=M1,0.8），也是红区 2026-08-28 跑通的那条的形状。
+        simplify_values = self._selection.get(matrix_module.AXIS_SIMPLIFY2D, ())
+        if simplify_values:
+            axes.append(
+                matrix_module.simplify2d_axis(self.effective_layer_model(), simplify_values)
+            )
         for name in ("fullWave", "equalCurrent", "relativeTolerance", "relativeCurrentTolerance"):
             values = self._selection.get(name, ())
             if values:
@@ -2840,6 +3181,9 @@ class GuiState:
             defaults=dict(self._default_overrides),
             extra_flags=parse_extra_flags(self._extra_text),
             options=self._options,
+            # 存**并集**而不是手填的那份：下次在一台没有官方目录的机器上打开，
+            # 层清单照样在（"下次启动不用再 load"这句话对这一格也要成立）。
+            layer_model=self.effective_layer_model(),
             source_path=self._spec.source_path if self._spec is not None else "",
             source_sha256=self._spec.source_sha256 if self._spec is not None else "",
         )

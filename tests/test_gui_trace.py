@@ -45,7 +45,14 @@ from gui.trace import ActionTrace
 
 BASE = gui_state.BASE_GROUP
 
-GROUP_OVERRIDABLE_EXPECTED = ("corner", "temperature", "mesh", "fullWave", "equalCurrent")
+GROUP_OVERRIDABLE_EXPECTED = (
+    "corner",
+    "temperature",
+    "mesh",
+    "simplify2d",
+    "fullWave",
+    "equalCurrent",
+)
 """**手写**的期望值，出处见模块 docstring。改这一行之前先改 `GROUP_ROW_AXES` 的理由。"""
 
 

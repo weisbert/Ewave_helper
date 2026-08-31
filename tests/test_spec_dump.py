@@ -80,6 +80,14 @@ def _demo_spec() -> model.BatchSpec:
         defaults={"--viaMode": "1"},
         extra_flags={"--surface": True, "--someOff": False},
         options=model.BatchOptions(max_parallel=8),
+        # 层清单：`simplify2d` 轴的批次级配置。层名是**合成的**（真层名是 PDK 坐标，
+        # 硬约束 1b），这里只要它非空 —— 空的 `LayerModel` 整块不写进文件，
+        # 那样这条字段覆盖测试就抓不到"忘了序列化"。
+        layer_model=model.LayerModel(
+            stack=("LOW1", "LOW2", "LOW3", "TOP1"),
+            simplify=("LOW2", "LOW3"),
+            thin_max_factor="1",
+        ),
     )
 
 

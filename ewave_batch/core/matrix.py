@@ -31,6 +31,8 @@ from ..model import (
     AxisValue,
     BatchOptions,
     Design,
+    FlagDict,
+    LayerModel,
     Run,
     RunExpansion,
     RunGroup,
@@ -47,12 +49,41 @@ AXIS_CORNER = "corner"
 AXIS_TEMPERATURE = "temperature"
 """temperature 轴的规范轴名。"""
 
+AXIS_SIMPLIFY2D = "simplify2d"
+"""「把哪几层降成 2D」这根轴的规范轴名。取值 = 那些层用多大的 edge mesh（µm），
+`SIMPLIFY2D_OFF` = 整叠都留 3D。层清单本身不在轴上，在 `model.LayerModel`。"""
+
+SIMPLIFY2D_OFF = "off"
+"""`simplify2d` 轴的「不降级」取值。三个 flag 全给 `False`（显式缺席）⇒
+这一格的命令行与没有这根轴时**逐字相同**，基线才是真基线。"""
+
+SIMPLIFY2D_FLAGS: tuple[str, ...] = ("--3d", "--edgeDist", "--thinMaxfactor")
+"""这根轴掌管的三个 flag。
+
+⚠️ **`--edgeDist` 是长名，mesh 轴掌管的是短名 `-e`** —— eWave 手册里它们是同一个选项
+（`--edgeDist=value, -e value`），而这里**故意**让两根轴各写一种形式：
+
+    -e 0.5  …  --edgeDist='<层>,4 <层>,4 …'
+
+短名给全局、长名给逐层，这正是手册文档化的用法
+（`--edgeDist=2 --edgeDist=M1,0.8` = 「M1 用 0.8，其余用全局 2」），
+也是红区 2026-08-28 那次实测跑通的那条命令的形状。
+
+🚨 因此 **mesh 轴绝不许改成写长名 `--edgeDist`**：一改，两根轴在同一个 `FlagDict`
+里撞同一个键，后合并的那个把前一个整个吃掉 —— 要么全局网格丢了，要么逐层覆盖丢了，
+而两种都是"目录名说一套、命令行做另一套"。`tests/test_matrix.py` 有一条测试钉住这件事。
+"""
+
 EWAVE_DIR_AXES: tuple[str, ...] = (AXIS_CORNER, AXIS_TEMPERATURE)
 """**只有这两根轴**允许 `encoded_in_ewave_dir=True` —— 它们是 eWave 自己写进目录名的那两个。
 
 别的轴要是也标了 True，它既不进 `<axes-slug>`、又不进 eWave 那层目录名 ⇒ 两个 run 落同一个
 目录、**静默覆盖**。那正是本工具存在的理由，所以 `expand_runs` 直接拒绝这种轴定义。
 """
+
+_NL = chr(10)
+"""换行符。多行错误文案用它拼 —— 源码里不写字面 
+，这个文件被红区闸门逐字扫过（同 gui.state 的同名常量）。"""
 
 _SLUG_KEEP_EXTRA = "._-"
 """`slugify` 保留的非字母数字字符（其中 `.` 随后会被换成 `_`）。"""
@@ -300,6 +331,168 @@ def axis_with_values(axis: Axis, values: Sequence[str]) -> Axis:
     return replace(axis, values=tuple(materialized))
 
 
+def simplify2d_off_flags() -> FlagDict:
+    """`simplify2d` 轴「不降级」那一格贡献的 flag：三个全 `False`（显式缺席）。
+
+    为什么是 `False` 而不是"什么都不写"：学来的默认表里万一有 `--thinMaxfactor`
+    （某个站点的官方脚本给过），"什么都不写"是盖不掉它的 —— 于是基线那一格会带着
+    一个来路不明的值，而目录名说它是基线。`False` 才是"这个 flag 必须不出现"。
+    （同 `--equalCurrent` 的 off，见 `docs/INTERFACES.md` 契约 1。）
+    """
+    return {flag: False for flag in SIMPLIFY2D_FLAGS}
+
+
+LAYER_NAME_BAD_CHARS = " \t,*"
+"""层名里一律不许出现的字符。
+
+`,` 和空格是 `--3d` / `--edgeDist` 自己的分隔符；`*` 是 eWave 的通配符，而手册明说
+**不能同时给通配和具体层名**（`--3d` 条目："It is not possible to set all metal layers
+and specified metal layers for 3D or 2D simulation simultaneously"）。混进去的后果
+不是报错，是这条 flag 整个失效或只生效一半 —— 而 run 照样跑得完、数字还挺像。
+"""
+
+
+def _clean_layers(names: Sequence[str], where: str) -> tuple[str, ...]:
+    """层名清单的词法检查。返回去掉空白之后的元组；有问题就 `SpecError`。"""
+    out: list[str] = []
+    for raw in names:
+        name = str(raw).strip()
+        if not name:
+            continue
+        bad = [ch for ch in LAYER_NAME_BAD_CHARS if ch in name]
+        if bad:
+            raise SpecError(
+                f"{where}: layer name {name!r} contains {' '.join(repr(c) for c in bad)} - "
+                "those are eWave's own separators / wildcards, a layer name cannot carry them."
+                f"{_NL}  Next: write one layer per list entry, and no '*'"
+            )
+        if name in out:
+            raise SpecError(f"{where}: layer {name!r} is listed twice")
+        out.append(name)
+    return tuple(out)
+
+
+def validate_layer_model(
+    model: LayerModel, *, value_hint: str = ""
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """检查 `LayerModel` 够不够造出一个「降 2D」的取值。返回清理过的 `(stack, simplify)`。
+
+    **拒绝而不是猜** —— 每一条不拦的代价都是"跑得完、数字也像"那一类：
+
+    | 情况 | 不拦的后果 |
+    |---|---|
+    | `stack` 空 | 算不出白名单；给个空的 `--3d=` 等于宣布"一层 3D 都没有" |
+    | `simplify` 空 | 这个取值其实什么都没降，却顶着一个"降了"的目录名 |
+    | `simplify` 不是 `stack` 的子集 | 写错的层名 eWave 不认识也**不报错**，那层就是没降 |
+    | `stack` 全在 `simplify` 里 | 整叠都 2D。真要那样就写 `--3d=-*`，别拿"列全了"来表达 |
+    """
+    where = f"simplify2d={value_hint!r}" if value_hint else "simplify2d"
+    stack = _clean_layers(model.stack, f"{where}: metal stack")
+    simplify = _clean_layers(model.simplify, f"{where}: layers to simplify")
+    if not stack:
+        raise SpecError(
+            f"{where}: the metal stack is empty."
+            f"{_NL}  eWave's --3d is a *keep-3D* whitelist, so the tool needs the whole stack "
+            "before it can work out which layers stay 3D."
+            f"{_NL}  Next: list every metal layer of this PDK once (bottom to top)"
+        )
+    if not simplify:
+        raise SpecError(
+            f"{where}: no layer is marked for 2D, yet this value asks for 2D simplification."
+            f"{_NL}  Next: name the layers to simplify, or use the {SIMPLIFY2D_OFF!r} value"
+        )
+    unknown = [layer for layer in simplify if layer not in stack]
+    if unknown:
+        raise SpecError(
+            f"{where}: {', '.join(repr(name) for name in unknown)} is not in the metal stack."
+            f"{_NL}  A layer name eWave does not recognise is not an error for eWave - it is "
+            "simply ignored, so that layer would silently stay 3D."
+            f"{_NL}  Next: fix the spelling, or add it to the metal stack"
+        )
+    if all(layer in simplify for layer in stack):
+        raise SpecError(
+            f"{where}: every layer of the stack is marked for 2D, so nothing would stay 3D."
+            f"{_NL}  Next: keep the inductor layers 3D, or drop this value"
+        )
+    return stack, simplify
+
+
+def simplify2d_flags_for(model: LayerModel, value: str) -> FlagDict:
+    """`simplify2d` 轴取某个值时贡献的三个 flag。
+
+    * `SIMPLIFY2D_OFF` → 三个全 `False`（`simplify2d_off_flags`），命令行与没有这根轴时逐字相同。
+    * 别的取值（一个 µm 数）→
+
+          --3d=<stack 减去 simplify，按 stack 的顺序>
+          --edgeDist=<"层,值" 用空格连起来，同样按 stack 的顺序>
+          --thinMaxfactor=<model.thin_max_factor>   （空 → False）
+
+    ★ **`--3d` 是算出来的补集，不是用户输入** —— 这是整个功能的要点。eWave 的 `--3d`
+    是「保持 3D 的白名单」，没列进去的层**静默**退 2D；而用户想的是「把这几层降下去」。
+    让工具算补集之后，"漏写一个层"的后果从「那层被无声降级」变成「那层留在 3D」= 不改变。
+    用户 2026-08-28 手工数元素数才查出来的那个坑（白名单漏了一层），结构上不再存在。
+
+    ★ 两个清单都按 `stack` 的顺序输出 ⇒ 命令行与用户在框里怎么敲无关，两次跑的
+    `cmd.sh` 可以逐字比。
+    """
+    if str(value).strip() == SIMPLIFY2D_OFF:
+        return simplify2d_off_flags()
+    edge = str(value).strip()
+    stack, simplify = validate_layer_model(model, value_hint=edge)
+    flags: FlagDict = {
+        "--3d": ",".join(layer for layer in stack if layer not in simplify),
+        "--edgeDist": " ".join(f"{layer},{edge}" for layer in stack if layer in simplify),
+    }
+    thin = str(model.thin_max_factor).strip()
+    flags["--thinMaxfactor"] = thin if thin else False
+    return flags
+
+
+def simplify2d_axis(model: LayerModel, values: Sequence[str]) -> Axis:
+    """`LayerModel` + 用户勾的取值 → 一根可用的 `simplify2d` 轴。
+
+    `builtin_axis_catalog()` 里那根**只有 `off` 一个取值** —— 别的取值要层清单才造得出来，
+    而层清单是 PDK 坐标，源码里一个字都不许有（CLAUDE.md 硬约束 1b）。所以真正的轴在
+    这里现造，界面和 spec 走的都是这一条路。
+    """
+    wanted: list[str] = []
+    for raw in values:
+        text = str(raw).strip()
+        if text and text not in wanted:
+            wanted.append(text)
+    if not wanted:
+        raise SpecError(
+            "simplify2d: no value is selected - the cartesian product would collapse to nothing."
+            f"{_NL}  Next: tick {SIMPLIFY2D_OFF!r}, or give an edge mesh size in um"
+        )
+    for text in wanted:
+        if text == SIMPLIFY2D_OFF:
+            continue
+        try:
+            number = float(text)
+        except ValueError:
+            raise SpecError(
+                f"simplify2d: value {text!r} is neither {SIMPLIFY2D_OFF!r} nor a number."
+                f"{_NL}  A value is the edge mesh size (um) used on the simplified layers."
+                f"{_NL}  Next: write e.g. '{SIMPLIFY2D_OFF}, 4'"
+            ) from None
+        if number <= 0:
+            raise SpecError(
+                f"simplify2d: value {text!r} must be positive - it is a mesh size in um"
+            )
+    return Axis(
+        name=AXIS_SIMPLIFY2D,
+        values=tuple(AxisValue(text, flags=simplify2d_flags_for(model, text)) for text in wanted),
+        kind=AxisKind.GROUP,
+        flags=SIMPLIFY2D_FLAGS,
+        short="2d",
+        description=(
+            "Simplify the listed metal layers to 2D; the value is their edge mesh size in um "
+            f"({SIMPLIFY2D_OFF} = everything stays 3D). --3d is computed as stack minus them"
+        ),
+    )
+
+
 def builtin_axis_catalog() -> dict[str, Axis]:
     """内置轴目录：轴名 → `Axis`（取值列表为**该轴的合法取值样例**，实际取值由 spec 给）。
 
@@ -455,6 +648,18 @@ def builtin_axis_catalog() -> dict[str, Axis]:
             description=(
                 "求解器线程数。⚠️ 与 dsub -R 的 cpu= 耦合（BRIEF §6，当前倍率 1:1）——"
                 "真正的同步在 core.cmd.parse_resource_string + BatchOptions.parallel_multiplier"
+            ),
+        ),
+        AXIS_SIMPLIFY2D: Axis(
+            name=AXIS_SIMPLIFY2D,
+            values=(AxisValue(SIMPLIFY2D_OFF, flags=dict(simplify2d_off_flags())),),
+            kind=AxisKind.GROUP,
+            flags=SIMPLIFY2D_FLAGS,
+            short="2d",
+            description=(
+                "把 LayerModel.simplify 那几层降成 2D，取值 = 它们用多大的 edge mesh（µm）；"
+                "off = 整叠留 3D。⚠️ 目录里**只有 off 这一个取值** —— 别的取值要层清单才造得出来，"
+                "而层清单是 PDK 坐标、源码里一个字都不许有（硬约束 1b），由 gui.state.simplify2d_axis 现造"
             ),
         ),
     }

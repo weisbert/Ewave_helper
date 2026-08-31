@@ -54,7 +54,7 @@ import os
 import re
 from collections.abc import Sequence
 
-from ..model import LogFacts
+from ..model import LayerStack, LogFacts
 from .layout import port_count_from_suffix
 
 __all__ = [
@@ -77,6 +77,9 @@ __all__ = [
     "collect_log_files",
     "read_log_tail",
     "parse_port_order",
+    "parse_layer_stack",
+    "LAYER_BASIS_HEADER",
+    "LAYER_VIA_MARKER",
     "TAIL_BYTES",
 ]
 
@@ -900,6 +903,118 @@ _RE_SNP_PORT = re.compile(r"^!\s*Port\s*\[\s*(\d+)\s*\]\s*=\s*(.+?)\s*$", re.IGN
 """`.sNp` 注释头里的端口行。出处：`references/probes/mvp_step4_verify_*.txt` 的实测原文，
 格式 `! Port[N] = <pin名> | ref`（BRIEF §10 step4「判据②」把 P8③ 一并答了：
 写的是 **pin 名**不是端口 ID）。`|` 后面是参考端，本函数只取名字。"""
+
+
+# --------------------------------------------------------------------------
+# 层清单 —— 「这个 design 到底有哪几层」由 eWave 自己回答
+# --------------------------------------------------------------------------
+
+LAYER_BASIS_HEADER = "basis function are sorted from largest to smallest as follows"
+"""eWave 报「每层占了多少网格元素」那一段的抬头。出处：`references/probes/speed3d_run_20260828.txt`。
+
+底下每行形如 `  <层> (20%)`，按占比从大到小。**这就是"该降哪几层"的决策依据** ——
+占 20% 的那层降下去才省时间，占 <5% 的降了纯属改变了没打算改的东西。
+"""
+
+LAYER_VIA_MARKER = "the experssion belongs to via"
+"""紧跟在某条 `begin to eval experssion:` 后面的话，意思是"上面那层是 via"。
+
+**这是唯一权威的金属/via 判据。** 靠名字猜（`V*` / `RV` / `Vz`…）就是在赌命名习惯，
+而 `--3d` 说的是 metal layer —— 把 via 塞进去是在拿没验证过的行为换一点方便。
+"""
+
+_LAYER_STAMP = re.compile(r"^(?:\[[^\]]*\]\s*)+")
+"""行首那一串 `[2026-08-28 09:48:14][info] `。有的行只有时间戳没有级别，所以是 `+`。"""
+
+_LAYER_EVAL = re.compile(r"begin to eval experssion:\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
+"""`begin to eval experssion: <层>=<GDS 层号表达式>` → 层名。
+
+这一段列的是**整个 PDK 的层**（含 via、含非金属导体），顺序是自下而上 ——
+所以它同时给了"有哪些层"和"层的先后"。
+"""
+
+_LAYER_BASIS_ROW = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*(<?\s*\d+\s*%)\s*\)$")
+"""`TOP1 (20%)` / `LOW1 (<5%)` → (层名, 占比)。"""
+
+
+def _layer_strip(line: str) -> str:
+    """去掉行首的时间戳/级别，再去两头空白。"""
+    return _LAYER_STAMP.sub("", line).strip()
+
+
+def parse_layer_stack(text: str) -> LayerStack:
+    """一份 eWave 日志 → 这个 design 的导体层清单（`LayerStack`）。
+
+    **为什么要它**：`--3d` 是保持 3D 的白名单，工具要替用户算补集就得知道有哪些层；
+    而层名是 PDK 叠层坐标（CLAUDE.md 硬约束 1b）—— 源码里不许有，也**不该让用户手打**。
+    官方 run 目录里本来就躺着一份 eWave 日志，两段内容合起来就是权威答案
+    （硬约束 1b 那条「运行时发现优于配置项」的又一个落点）。
+
+    两段各管一件事：
+
+    | 段 | 给出什么 |
+    |---|---|
+    | `begin to eval experssion: <层>=…` | 整个 PDK 的层 + **顺序（自下而上）**；紧跟 `LAYER_VIA_MARKER` 的那些是 via |
+    | `LAYER_BASIS_HEADER` 底下那几行 | 这个 design **真正meshes到**的层 + 各自占了多少元素 |
+
+    返回的 `conductors` = 两段的交集减去 via，按第一段的顺序。
+    取交集而不是直接用第一段：第一段列的是整个 PDK（几十层，多数这个 design 根本没有），
+    全塞进 `--3d` 只是让命令行难读。取第二段而不减 via：`--3d` 说的是 metal layer。
+
+    🚨 **两段缺一就返回空**（`note` 说明缺了哪一段），**不猜**：
+    只有第二段就分不出 via；只有第一段就不知道这个 design 用了哪些。
+    猜错的后果是 `--3d` 少一层 → 那层静默退 2D，正是这整个功能要消灭的东西。
+    """
+    lines = [_layer_strip(raw) for raw in strip_ansi(text).splitlines()]
+    dense = [line for line in lines if line]
+
+    order: list[str] = []
+    vias: set[str] = set()
+    for index, line in enumerate(dense):
+        found = _LAYER_EVAL.search(line)
+        if found is None:
+            continue
+        name = found.group(1)
+        if name not in order:
+            order.append(name)
+        nxt = dense[index + 1] if index + 1 < len(dense) else ""
+        if LAYER_VIA_MARKER in nxt.lower():
+            vias.add(name)
+
+    shares: dict[str, str] = {}
+    in_basis = False
+    for line in dense:
+        if LAYER_BASIS_HEADER in line.lower():
+            in_basis = True
+            continue
+        if not in_basis:
+            continue
+        row = _LAYER_BASIS_ROW.match(line)
+        if row is None:
+            # 这一段以 `total: 880652` 收尾，也可能被下一条 [info] 打断。
+            break
+        shares[row.group(1)] = row.group(2).replace(" ", "")
+
+    if not shares or not order:
+        missing = []
+        if not shares:
+            missing.append("the per-layer element report (%r)" % LAYER_BASIS_HEADER)
+        if not order:
+            missing.append("the layer expressions (%r)" % "begin to eval experssion:")
+        return LayerStack(
+            note=(
+                "this log has no layer list: missing " + " and ".join(missing) + ". "
+                "Both are needed - one says which layers this design actually meshes, "
+                "the other says which of them are vias."
+            )
+        )
+
+    used = [name for name in order if name in shares]
+    return LayerStack(
+        conductors=tuple(name for name in used if name not in vias),
+        vias=tuple(name for name in used if name in vias),
+        shares={name: shares[name] for name in used},
+    )
 
 
 def parse_port_order(snp_path: str) -> tuple[str, ...]:

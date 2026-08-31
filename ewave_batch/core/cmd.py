@@ -529,6 +529,32 @@ def detect_flag_conflicts(layers: FlagLayers, axes: Sequence[Axis]) -> list[Flag
     return conflicts
 
 
+RENDER_LAST: tuple[str, ...] = ("--edgeDist",)
+"""**排在所有别的 flag 后面**渲染的 flag。目前只有一个。
+
+`--edgeDist` 在本工具里只以**逐层**形式出现（`simplify2d` 轴：`'L1,4 L2,4'`），
+而全局那份由 mesh 轴用短名 `-e` 给 —— eWave 里两者是同一个选项的两种写法，
+「全局 + 逐层」同时出现是手册文档化的用法：
+
+    --edgeDist=2 --edgeDist=M1,0.8   →  M1 用 0.8，其余用全局 2
+
+⚠️ **顺序按证据来，不按推理来。** 手册那个例子、以及红区 2026-08-28 真跑通的那条命令，
+都是「先全局、后逐层」。而 `sorted()` 会把 `--edgeDist` 排到 `-e` **前面**（ASCII 下
+`--` < `-e`），正好反过来。
+
+从手册对 `--edgeDist='*, 0.5 M6,0.6'` 的描述看，eWave 多半是按**形状**分辨的
+（裸数字 = 全局，`层,值` = 那一层），顺序应当无所谓 —— 但那是推理。
+真按"最后一个赢"实现的话，我们这个顺序会让全局那份把逐层覆盖**整个吃掉**，
+而 run 照样跑完、`--3d` 照样生效，看起来只是"降 2D 没省下多少时间"。
+硬约束 3：本机没有 eWave，这条推理**验证不了** ⇒ 照抄验证过的那条命令的形状。
+"""
+
+
+def _render_key(flag: str) -> tuple[int, str]:
+    """`render_flags` 的排序键：`RENDER_LAST` 里的排最后，其余按名字。"""
+    return (1 if flag in RENDER_LAST else 0, flag)
+
+
 def render_flags(flags: FlagDict) -> list[str]:
     """flag dict → argv 片段，顺序**确定**（同样的输入永远同样的输出，cmd.sh 才可比对）。
 
@@ -540,12 +566,13 @@ def render_flags(flags: FlagDict) -> list[str]:
 
     端口不在这里渲染，见 `tools.ewave.render_ports`。
 
-    顺序 = 按 flag 名 `sorted()`。ASCII 下 `--x` 排在 `-x` 前面，于是长 flag 一堆、短 flag
-    一堆，人读 `cmd.sh` 时找得到。**别改成"按插入顺序"** —— dict 顺序会随合并的层数变化，
-    两个 run 的 `cmd.sh` 就没法直接 diff 了。
+    顺序 = 按 flag 名 `sorted()`，`RENDER_LAST` 里的除外（它们排在最后，见下）。
+    ASCII 下 `--x` 排在 `-x` 前面，于是长 flag 一堆、短 flag 一堆，人读 `cmd.sh` 时找得到。
+    **别改成"按插入顺序"** —— dict 顺序会随合并的层数变化，两个 run 的 `cmd.sh` 就没法
+    直接 diff 了。
     """
     argv: list[str] = []
-    for flag in sorted(flags):
+    for flag in sorted(flags, key=_render_key):
         value = flags[flag]
         if value is False:
             continue

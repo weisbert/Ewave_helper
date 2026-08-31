@@ -97,7 +97,10 @@ SHARED_LAYER_MODULE = "gui._ui"
 SHARED_LAYER_BRIDGE_EXTRAS: tuple[str, ...] = (
     "axis_selection",
     "batch_name",
+    "available_layers",
     "extra_flags_text",
+    "layer_model_text",
+    "layer_source_text",
     "official_run_dir",
     "options",
     "set_max_parallel",
