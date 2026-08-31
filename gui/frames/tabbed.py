@@ -324,9 +324,12 @@ def place_sections(kit: object | None, root: object, bridge: object) -> dict:
     section("resources", tabs["Settings"]).pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
 
     # --- Runs 页：表独占整窗 + 选中详情
-    section("runs", tabs["Runs"], rows=20, titled=False,
-            header_in_title=False).pack(fill=tk.BOTH, expand=True)
-    section("detail", tabs["Runs"]).pack(fill=tk.X, pady=(6, 0))
+    # detail 先从页底拿走自己那份，runs 最后 pack —— 同 split/stacked，理由见
+    # `gui/frames/split.py` 那段长注释（2026-08-31 实测：反过来写会把 `Output log`
+    # 按钮挤出窗口，而 `winfo_ismapped()` 还返回 1，所以旧判据看不出来）。
+    runs = section("runs", tabs["Runs"], rows=20, titled=False, header_in_title=False)
+    section("detail", tabs["Runs"]).pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+    runs.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
     # 动作栏也在 notebook 外面，而且**先于** notebook 从底部拿空间 —— Submit 永远在屏幕上。
     # `side=BOTTOM` 时先 pack 的更靠下 ⇒ 状态栏在最底，动作栏在它上面。

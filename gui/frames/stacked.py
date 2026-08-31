@@ -295,15 +295,31 @@ def place_sections(kit: object | None, root: object, bridge: object) -> dict:
     # 草图 1a 的取舍：Designs 只留 2 行、Runs 只留 9 行，换「全部同屏」。
     # `buttons="three"` = Add / Duplicate / Remove —— 复制一行再改，比删掉重敲三个字段快
     # 得多；共用层的 `dup_design` 早就实现了，之前只有 tabbed 传了这个参数。
-    section("designs", body, widths=(250, 250, 210), rows=2, buttons="three").pack(
-        fill=tk.X, pady=(4, 6)
-    )
-    section("groups", body).pack(fill=tk.X, pady=(0, 6))
-    section("settings", body, compact=False, show_formula=False).pack(fill=tk.X, pady=(0, 6))
-    section("resources", body).pack(fill=tk.X, pady=(0, 6))
-    # runs 先建后 pack：detail 得先从 body 底部拿走自己那几行，剩下的才归表。
+    #
+    # ⚠️ **建的顺序和 pack 的顺序在这里故意不是同一个** ——
+    # 建的顺序必须是 `SECTIONS` 那个规范顺序（`place_sections` 的 `built` 被
+    # `tests/test_gui_frames.py` 逐字断言，三版一致靠它）；而 pack 的顺序是
+    # **抢空间的顺序**，见下面那段。所以先全建出来，再按另一个顺序 pack。
+    designs = section("designs", body, widths=(250, 250, 210), rows=2, buttons="three")
+    groups = section("groups", body)
+    settings = section("settings", body, compact=False, show_formula=False)
+    resources = section("resources", body)
     runs = section("runs", body, rows=9)
-    section("detail", body).pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+    detail = section("detail", body)
+
+    # 🚨 **detail 第一个 pack**（`side=BOTTOM`），排在那四块固定高度的 section 之前。
+    # 原来它虽然也写着 `side=BOTTOM`，但排在 designs/groups/settings/resources
+    # **后面** —— 而 pack 是**按调用顺序**分配空间的，那四块先把 body 吃光，
+    # detail 照样被挤出去。2026-08-31 实测（stacked，1560px 宽，选中一条 failed run）：
+    # `Output log` 的底边恒在 920px，窗口 900/850/800 三档全部掉在外面 ——
+    # 和 split 那条是同一个病，只是阈值不同。「必须点得到的东西排最前面」
+    # 这条纪律对 body 内部同样成立，不是只对 root。
+    detail.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+    designs.pack(side=tk.TOP, fill=tk.X, pady=(4, 6))
+    groups.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+    settings.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+    resources.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+    # runs **最后** pack ⇒ 空间不够时被压缩的是那张自带竖滚动条的表（压瘦了还能滚）。
     runs.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
     # 动作栏和状态栏建在 root 上、**在 body 之前**从底部 pack（见上面那段长注释）。

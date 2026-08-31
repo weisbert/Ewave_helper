@@ -192,10 +192,17 @@ def _split_app_class(shared: object) -> type:
             self.build_settings(left, compact=True, show_formula=True).pack(fill=tk.X, pady=(0, 6))
             self.build_resources(left, compact=True).pack(fill=tk.X)
 
-            self.build_runs(right, rows=RUN_ROWS, titled=False, header_in_title=False).pack(
-                fill=tk.BOTH, expand=True
-            )
-            self.build_detail(right).pack(fill=tk.X, pady=(6, 0))
+            # 🚨 **detail 先从右栏底部拿走自己那份，runs 最后 pack、只拿剩下的。**
+            # 反过来写（runs 先 pack + expand，detail 排它后面）就是 stacked 版
+            # 2026-08-19 那个「Submit 点不到」的同一个病，只是这次犯在右栏内部：
+            # runs 带着 `rows=25` 的请求高度先把空间吃光，detail 被摆到窗口外面 ——
+            # 2026-08-31 用户实测「选中目标仿真后，下面的 Output log 被挤到看不见」。
+            # 实测数据：默认字体下 `Output log` 底边离窗口底只剩 30px，字号 +2 就变成 -10px；
+            # 而 `apply_minsize` 把窗口高封在 0.85×屏幕高，**窗口想长也长不了**。
+            # 压缩就该压那张自带竖滚动条的表（压瘦了还能滚），而不是压一滚都不会滚的 detail。
+            runs = self.build_runs(right, rows=RUN_ROWS, titled=False, header_in_title=False)
+            self.build_detail(right).pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+            runs.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
             # sash 初始位置：见 `_place_sash`。必须等窗口**真正映射**之后才算得准，
             # 所以绑在第一次 <Configure> 上，而不是 after_idle。
